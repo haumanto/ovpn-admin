@@ -849,9 +849,22 @@ func validatePassword(password string) error {
 	}
 }
 
+// checkUserExist reports whether username is a user: a certificate with CN=username in index.txt
+// that is not an OpenVPN server certificate (those are neither listed nor managed).
 func checkUserExist(username string) bool {
 	for _, u := range indexTxtParser(fRead(*indexTxtPath)) {
-		if u.DistinguishedName == ("/CN=" + username) {
+		if u.DistinguishedName == ("/CN="+username) && !isServerCertificate(u) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkCommonNameExist reports whether index.txt has any certificate with CN=commonName,
+// users and server certificates alike: a new user must not reuse it.
+func checkCommonNameExist(commonName string) bool {
+	for _, u := range indexTxtParser(fRead(*indexTxtPath)) {
+		if u.DistinguishedName == ("/CN=" + commonName) {
 			return true
 		}
 	}
@@ -870,7 +883,11 @@ func (oAdmin *OvpnAdmin) usersList() []OpenvpnClient {
 	apochNow := time.Now().Unix()
 
 	for _, line := range indexTxtParser(fRead(*indexTxtPath)) {
-		if line.Identity != "server" && !strings.Contains(line.Identity, "REVOKED") {
+		if isServerCertificate(line) {
+			ovpnServerCertExpire.Set(float64((parseDateToUnix(indexTxtDateLayout, line.ExpirationDate) - apochNow) / 3600 / 24))
+			continue
+		}
+		if !strings.Contains(line.Identity, "REVOKED") {
 			totalCerts += 1
 			ovpnClient := OpenvpnClient{Identity: line.Identity, ExpirationDate: parseDateToString(indexTxtDateLayout, line.ExpirationDate, stringDateFormat)}
 			switch {
@@ -906,9 +923,6 @@ func (oAdmin *OvpnAdmin) usersList() []OpenvpnClient {
 			}
 
 			users = append(users, ovpnClient)
-
-		} else {
-			ovpnServerCertExpire.Set(float64((parseDateToUnix(indexTxtDateLayout, line.ExpirationDate) - apochNow) / 3600 / 24))
 		}
 	}
 
@@ -933,9 +947,9 @@ func (oAdmin *OvpnAdmin) userCreate(username, password string) (bool, string) {
 	oAdmin.createUserMutex.Lock()
 	defer oAdmin.createUserMutex.Unlock()
 
-	if checkUserExist(username) {
+	if checkCommonNameExist(username) {
 		ucErr = fmt.Sprintf("User \"%s\" already exists\n", username)
-		log.Debugf("userCreate: checkUserExist():  %s", ucErr)
+		log.Debugf("userCreate: checkCommonNameExist():  %s", ucErr)
 		return false, ucErr
 	}
 
@@ -1105,7 +1119,7 @@ func (oAdmin *OvpnAdmin) userRevoke(username string) (error, string) {
 		return nil, fmt.Sprintf("user \"%s\" revoked", username)
 	}
 	log.Infof("user \"%s\" not found", username)
-	return errors.New(fmt.Sprintf("User \"%s\" not found}", username)), fmt.Sprintf("User \"%s\" not found", username)
+	return errors.New(fmt.Sprintf("User \"%s\" not found", username)), fmt.Sprintf("User \"%s\" not found", username)
 }
 
 func (oAdmin *OvpnAdmin) userUnrevoke(username string) (error, string) {
@@ -1310,7 +1324,7 @@ func (oAdmin *OvpnAdmin) userDelete(username string) (error, string) {
 		oAdmin.clients = oAdmin.usersList()
 		return nil, fmt.Sprintf("{\"msg\":\"User %s successfully deleted\"}", username)
 	}
-	return errors.New(fmt.Sprintf("User \"%s\" not found}", username)), fmt.Sprintf("{\"msg\":\"User \"%s\" not found\"}", username)
+	return errors.New(fmt.Sprintf("User \"%s\" not found", username)), fmt.Sprintf("{\"msg\":\"User \"%s\" not found\"}", username)
 }
 
 func (oAdmin *OvpnAdmin) downloadCerts() bool {
