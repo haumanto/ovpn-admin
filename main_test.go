@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -302,6 +303,259 @@ func TestNoRequestURIInSources(t *testing.T) {
 		}
 		if strings.Contains(string(src), "RequestURI") {
 			t.Errorf("%s uses RequestURI, log r.URL.Path instead", f)
+		}
+	}
+}
+
+// F01: the sync token of the example files and the former built-in default are public.
+func TestValidateSyncTokenConfig(t *testing.T) {
+	cases := []struct {
+		name, role, token string
+		wantErr           string // substring of the error, empty = accepted
+	}{
+		{"example token rejected", "master", "TOKEN", "example value"},
+		{"example token rejected on a slave", "slave", "TOKEN", "example value"},
+		{"example token rejected whatever the case", "master", " token ", "example value"},
+		{"built-in fallback rejected", "master", "VerySecureToken", "built-in default"},
+		{"built-in fallback rejected on a slave", "slave", "VerySecureToken", "built-in default"},
+		{"empty token rejected on a slave", "slave", "", "is empty"},
+		{"blank token rejected on a slave", "slave", "   ", "is empty"},
+		{"strong token accepted on a master", "master", "k7Qe-0p2xT9vN4mZs8LwUa3dRb6HcY1j", ""},
+		{"strong token accepted on a slave", "slave", "k7Qe-0p2xT9vN4mZs8LwUa3dRb6HcY1j", ""},
+		{"sync disabled (master, no token) accepted", "master", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateSyncTokenConfig(c.role, c.token)
+			if c.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validateSyncTokenConfig(%q, %q) = %v, want nil", c.role, c.token, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Fatalf("validateSyncTokenConfig(%q, %q) = %v, want an error containing %q", c.role, c.token, err, c.wantErr)
+			}
+			// the message names the kind of value, never the token itself
+			for _, secret := range []string{"TOKEN", "VerySecureToken"} {
+				if secret != "" && strings.Contains(err.Error(), secret) {
+					t.Errorf("the error prints the token %q: %v", secret, err)
+				}
+			}
+		})
+	}
+}
+
+// The built-in default is gone: an unset --master.sync-token is the empty token (sync disabled).
+func TestSyncTokenFlagHasNoBuiltInDefault(t *testing.T) {
+	if *masterSyncToken == syncTokenBuiltinFallback || *masterSyncToken == syncTokenExample {
+		t.Fatalf("--master.sync-token defaults to a public value")
+	}
+}
+
+// A master without a sync token serves no archive, the empty request token included; before, the
+// empty token matched an empty configuration.
+func TestDownloadHandlersFailClosedWithoutSyncToken(t *testing.T) {
+	for _, tc := range []struct{ configured, given string }{{"", ""}, {"  ", "%20%20"}, {"", "TOKEN"}, {"strong-secret-value", ""}, {"strong-secret-value", "wrong"}} {
+		oAdmin := &OvpnAdmin{role: "master", masterSyncToken: tc.configured}
+		for name, h := range map[string]http.HandlerFunc{"certs": oAdmin.downloadCertsHandler, "ccd": oAdmin.downloadCcdHandler} {
+			rec := httptest.NewRecorder()
+			h(rec, httptest.NewRequest(http.MethodGet, "/api/data/"+name+"/download?token="+tc.given, nil))
+			if rec.Code != http.StatusForbidden {
+				t.Errorf("%s with configured %q, given %q: %d, want 403", name, tc.configured, tc.given, rec.Code)
+			}
+		}
+	}
+	if !syncTokenMatches("strong-secret-value", "strong-secret-value") {
+		t.Error("the configured token does not match itself")
+	}
+	if syncTokenMatches("", "") {
+		t.Error("the empty token matches the empty token")
+	}
+}
+
+// the handlers that change state (disconnect included, it only echoes today)
+func mutationHandlers(oAdmin *OvpnAdmin) map[string]http.HandlerFunc {
+	return map[string]http.HandlerFunc{
+		"/api/user/create":          oAdmin.userCreateHandler,
+		"/api/user/rotate":          oAdmin.userRotateHandler,
+		"/api/user/delete":          oAdmin.userDeleteHandler,
+		"/api/user/revoke":          oAdmin.userRevokeHandler,
+		"/api/user/unrevoke":        oAdmin.userUnrevokeHandler,
+		"/api/user/change-password": oAdmin.userChangePasswordHandler,
+		"/api/user/disconnect":      oAdmin.userDisconnectHandler,
+		"/api/user/ccd/apply":       oAdmin.userApplyCcdHandler,
+	}
+}
+
+func formPost(path, user string, headers map[string]string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("username="+user+"&password="))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	return req
+}
+
+// F02: every mutation route answers 405 to anything but POST, and does nothing.
+func TestMutationRoutesRejectOtherMethods(t *testing.T) {
+	oAdmin, _ := setupFakeEasyrsa(t)
+	if ok, msg := oAdmin.userCreate("alice", ""); !ok {
+		t.Fatal(msg)
+	}
+	before := strings.Join(indexLines(t), ", ")
+
+	for path, h := range mutationHandlers(oAdmin) {
+		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete, http.MethodPatch, http.MethodOptions} {
+			rec := httptest.NewRecorder()
+			h(rec, httptest.NewRequest(method, path+"?username=alice&password=", nil))
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Errorf("%s %s: %d, want 405", method, path, rec.Code)
+			}
+			if rec.Header().Get("Allow") != http.MethodPost {
+				t.Errorf("%s %s: Allow = %q, want POST", method, path, rec.Header().Get("Allow"))
+			}
+			if method != http.MethodHead && (rec.Body.Len() == 0 || rec.Body.Len() > 100) {
+				t.Errorf("%s %s: body %q, want a short message", method, path, rec.Body.String())
+			}
+		}
+	}
+	if got := strings.Join(indexLines(t), ", "); got != before {
+		t.Errorf("index.txt changed: %s, want %s", got, before)
+	}
+}
+
+// The method comes before the slave rule: a GET on a slave is 405, a POST is 423 as before.
+func TestMutationRoutesMethodCheckComesBeforeSlaveRule(t *testing.T) {
+	oAdmin := &OvpnAdmin{role: "slave", createUserMutex: &sync.Mutex{}}
+	for path, h := range mutationHandlers(oAdmin) {
+		if path == "/api/user/disconnect" {
+			continue // no slave rule
+		}
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("GET %s on a slave: %d, want 405", path, rec.Code)
+		}
+		rec = httptest.NewRecorder()
+		h(rec, formPost(path, "alice", nil))
+		if rec.Code != http.StatusLocked {
+			t.Errorf("POST %s on a slave: %d, want 423", path, rec.Code)
+		}
+	}
+}
+
+// F02: a browser that names a foreign origin gets 403 and nothing happens.
+func TestCrossSitePostIsRefusedAndChangesNothing(t *testing.T) {
+	oAdmin, pki := setupFakeEasyrsa(t)
+	setNetworks(t, "172.16.100.0/24", "")
+	ccdPath := setupCcdDir(t, nil)
+	setFlag(t, ccdEnabled, true)
+	if ok, msg := oAdmin.userCreate("alice", ""); !ok {
+		t.Fatal(msg)
+	}
+	before := strings.Join(indexLines(t), ", ")
+
+	foreign := []map[string]string{
+		{"Origin": "https://evil.example"},
+		{"Origin": "http://example.com:8081"}, // same host, other port
+		{"Origin": "null"},                    // opaque origin (sandboxed frame, redirect)
+		{"Origin": ""},                        // present but empty
+		{"Origin": "garbage"},
+		{"Referer": "https://evil.example/attack.html"},
+		{"Referer": "https://example.com.evil.example/"},
+		{"Origin": "http://example.com", "Referer": "https://evil.example/"}, // one good header does not excuse the other
+		{"Origin": "https://evil.example", "Referer": "http://example.com/"},
+	}
+	for path, h := range mutationHandlers(oAdmin) {
+		for _, headers := range foreign {
+			req := formPost(path, "alice", headers)
+			if _, set := headers["Origin"]; set && headers["Origin"] == "" {
+				req.Header["Origin"] = []string{""} // Set("") keeps the key, make it explicit
+			}
+			if path == "/api/user/ccd/apply" {
+				req = httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"User":"alice","ClientAddress":"172.16.100.77"}`))
+				for k, v := range headers {
+					req.Header.Set(k, v)
+				}
+			}
+			rec := httptest.NewRecorder()
+			h(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Errorf("POST %s with %v: %d %q, want 403", path, headers, rec.Code, rec.Body.String())
+			}
+		}
+	}
+
+	// a new user, a revoke, a rotation, a delete, a ccd: none of it happened
+	if got := strings.Join(indexLines(t), ", "); got != before {
+		t.Errorf("index.txt changed: %s, want %s", got, before)
+	}
+	mustExist(t, pki, "issued/alice.crt", "private/alice.key")
+	if _, err := os.Stat(filepath.Join(ccdPath, "alice")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a cross-site request wrote the ccd of alice: %v", err)
+	}
+}
+
+// F02: same-origin and header-less requests keep working.
+func TestSameOriginAndHeaderlessPostsSucceed(t *testing.T) {
+	oAdmin, _ := setupFakeEasyrsa(t)
+	cases := []struct {
+		user    string
+		headers map[string]string
+	}{
+		{"noheaders", nil},
+		{"origin", map[string]string{"Origin": "http://example.com"}},
+		{"originupper", map[string]string{"Origin": "HTTP://EXAMPLE.COM"}},
+		{"referer", map[string]string{"Referer": "http://example.com/some/page?x=1"}},
+		{"both", map[string]string{"Origin": "https://example.com", "Referer": "https://example.com/"}},
+	}
+	for _, c := range cases {
+		rec := httptest.NewRecorder()
+		oAdmin.userCreateHandler(rec, formPost("/api/user/create", c.user, c.headers))
+		if rec.Code != http.StatusOK {
+			t.Errorf("create %s with %v: %d %q, want 200", c.user, c.headers, rec.Code, rec.Body.String())
+		}
+	}
+	want := "V both, V noheaders, V origin, V originupper, V referer"
+	if got := strings.Join(indexLines(t), ", "); got != want {
+		t.Errorf("index.txt = %s, want %s", got, want)
+	}
+
+	// a state change through the same gate: revoke, same origin then no origin
+	rec := httptest.NewRecorder()
+	oAdmin.userRevokeHandler(rec, formPost("/api/user/revoke", "origin", map[string]string{"Origin": "http://example.com"}))
+	if rec.Code != http.StatusOK {
+		t.Errorf("same-origin revoke: %d %q, want 200", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	oAdmin.userUnrevokeHandler(rec, formPost("/api/user/unrevoke", "origin", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("header-less unrevoke: %d %q, want 200", rec.Code, rec.Body.String())
+	}
+
+	// Host with a port
+	req := formPost("/api/user/create", "ported", map[string]string{"Origin": "http://admin.local:8080"})
+	req.Host = "admin.local:8080"
+	rec = httptest.NewRecorder()
+	oAdmin.userCreateHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("same-origin create on host:port: %d %q, want 200", rec.Code, rec.Body.String())
+	}
+}
+
+// the read-only routes the frontend polls stay open to GET
+func TestReadRoutesStillAnswerGet(t *testing.T) {
+	oAdmin := &OvpnAdmin{role: "master", lastSyncTime: "unknown", lastSuccessfulSyncTime: "unknown", modules: []string{"core"}}
+	for path, h := range map[string]http.HandlerFunc{
+		"/api/server/settings":      oAdmin.serverSettingsHandler,
+		"/api/sync/last/try":        oAdmin.lastSyncTimeHandler,
+		"/api/sync/last/successful": oAdmin.lastSuccessfulSyncTimeHandler,
+	} {
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("GET %s: %d, want 200", path, rec.Code)
 		}
 	}
 }

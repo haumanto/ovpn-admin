@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -74,7 +75,7 @@ var (
 	masterBasicAuthUser      = kingpin.Flag("master.basic-auth.user", "user for master server's Basic Auth").Default("").Envar("OVPN_MASTER_USER").String()
 	masterBasicAuthPassword  = kingpin.Flag("master.basic-auth.password", "password for master server's Basic Auth").Default("").Envar("OVPN_MASTER_PASSWORD").String()
 	masterSyncFrequency      = kingpin.Flag("master.sync-frequency", "master host data sync frequency in seconds").Default("600").Envar("OVPN_MASTER_SYNC_FREQUENCY").Int()
-	masterSyncToken          = kingpin.Flag("master.sync-token", "master host data sync security token").Default("VerySecureToken").Envar("OVPN_MASTER_TOKEN").PlaceHolder("TOKEN").String()
+	masterSyncToken          = kingpin.Flag("master.sync-token", "master host data sync security token; empty disables the sync (a slave requires it); the example and built-in default values are refused").Default("").Envar("OVPN_MASTER_TOKEN").PlaceHolder("TOKEN").String()
 	openvpnNetwork           = kingpin.Flag("ovpn.network", "IPv4 NETWORK/MASK_PREFIX (or NETWORK/NETMASK) for OpenVPN server").Default("172.16.100.0/24").Envar("OVPN_NETWORK").String()
 	openvpnNetworkIPv6       = kingpin.Flag("ovpn.network.ipv6", "IPv6 NETWORK/PREFIX for OpenVPN server (server-ipv6), e.g. fd00:16:100::/64; empty disables IPv6").Default("").Envar("OVPN_NETWORK_IPV6").String()
 	openvpnServer            = kingpin.Flag("ovpn.server", "HOST:PORT:PROTOCOL for OpenVPN server, IPv6 hosts in brackets: [2001:db8::1]:1194:udp; can have multiple values").Default("127.0.0.1:7777:tcp").Envar("OVPN_SERVER").PlaceHolder("HOST:PORT:PROTOCOL").Strings()
@@ -261,6 +262,9 @@ func (oAdmin *OvpnAdmin) userStatisticHandler(w http.ResponseWriter, r *http.Req
 
 func (oAdmin *OvpnAdmin) userCreateHandler(w http.ResponseWriter, r *http.Request) {
 	log.Info(r.RemoteAddr, " ", r.URL.Path)
+	if !requireSameOriginPost(w, r) {
+		return
+	}
 	if oAdmin.role == "slave" {
 		http.Error(w, `{"status":"error"}`, http.StatusLocked)
 		return
@@ -279,6 +283,9 @@ func (oAdmin *OvpnAdmin) userCreateHandler(w http.ResponseWriter, r *http.Reques
 }
 func (oAdmin *OvpnAdmin) userRotateHandler(w http.ResponseWriter, r *http.Request) {
 	log.Info(r.RemoteAddr, " ", r.URL.Path)
+	if !requireSameOriginPost(w, r) {
+		return
+	}
 	if oAdmin.role == "slave" {
 		http.Error(w, `{"status":"error"}`, http.StatusLocked)
 		return
@@ -295,6 +302,9 @@ func (oAdmin *OvpnAdmin) userRotateHandler(w http.ResponseWriter, r *http.Reques
 
 func (oAdmin *OvpnAdmin) userDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	log.Info(r.RemoteAddr, " ", r.URL.Path)
+	if !requireSameOriginPost(w, r) {
+		return
+	}
 	if oAdmin.role == "slave" {
 		http.Error(w, `{"status":"error"}`, http.StatusLocked)
 		return
@@ -311,6 +321,9 @@ func (oAdmin *OvpnAdmin) userDeleteHandler(w http.ResponseWriter, r *http.Reques
 
 func (oAdmin *OvpnAdmin) userRevokeHandler(w http.ResponseWriter, r *http.Request) {
 	log.Info(r.RemoteAddr, " ", r.URL.Path)
+	if !requireSameOriginPost(w, r) {
+		return
+	}
 	if oAdmin.role == "slave" {
 		http.Error(w, `{"status":"error"}`, http.StatusLocked)
 		return
@@ -327,6 +340,9 @@ func (oAdmin *OvpnAdmin) userRevokeHandler(w http.ResponseWriter, r *http.Reques
 
 func (oAdmin *OvpnAdmin) userUnrevokeHandler(w http.ResponseWriter, r *http.Request) {
 	log.Info(r.RemoteAddr, " ", r.URL.Path)
+	if !requireSameOriginPost(w, r) {
+		return
+	}
 	if oAdmin.role == "slave" {
 		http.Error(w, `{"status":"error"}`, http.StatusLocked)
 		return
@@ -343,6 +359,9 @@ func (oAdmin *OvpnAdmin) userUnrevokeHandler(w http.ResponseWriter, r *http.Requ
 
 func (oAdmin *OvpnAdmin) userChangePasswordHandler(w http.ResponseWriter, r *http.Request) {
 	log.Info(r.RemoteAddr, " ", r.URL.Path)
+	if !requireSameOriginPost(w, r) {
+		return
+	}
 	if oAdmin.role == "slave" {
 		http.Error(w, `{"status":"error"}`, http.StatusLocked)
 		return
@@ -372,6 +391,9 @@ func (oAdmin *OvpnAdmin) userShowConfigHandler(w http.ResponseWriter, r *http.Re
 
 func (oAdmin *OvpnAdmin) userDisconnectHandler(w http.ResponseWriter, r *http.Request) {
 	log.Info(r.RemoteAddr, " ", r.URL.Path)
+	if !requireSameOriginPost(w, r) {
+		return
+	}
 	_ = r.ParseForm()
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	// 	fmt.Fprintf(w, "%s", userDisconnect(r.FormValue("username")))
@@ -397,6 +419,9 @@ func (oAdmin *OvpnAdmin) userShowCcdHandler(w http.ResponseWriter, r *http.Reque
 
 func (oAdmin *OvpnAdmin) userApplyCcdHandler(w http.ResponseWriter, r *http.Request) {
 	log.Info(r.RemoteAddr, " ", r.URL.Path)
+	if !requireSameOriginPost(w, r) {
+		return
+	}
 	if oAdmin.role == "slave" {
 		http.Error(w, `{"status":"error"}`, http.StatusLocked)
 		return
@@ -457,7 +482,7 @@ func (oAdmin *OvpnAdmin) downloadCertsHandler(w http.ResponseWriter, r *http.Req
 	_ = r.ParseForm()
 	token := r.Form.Get("token")
 
-	if token != oAdmin.masterSyncToken {
+	if !syncTokenMatches(oAdmin.masterSyncToken, token) {
 		http.Error(w, `{"status":"error"}`, http.StatusForbidden)
 		return
 	}
@@ -480,7 +505,7 @@ func (oAdmin *OvpnAdmin) downloadCcdHandler(w http.ResponseWriter, r *http.Reque
 	_ = r.ParseForm()
 	token := r.Form.Get("token")
 
-	if token != oAdmin.masterSyncToken {
+	if !syncTokenMatches(oAdmin.masterSyncToken, token) {
 		http.Error(w, `{"status":"error"}`, http.StatusForbidden)
 		return
 	}
@@ -500,6 +525,10 @@ func main() {
 	log.SetFormatter(logFormats[*logFormat])
 
 	if err := validateBasicAuthConfig(*basicUsername, *basicPassword); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := validateSyncTokenConfig(*serverRole, *masterSyncToken); err != nil {
 		log.Fatal(err)
 	}
 
@@ -614,6 +643,65 @@ func main() {
 		log.Info("HTTP Basic Auth is enabled")
 	}
 	log.Fatal(http.ListenAndServe(listenAddress(*listenHost, *listenPort), handler))
+}
+
+// Public values that must never protect the sync: the token of the example compose files and the
+// former built-in default of --master.sync-token.
+const (
+	syncTokenExample         = "TOKEN"
+	syncTokenBuiltinFallback = "VerySecureToken"
+)
+
+// validateSyncTokenConfig refuses a sync token everybody knows. The sync is enabled when the
+// token is set (the master then serves the PKI and CCD archives) and always on a slave (it
+// downloads them). The error names the rejected value, never the token. A master without a token
+// has the sync disabled: no token, no sync, no error.
+func validateSyncTokenConfig(role, token string) error {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		if role == "slave" {
+			return errors.New("--master.sync-token is empty: a slave needs the sync token of its master")
+		}
+		return nil
+	}
+	switch {
+	case strings.EqualFold(token, syncTokenExample):
+		return errors.New("--master.sync-token rejected: it is the example value from the documentation, set a strong secret")
+	case strings.EqualFold(token, syncTokenBuiltinFallback):
+		return errors.New("--master.sync-token rejected: it is the built-in default value, set a strong secret")
+	}
+	return nil
+}
+
+// syncTokenMatches fails closed: without a configured token the sync is disabled and no request
+// token is accepted, the empty one included.
+func syncTokenMatches(configured, given string) bool {
+	if strings.TrimSpace(configured) == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(configured), []byte(given)) == 1
+}
+
+// requireSameOriginPost is the first check of every handler that changes state. Other methods
+// than POST get 405. When the browser names where the request comes from (Origin, Referer) its
+// host must be the Host of the request, otherwise 403 and nothing is done. Requests with neither
+// header (curl, CLI clients) pass; a present but empty or unparsable header does not.
+func requireSameOriginPost(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed, use POST", http.StatusMethodNotAllowed)
+		return false
+	}
+	for _, name := range []string{"Origin", "Referer"} {
+		for _, v := range r.Header.Values(name) {
+			u, err := url.Parse(strings.TrimSpace(v))
+			if err != nil || u.Host == "" || !strings.EqualFold(u.Host, r.Host) {
+				http.Error(w, "cross-site request refused", http.StatusForbidden)
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // validateBasicAuthConfig fails closed: setting only one of the two credentials
