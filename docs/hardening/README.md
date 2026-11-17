@@ -153,7 +153,7 @@ Nothing rotates the audit file. A `copytruncate` rule keeps it small; fail2ban f
 
 ## The ban engine inside the OpenVPN container
 
-The openvpn container runs its own fail2ban (jail `ovpn-admin`). It reads `openvpn.log`, bans a source address after `OVPN_BAN_MAXRETRY` failed logins (`AUTH_FAILED`) or revoked-certificate attempts within `OVPN_BAN_FINDTIME` seconds for `OVPN_BAN_BANTIME` seconds, and lists active bans in `bans.tsv` in the audit directory. Bans live in the `OVPN_BAN` (iptables, IPv4) and `OVPN_BAN6` (ip6tables, IPv6) chains and are not kept across a container restart. It is independent of the host-level jails above. All variables are set in `docker-compose.yaml` and `docker-compose-slave.yaml`; every value is validated at start, and a bad value stops the container with a message instead of running half-configured.
+The openvpn container runs its own fail2ban (jail `ovpn-admin`). It reads `openvpn.log`, bans a source address after `OVPN_BAN_MAXRETRY` failed logins (`AUTH_FAILED`) or revoked-certificate attempts within `OVPN_BAN_FINDTIME` seconds for `OVPN_BAN_BANTIME` seconds, and lists active bans in `bans.tsv` in the audit directory. Bans live in the `OVPN_BAN` (iptables, IPv4) and `OVPN_BAN6` (ip6tables, IPv6) chains. A restart does not keep them as such: the engine starts empty and rebuilds them from the log, see "Restart behaviour". It is independent of the host-level jails above. All variables are set in `docker-compose.yaml` and `docker-compose-slave.yaml`; every value is validated at start, and a bad value stops the container with a message instead of running half-configured.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -190,6 +190,29 @@ The two logs the engine depends on, `openvpn.log` (audit directory) and `/var/lo
 * Rotated files are `<name>.1` to `<name>.N` next to the original, with the same owner and mode. They are not compressed.
 * The container's own stdout (what `docker logs` shows) is bounded by the compose `logging` block: `json-file`, `max-size: 10m`, `max-file: 3`, on both services in both compose files.
 * The audit log `audit.tsv` of ovpn-admin is not touched by this loop; see step 5.
+
+### What the filter matches
+
+The jail counts two kinds of line in `openvpn.log`, written by the OpenVPN 2.7 server of the image: `VERIFY ERROR: ... certificate revoked` and `AUTH_FAILED`. OpenVPN starts every server line with the name of the listener's `--proto` and the source, and writes an IPv6 source in brackets. The shipped filter (written by `configure.sh` to `/etc/fail2ban/filter.d/ovpn-admin.conf`, always rebuilt at start) accepts all of these:
+
+```text
+2026-11-17 19:52:37 tcp6-server:172.20.0.50:50256 VERIFY ERROR: depth=0, error=certificate revoked: CN=p14d-rev2, serial=...
+2026-11-17 19:53:37 tcp6-server:172.20.0.51:58232 SENT CONTROL [p14d-valid]: 'AUTH_FAILED' (status=1)
+2026-11-17 19:48:29 udp6:[fd00:172:20::61]:49031 SENT CONTROL [p14d-valid]: 'AUTH_FAILED' (status=1)
+```
+
+* The proto name is `tcp-server`, `tcp4-server` or `tcp6-server` for TCP and `udp`, `udp4` or `udp6` for UDP (what `OVPN_PROTO` selects). There is no `udp-server`. Lines from older OpenVPN versions without a proto name, with or without `[AF_INET]` / `[AF_INET6]`, still match.
+* The address must follow the proto name directly. A line with another prefix (`tcp-client:`, an unknown name, or a `<common-name>/` instance prefix) is a miss, so a stray line cannot ban an address.
+* One failed password writes two `AUTH_FAILED` lines (`[UNDEF]` and `[<user>]`) and counts twice: with `OVPN_BAN_MAXRETRY=3` an attacker is banned after the second wrong password. A revoked certificate writes one `VERIFY ERROR` line per attempt (the `Sent fatal SSL alert: certificate revoked` line is not counted) and needs `OVPN_BAN_MAXRETRY` attempts.
+* Check the filter against your own log with `docker exec <openvpn container> fail2ban-regex /etc/openvpn/audit/openvpn.log /etc/fail2ban/filter.d/ovpn-admin.conf`. `Failregex: 0 total` on a log that holds failed logins means the filter does not fit your OpenVPN version.
+
+### Restart behaviour
+
+The ban state is not stored for the next start; it is derived again from `openvpn.log`. At every container start (a restart or a recreate) `configure.sh` runs `ovpn-ban.sh init`, which empties both ban chains and `bans.tsv`, and then starts fail2ban without a ban database (`dbfile = None`). The jail reads the whole `openvpn.log` again, so:
+
+* **Restart inside `OVPN_BAN_FINDTIME`** of the last counted failure: the failures are counted again and the jail bans the address again within seconds of the start. The DROP rule and the `bans.tsv` row come back (with a new `banned_at`), and the ban ends `OVPN_BAN_BANTIME` after the last counted failure, not after the restart. The `expires_at` in `bans.tsv` and in the Banned IPs view is computed at the moment of the re-ban, so for a re-applied ban it can show a later time than the real unban; the row disappears at the real unban.
+* **Restart after `OVPN_BAN_FINDTIME`**: the old failures are too old to count, nothing is banned, and the chains and `bans.tsv` are empty. The restart ended the ban even if `OVPN_BAN_BANTIME` had not run out.
+* A restart is therefore not a way to escape a ban that is still inside its findtime, and not a way to keep one past it. A ban that must survive a restart on its own needs a host firewall rule, not the jail.
 
 ## Limits you should know
 

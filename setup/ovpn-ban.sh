@@ -176,8 +176,9 @@ rows_without() {
 # reason_for IP: which failure kinds the log shows for IP (only fixed words are returned)
 reason_for() {
   local lines="" kinds=() re
-  # the log line starts with "IP:port" or "[AF_INET]IP:port" / "[AF_INET6]IP:port"; the address is only [0-9a-f:.]
-  re="(^|[] ])${1//./[.]}:[0-9]+ "
+  # after the timestamp the log line starts with "IP:port", "[AF_INET]IP:port" / "[AF_INET6]IP:port" or, as OpenVPN 2.7 writes it,
+  # "<proto>:IP:port" / "<proto>:[IPv6]:port" (tcp6-server:172.20.0.41:33392, udp6:[fd00::61]:49031); the address is only [0-9a-f:.]
+  re="(^|[] ]|(tcp|udp)[46]?(-server)?:)\\[?${1//./[.]}\\]?:[0-9]+ "
   [ -r "$OVPN_LOG" ] && lines="$(tail -n 5000 "$OVPN_LOG" 2>/dev/null | grep -E "$re" 2>/dev/null || true)"
   case "$lines" in *"certificate revoked"*) kinds+=("revoked-certificate") ;; esac
   case "$lines" in *"AUTH_FAILED"*) kinds+=("auth-failed") ;; esac

@@ -269,15 +269,20 @@ logtarget = ${FAIL2BAN_LOG}
 dbfile = None
 EOF
 
-  # only these two OpenVPN log lines count; the line starts with "IP:port" (OpenVPN's per-connection prefix):
-  #   IP:port VERIFY ERROR: ... certificate revoked
-  #   IP:port AUTH_FAILED   (also as "IP:port SENT CONTROL [user]: 'AUTH_FAILED' (status=1)", how OpenVPN 2.x logs it)
-  # TLS handshake failures, expired certificates and network errors do not match. <HOST> matches IPv4 and IPv6 sources;
-  # OpenVPN prefixes the address with [AF_INET] or [AF_INET6] when the listener is dual-stack (tcp6/udp6).
+  # only these two OpenVPN log lines count. After the timestamp (which fail2ban strips) OpenVPN 2.7 starts the line with the
+  # listener's --proto name and the source, "<proto>:IP:port": tcp-server, tcp4-server, tcp6-server for TCP and udp, udp4,
+  # udp6 for UDP (not udp-server). An IPv6 source is written in brackets, "<proto>:[IPv6]:port". Old-style lines have no
+  # proto name and may carry [AF_INET] or [AF_INET6] in front of the address. Real lines of OpenVPN 2.7.7, default image:
+  #   2026-11-17 19:11:47 tcp6-server:172.20.0.50:54768 VERIFY ERROR: depth=0, error=certificate revoked: CN=x, serial=N
+  #   2026-11-17 19:07:57 tcp6-server:172.20.0.41:33392 SENT CONTROL [user]: 'AUTH_FAILED' (status=1)
+  #   2026-11-17 19:48:29 udp6:[fd00:172:20::61]:49031 SENT CONTROL [user]: 'AUTH_FAILED' (status=1)
+  # The proto name is optional and "IP:port" must follow it directly (an unknown prefix makes the line a miss). One failed
+  # login writes two AUTH_FAILED lines ([UNDEF] and [user]), so it counts twice. TLS handshake failures, expired
+  # certificates and network errors do not match. <HOST> matches IPv4 and IPv6 sources.
   cat > /etc/fail2ban/filter.d/ovpn-admin.conf <<'EOF' || return 1
 [Definition]
-failregex = ^\s*(?:\[AF_INET6?\])?<HOST>:\d+ VERIFY ERROR: .*certificate revoked
-            ^\s*(?:\[AF_INET6?\])?<HOST>:\d+ (?:SENT CONTROL \[[^]]*\]: ')?AUTH_FAILED
+failregex = ^\s*(?:(?:tcp[46]?-server|udp[46]?):)?(?:\[AF_INET6?\])?\[?<HOST>\]?:\d+ VERIFY ERROR: .*certificate revoked
+            ^\s*(?:(?:tcp[46]?-server|udp[46]?):)?(?:\[AF_INET6?\])?\[?<HOST>\]?:\d+ (?:SENT CONTROL \[[^]]*\]: ')?AUTH_FAILED
 ignoreregex =
 EOF
 
