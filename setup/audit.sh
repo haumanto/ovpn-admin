@@ -27,7 +27,10 @@ audit_log() {
   _a_v6=$(audit_field "$6")
   _a_rx=$(audit_field "$7")
   _a_tx=$(audit_field "$8")
-  _a_time=$(audit_field "${time_unix:-$(date +%s)}")
+  # Always wall-clock time. Do not use OpenVPN's time_unix: it is the session START timestamp and
+  # OpenVPN reuses the same value in the client-disconnect environment (time_duration is the session length),
+  # so it would stamp disconnect with the connect time and order auth_ok after connect.
+  _a_time=$(audit_field "$(date +%s)")
 
   if ! (
     umask 077
