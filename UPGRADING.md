@@ -1,11 +1,12 @@
 # Upgrading ovpn-admin (docker compose)
 
-One script covers every version: `scripts/upgrade.sh`. It backs up the bind-mounted data, builds or pulls the images, starts `openvpn`, waits for its management interface, then starts `ovpn-admin` and waits for `/ping`. The version you upgrade to comes from the compose file and the checkout you are on; `--target-version` (default `v0.1.2`) only changes the text of the messages, the name of the backup archive and the rollback text.
+One script covers every version: `scripts/upgrade.sh`. It backs up the bind-mounted data, builds or pulls the images, starts `openvpn`, waits for its management interface, then starts `ovpn-admin` and waits for `/ping`. The version you upgrade to comes from the compose file and the checkout you are on; `--target-version` (default `v0.1.3`) only changes the text of the messages, the name of the backup archive and the rollback text.
 
 Pick your section:
 
 * [v0.1.0 → v0.1.1](#v010--v011)
 * [v0.1.1 → v0.1.2](#v011--v012)
+* [v0.1.2 → v0.1.3](#v012--v013)
 * [upstream → v0.1.x](#upstream--v01x)
 
 Kubernetes/Helm deployments: see `charts/openvpn-admin/README.md`. The historical notes of the first release stay in `UPGRADING-v0.1.0.md`.
@@ -24,7 +25,7 @@ Options:
 --project-dir DIR       compose file and data directories (required)
 --compose-file NAME     default docker-compose.yaml
 --project-name NAME     default openvpn-master, as in start.sh; it must match your running stack
---target-version VER    default v0.1.2; messages, backup file name and rollback text only
+--target-version VER    default v0.1.3; messages, backup file name and rollback text only
 --backup-dir DIR        default <project-dir>/backups
 --health-url URL        default http://127.0.0.1:8080/ping
 --health-timeout SECS   default 180
@@ -67,7 +68,7 @@ No database migration. `easyrsa_master/`, `ccd_master/` and `users.db` are untou
    scripts/upgrade.sh --project-dir . --dry-run
    scripts/upgrade.sh --project-dir . --previous-ref <your old tag or commit>
    ```
-   The dry run prints the plan, the backup file list, any warning, and starts nothing. `--target-version v0.1.1` is the default and can be left out.
+   The dry run prints the plan, the backup file list, any warning, and starts nothing. `--target-version v0.1.1` gives the correct labels for this upgrade. The script's default label is now `v0.1.3`.
 5. **Verify**: `curl -fsS http://127.0.0.1:8080/ping`, log in to the UI with the Basic Auth user, and connect one VPN client. Its `connect` line then shows up in the user's login history. `ls -l audit_master/` should list `audit.tsv`.
 
 Manual equivalent, no script:
@@ -90,7 +91,7 @@ Image rebuild, no database migration. The compose files and the volumes do not c
 1. **Note your current version**: `git describe --tags --always` (or write down the image tags). You need it for a rollback.
 2. **Keep your compose file.** `docker-compose.yaml` and `docker-compose-slave.yaml` are the same as in v0.1.1. Registry users: change the two `image:` lines to `ghcr.io/haumanto/ovpn-admin/ovpn-admin:v0.1.2` and `ghcr.io/haumanto/ovpn-admin/openvpn:v0.1.2`.
 3. **Get the v0.1.2 code**: `git fetch --tags && git checkout v0.1.2` in the existing checkout.
-4. **Preview, then upgrade**. The default label is `v0.1.2`; pass `--target-version` only if you want a different label in the messages and the backup name.
+4. **Preview, then upgrade**. The script's default label is `v0.1.3`. For correct labels in this step, pass `--target-version v0.1.2`.
    ```bash
    scripts/upgrade.sh --project-dir . --dry-run
    scripts/upgrade.sh --project-dir . --previous-ref <your v0.1.1 tag or commit>
@@ -111,6 +112,41 @@ curl -fsS http://127.0.0.1:8080/ping
 ```
 
 Not tested for v0.1.2: a real upgrade run (QA used the dry run only), older Docker hosts, and the arm64 build. See `RELEASE-v0.1.2.md`, Known limitations.
+
+## v0.1.2 → v0.1.3
+
+Image rebuild, no database migration. The volumes do not change. The compose files gain one optional variable, `OVPN_IPTABLES_BIN` (default `iptables`). The default OpenVPN image goes back to Alpine 3.24, so the OpenVPN package changes from `openvpn-2.6.20-r0` (v0.1.2) to `openvpn-2.7.7-r0`. Older Docker hosts can build the image on Alpine 3.23 instead. Release notes: `RELEASE-v0.1.3.md`. v0.1.3 is a release candidate. These steps apply once it is published.
+
+1. **Note your current version**: `git describe --tags --always` (or write down the image tags). You need it for a rollback.
+2. **Compose files.** `docker-compose.yaml` and `docker-compose-slave.yaml` in v0.1.3 add `OVPN_IPTABLES_BIN: "${OVPN_IPTABLES_BIN:-iptables}"` to the `openvpn` service. Hosts on nf_tables need no change. If you keep a v0.1.2 compose file and need `iptables-legacy`, add that line to the `openvpn` service's `environment`. Registry users: change the two `image:` lines to `ghcr.io/haumanto/ovpn-admin/ovpn-admin:v0.1.3` and `ghcr.io/haumanto/ovpn-admin/openvpn:v0.1.3`.
+3. **Get the v0.1.3 code**: `git fetch --tags && git checkout v0.1.3` in the existing checkout.
+4. **Older Docker hosts: Alpine 3.23 image.** Build the OpenVPN image on Alpine 3.23 (OpenVPN 2.6.20):
+   ```bash
+   docker build --build-arg ALPINE_VERSION=3.23 -f Dockerfile.openvpn .
+   ```
+   QA ran this command on its test host. The compose build and `scripts/upgrade.sh` do not pass the build argument, and the way to make compose use this image on an older host is not tested. On such a host, do not run the `build --pull` steps below until that is settled. See `RELEASE-v0.1.3.md`, Known limitations.
+5. **Preview, then upgrade.** For a legacy host, export the backend before the script runs (QA tested this export with `docker compose up`, not through `upgrade.sh`). The script's default label is `v0.1.3`. Pass `--previous-ref` with your v0.1.2 tag or commit.
+   ```bash
+   export OVPN_IPTABLES_BIN=iptables-legacy   # older hosts only; leave unset otherwise
+   scripts/upgrade.sh --project-dir . --dry-run
+   scripts/upgrade.sh --project-dir . --previous-ref <your v0.1.2 tag or commit>
+   ```
+   The dry run prints the plan and starts nothing. The backup is `backups/pre-v0.1.3-<time>.tar.gz`.
+6. **Verify**: `curl -fsS http://127.0.0.1:8080/ping`, log in to the UI with the Basic Auth user, and connect one VPN client. Its `connect` line then shows up in the user's login history. `ls -l audit_master/` should list `audit.tsv`. On a legacy host, check the NAT rule in the legacy table: `docker compose -p openvpn-master exec -T openvpn iptables-legacy -t nat -S POSTROUTING`.
+
+Manual equivalent, no script (the wait for the management interface is the loop in the v0.1.0 → v0.1.1 section):
+```bash
+mkdir -p -m 700 backups
+tar -czf backups/pre-v0.1.3-$(date -u +%Y%m%dT%H%M%SZ).tar.gz easyrsa_master ccd_master audit_master
+sha256sum backups/pre-v0.1.3-*.tar.gz
+docker compose -p openvpn-master build --pull   # registry images: docker compose -p openvpn-master pull
+docker compose -p openvpn-master up -d --no-deps openvpn
+# wait for the management interface (loop from the v0.1.0 → v0.1.1 section)
+docker compose -p openvpn-master up -d --no-deps ovpn-admin
+curl -fsS http://127.0.0.1:8080/ping
+```
+
+Known limits of this upgrade: a real upgrade run was not done (QA used the dry run only). Older Docker hosts were not tested, and the Alpine 3.23 path is not tested through compose. The arm64 build was not tested. See `RELEASE-v0.1.3.md`, Known limitations.
 
 ## upstream → v0.1.x
 
@@ -167,7 +203,7 @@ Never use `down -v` and never delete `easyrsa_master/` (it holds your CA) or `au
 ```bash
 docker compose -p openvpn-master stop
 mv easyrsa_master easyrsa_master.failed-upgrade && mv ccd_master ccd_master.failed-upgrade && mv audit_master audit_master.failed-upgrade
-tar -xzf backups/pre-v0.1.2-<timestamp>.tar.gz -C .
+tar -xzf backups/pre-v0.1.3-<timestamp>.tar.gz -C .
 git checkout <previous tag or commit>
 docker compose -p openvpn-master up -d --build   # registry images: pull, then up -d
 curl -fsS http://127.0.0.1:8080/ping

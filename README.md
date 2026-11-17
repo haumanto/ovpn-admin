@@ -27,7 +27,7 @@ An example of dashboard made using ovpn-admin metrics:
 
 ## Installation
 
-Release notes for this version: [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md). Earlier releases: [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0 or v0.1.1: [UPGRADING.md](UPGRADING.md).
+Release notes for this version: [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md) (release candidate, not published yet). Earlier releases: [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0, v0.1.1 or v0.1.2: [UPGRADING.md](UPGRADING.md).
 
 ### 1. Docker
 
@@ -50,7 +50,7 @@ export OVPN_MASTER_TOKEN="$(openssl rand -hex 32)"
 ./start.sh
 ```
 #### 1.1
-Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.2`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`. The v0.1.2 images are published with the v0.1.2 release; you can also build from source.
+Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.2`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`. The v0.1.2 images are published with the v0.1.2 release. The v0.1.3 images are not published yet; build from source.
 
 ### 2. Building from source
 
@@ -74,7 +74,7 @@ cd ovpn-admin
 
 ### 3. Prebuilt binary
 
-You can also download and use prebuilt binaries from the [releases](https://github.com/haumanto/ovpn-admin/releases/latest) page — just choose a relevant tar.gz file (`linux-amd64` or `linux-arm64`). The v0.1.2 binaries are attached to the v0.1.2 release.
+You can also download and use prebuilt binaries from the [releases](https://github.com/haumanto/ovpn-admin/releases/latest) page — just choose a relevant tar.gz file (`linux-amd64` or `linux-arm64`). The v0.1.2 binaries are attached to the v0.1.2 release. The v0.1.3 binaries are not published yet.
 
 
 ## Secure deployment
@@ -150,6 +150,15 @@ The `openvpn` image (`Dockerfile.openvpn`, [setup/configure.sh](setup/configure.
 | `OVPN_PASSWD_AUTH` | `false` | Enable the additional password authentication |
 | `OVPN_ROLE` | `master` | `slave` waits for the first successful sync of its ovpn-admin with the master instead of generating new certificates |
 | `OVPN_AUDIT_LOG` | `/etc/openvpn/audit/audit.tsv` | Connection audit log written by the OpenVPN hooks, see [Audit log](#audit-log) |
+| `OVPN_IPTABLES_BIN` | `iptables` | IPv4 NAT backend. `iptables` uses nf_tables. Set `iptables-legacy` on older Docker hosts. The container exits with `ERROR: iptables binary not found: <name>` if the binary is missing. IPv6 NAT always uses `ip6tables` |
+
+Build argument `ALPINE_VERSION` (`Dockerfile.openvpn`, default `3.24`, OpenVPN 2.7.7). On an older Docker host, build the image on Alpine 3.23 (OpenVPN 2.6.20):
+
+```bash
+docker build --build-arg ALPINE_VERSION=3.23 -f Dockerfile.openvpn .
+```
+
+The compose files do not pass this build argument. See [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md) for what was tested.
 
 IPv6 forwarding (`net.ipv6.conf.all.forwarding=1`) has to be enabled in the network namespace of the container. `configure.sh` tries to set it, but `/proc/sys` is usually read-only in containers, so set it from the outside (e.g. `sysctls` in Docker Compose), otherwise only a warning is printed and IPv6 traffic of the clients is not routed. Use the same pool for `OVPN_SERVER_NET6` and ovpn-admin's `OVPN_NETWORK_IPV6`.
 
@@ -200,7 +209,7 @@ The `openvpn` image installs the hooks [client-connect.sh](setup/client-connect.
 
 ## Upgrade notes
 
-Upgrading a docker compose deployment (upstream, v0.1.0, v0.1.1 or v0.1.2): follow [UPGRADING.md](UPGRADING.md); `scripts/upgrade.sh` backs up first and covers the audit volume.
+Upgrading a docker compose deployment (upstream, v0.1.0, v0.1.1, v0.1.2): follow [UPGRADING.md](UPGRADING.md); `scripts/upgrade.sh` backs up first and covers the audit volume.
 
 * **openvpn-user v1.0.4 → v1.0.9** (only relevant with password authentication, `--auth.password` / `OVPN_PASSWD_AUTH=true`). openvpn-user v1.0.9 adds the columns `secret` and `app_configured` to `users.db`. The column `secret` is added without a default value, so for every user whose password was saved by openvpn-user v1.0.4 or older it is `NULL`, and `openvpn-user auth` of v1.0.9 rejects these users (`converting NULL to string is unsupported`) — they cannot connect to the VPN any more. Users created by v1.0.9 are not affected. Additionally `openvpn-user db-migrate` does nothing on a database created by v1.0.4 until `openvpn-user db-init` has created the `migrations` table, and until the database is migrated `openvpn-user create` reports success without saving the user.
   * The Docker images handle this: `setup/configure.sh` of the openvpn image and ovpn-admin itself (when started with `--auth.password` or `--auth.db-init`) run `db-init` and `db-migrate` on start and then replace `NULL` in `secret` with an empty string (the value v1.0.9 stores for new users). All steps are idempotent.
