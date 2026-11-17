@@ -5,6 +5,7 @@ One script covers every version: `scripts/upgrade.sh`. It backs up the bind-moun
 Pick your section:
 
 * [v0.1.0 → v0.1.1](#v010--v011)
+* [v0.1.1 → v0.1.2](#v011--v012)
 * [upstream → v0.1.x](#upstream--v01x)
 
 Kubernetes/Helm deployments: see `charts/openvpn-admin/README.md`. The historical notes of the first release stay in `UPGRADING-v0.1.0.md`.
@@ -81,6 +82,35 @@ until docker compose -p openvpn-master exec -T openvpn sh -c "(printf 'version\n
 docker compose -p openvpn-master up -d --no-deps ovpn-admin
 curl -fsS http://127.0.0.1:8080/ping
 ```
+
+## v0.1.1 → v0.1.2
+
+Image rebuild, no database migration. The compose files and the volumes do not change. The base image moves from Alpine 3.24 to 3.23, so the OpenVPN package in the images changes from `openvpn-2.7.7-r0` to `openvpn-2.6.20-r0`. Release notes: `RELEASE-v0.1.2.md`. The v0.1.2 tag does not exist yet; the steps below apply once the release is published.
+
+1. **Note your current version**: `git describe --tags --always` (or write down the image tags). You need it for a rollback.
+2. **Keep your compose file.** `docker-compose.yaml` and `docker-compose-slave.yaml` are the same as in v0.1.1. Registry users: once the v0.1.2 images are published, change the two `image:` lines to `ghcr.io/haumanto/ovpn-admin/ovpn-admin:v0.1.2` and `ghcr.io/haumanto/ovpn-admin/openvpn:v0.1.2`.
+3. **Get the v0.1.2 code**: `git fetch --tags && git checkout v0.1.2` in the existing checkout.
+4. **Preview, then upgrade**. Pass `--target-version v0.1.2`. Without it the script still prints `v0.1.1` in its messages and names the backup `pre-v0.1.1-<time>.tar.gz`. Only the labels are affected; the images are built from the checkout.
+   ```bash
+   scripts/upgrade.sh --project-dir . --target-version v0.1.2 --dry-run
+   scripts/upgrade.sh --project-dir . --target-version v0.1.2 --previous-ref <your v0.1.1 tag or commit>
+   ```
+   The script runs `build --pull` (or `pull` for registry images), so the Alpine 3.23 base image is fetched. The dry run prints the plan and starts nothing.
+5. **Verify**: `curl -fsS http://127.0.0.1:8080/ping`, log in to the UI with the Basic Auth user, and connect one VPN client. Its `connect` line then shows in the user's login history. `ls -l audit_master/` should list `audit.tsv`.
+
+Manual equivalent, no script (the wait for the management interface is the loop in the v0.1.0 → v0.1.1 section):
+```bash
+mkdir -p -m 700 backups
+tar -czf backups/pre-v0.1.2-$(date -u +%Y%m%dT%H%M%SZ).tar.gz easyrsa_master ccd_master audit_master
+sha256sum backups/pre-v0.1.2-*.tar.gz
+docker compose -p openvpn-master build --pull   # registry images: docker compose -p openvpn-master pull
+docker compose -p openvpn-master up -d --no-deps openvpn
+# wait for the management interface (loop from the v0.1.0 → v0.1.1 section)
+docker compose -p openvpn-master up -d --no-deps ovpn-admin
+curl -fsS http://127.0.0.1:8080/ping
+```
+
+Not tested for v0.1.2: a real upgrade run (QA used the dry run only), older Docker hosts, and the arm64 build. See `RELEASE-v0.1.2.md`, Known limitations.
 
 ## upstream → v0.1.x
 
