@@ -13,6 +13,8 @@ services:
       # tcp6 = dual-stack listener: accepts clients over IPv4 and IPv6
       OVPN_PROTO: "tcp6"
       OVPN_PASSWD_AUTH: "true"
+      # IPv4 firewall backend; older Docker hosts set iptables-legacy
+      OVPN_IPTABLES_BIN: "${OVPN_IPTABLES_BIN:-iptables}"
       # connection audit log written by the OpenVPN hooks, read by ovpn-admin through the shared ./audit_master mount
       OVPN_AUDIT_LOG: "/etc/openvpn/audit/audit.tsv"
     cap_add:

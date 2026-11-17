@@ -1,8 +1,9 @@
-FROM alpine:3.23
+ARG ALPINE_VERSION=3.24
+FROM alpine:${ALPINE_VERSION}
 ARG TARGETARCH
 # "iptables" (nft backend) also provides the ip6tables commands, "ip6tables" is listed to make the dependency explicit
 # sqlite: configure.sh fixes users.db rows migrated from openvpn-user <= 1.0.4 (secret IS NULL)
-RUN apk add --update bash openvpn easy-rsa iptables ip6tables sqlite && \
+RUN apk add --update bash openvpn easy-rsa iptables iptables-legacy ip6tables sqlite && \
     ln -s /usr/share/easy-rsa/easyrsa /usr/local/bin && \
     case "${TARGETARCH}" in \
       amd64) OPENVPN_USER_SHA256=aa121e391ec206f48256b7b9828b72c010f6f2402c3a6d0205084a3c5803bb82 ;; \

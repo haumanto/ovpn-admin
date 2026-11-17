@@ -49,8 +49,25 @@ else
 fi
 easyrsa gen-crl
 
-iptables -t nat -D POSTROUTING -s "${OVPN_SRV_NET}/${OVPN_SRV_MASK}" ! -d "${OVPN_SRV_NET}/${OVPN_SRV_MASK}" -j MASQUERADE || true
-iptables -t nat -A POSTROUTING -s "${OVPN_SRV_NET}/${OVPN_SRV_MASK}" ! -d "${OVPN_SRV_NET}/${OVPN_SRV_MASK}" -j MASQUERADE
+# Select iptables backend.
+# Default: system iptables
+# Older Docker hosts: iptables-legacy
+IPTABLES_BIN="${OVPN_IPTABLES_BIN:-iptables}"
+
+command -v "$IPTABLES_BIN" >/dev/null 2>&1 || {
+    echo "ERROR: iptables binary not found: $IPTABLES_BIN" >&2
+    exit 1
+}
+
+"$IPTABLES_BIN" -t nat -D POSTROUTING \
+    -s "${OVPN_SRV_NET}/${OVPN_SRV_MASK}" \
+    ! -d "${OVPN_SRV_NET}/${OVPN_SRV_MASK}" \
+    -j MASQUERADE || true
+
+"$IPTABLES_BIN" -t nat -A POSTROUTING \
+    -s "${OVPN_SRV_NET}/${OVPN_SRV_MASK}" \
+    ! -d "${OVPN_SRV_NET}/${OVPN_SRV_MASK}" \
+    -j MASQUERADE
 
 OVPN_IPV6_ARGS=()
 if [ -n "${OVPN_SRV_NET6}" ]; then

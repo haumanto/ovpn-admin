@@ -12,6 +12,8 @@ services:
       OVPN_SERVER_MASK: "255.255.255.0"
       OVPN_SERVER_NET6: "fd00:192:168:100::/64"
       OVPN_PROTO: "tcp6"
+      # IPv4 firewall backend; older Docker hosts set iptables-legacy
+      OVPN_IPTABLES_BIN: "${OVPN_IPTABLES_BIN:-iptables}"
     cap_add:
       - NET_ADMIN
     sysctls:
