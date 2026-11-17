@@ -96,6 +96,7 @@ var (
 	logLevel                 = kingpin.Flag("log.level", "set log level: trace, debug, info, warn, error (default info)").Default("info").Envar("LOG_LEVEL").String()
 	logFormat                = kingpin.Flag("log.format", "set log format: text, json (default text)").Default("text").Envar("LOG_FORMAT").String()
 	storageBackend           = kingpin.Flag("storage.backend", "storage backend: filesystem, kubernetes.secrets (default filesystem)").Default("filesystem").Envar("STORAGE_BACKEND").String()
+	auditPath                = kingpin.Flag("audit.path", "path to the OpenVPN connection audit log (tab-separated, written by the connection hooks); a missing file is an empty login history").Default("/var/log/openvpn-audit/audit.tsv").Envar("OVPN_AUDIT_PATH").String()
 	clientCertExpirationDays = kingpin.Flag("client-cert.expiration-days", "Expiration period of OpenVPN client certificates in days, the period will shrink automatically to the CA expiration period").Default("3650").Envar("CLIENT_CERT_EXPIRATION_DAYS").String()
 
 	certsArchivePath = "/tmp/" + certsArchiveFileName
@@ -226,6 +227,8 @@ type OpenvpnClient struct {
 	RevocationDate   string `json:"RevocationDate"`
 	ConnectionStatus string `json:"ConnectionStatus"`
 	Connections      int    `json:"Connections"`
+	LastLogin        string `json:"LastLogin"`
+	LastLoginIP      string `json:"LastLoginIP"`
 }
 
 type indexTxtLine struct {
@@ -249,7 +252,7 @@ func (oAdmin *OvpnAdmin) userListHandler(w http.ResponseWriter, r *http.Request)
 		oAdmin.clients = oAdmin.usersList()
 	}
 
-	usersList, _ := json.Marshal(oAdmin.clients)
+	usersList, _ := json.Marshal(withLastLogin(oAdmin.clients, defaultAuditLog.index()))
 	fmt.Fprintf(w, "%s", usersList)
 }
 
@@ -623,6 +626,7 @@ func main() {
 	http.HandleFunc(*listenBaseUrl+"api/user/config/show", ovpnAdmin.userShowConfigHandler)
 	http.HandleFunc(*listenBaseUrl+"api/user/disconnect", ovpnAdmin.userDisconnectHandler)
 	http.HandleFunc(*listenBaseUrl+"api/user/statistic", ovpnAdmin.userStatisticHandler)
+	http.HandleFunc(*listenBaseUrl+"api/user/audit", ovpnAdmin.userAuditHandler)
 	http.HandleFunc(*listenBaseUrl+"api/user/ccd", ovpnAdmin.userShowCcdHandler)
 	http.HandleFunc(*listenBaseUrl+"api/user/ccd/apply", ovpnAdmin.userApplyCcdHandler)
 
