@@ -12,6 +12,33 @@ OVPN_SRV_NET6="${OVPN_SERVER_NET6:-}"
 # Listener transport (OpenVPN --proto): tcp = IPv4 only, tcp6 = dual-stack (IPv4 and IPv6 clients)
 OVPN_SRV_PROTO="${OVPN_PROTO:-tcp}"
 
+# Ban engine (fail2ban, see start_fail2ban below). Every value is validated here, before anything is changed:
+# a bad value stops the container at startup instead of producing a broken fail2ban config.
+BAN_ENABLED="${OVPN_BAN_ENABLED:-true}"
+BAN_REQUIRED="${OVPN_BAN_REQUIRED:-false}"
+BAN_MAXRETRY="${OVPN_BAN_MAXRETRY:-3}"
+BAN_FINDTIME="${OVPN_BAN_FINDTIME:-600}"
+BAN_BANTIME="${OVPN_BAN_BANTIME:-3600}"
+# hosts and networks that are never banned (Docker bridge and private source addresses by default)
+BAN_IGNOREIP="${OVPN_BAN_IGNOREIP:-127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fe80::/10}"
+for ban_bool in OVPN_BAN_ENABLED:"${BAN_ENABLED}" OVPN_BAN_REQUIRED:"${BAN_REQUIRED}"; do
+  if [ "${ban_bool#*:}" != "true" ] && [ "${ban_bool#*:}" != "false" ]; then
+    echo "ERROR: ${ban_bool%%:*} must be true or false, got \"${ban_bool#*:}\"" >&2
+    exit 1
+  fi
+done
+for ban_num in OVPN_BAN_MAXRETRY:"${BAN_MAXRETRY}" OVPN_BAN_FINDTIME:"${BAN_FINDTIME}" OVPN_BAN_BANTIME:"${BAN_BANTIME}"; do
+  if ! [[ "${ban_num#*:}" =~ ^[1-9][0-9]{0,9}$ ]]; then
+    echo "ERROR: ${ban_num%%:*} must be a positive integer, got \"${ban_num#*:}\"" >&2
+    exit 1
+  fi
+done
+# one line of IPv4/IPv6 addresses or CIDR networks separated by single spaces; no host names, no other characters
+if ! [[ "${BAN_IGNOREIP}" =~ ^[0-9A-Fa-f:./]+( [0-9A-Fa-f:./]+)*$ ]]; then
+  echo "ERROR: OVPN_BAN_IGNOREIP must be IP addresses or CIDR networks separated by single spaces" >&2
+  exit 1
+fi
+
 
 cd "${EASY_RSA_LOC}"
 
@@ -130,4 +157,122 @@ fi
 
 mkdir -p /etc/openvpn/ccd
 
-exec openvpn --config /etc/openvpn/openvpn.conf --client-config-dir /etc/openvpn/ccd --port 1194 --proto "${OVPN_SRV_PROTO}" --management 127.0.0.1 8989 --dev tun0 --server "${OVPN_SRV_NET}" "${OVPN_SRV_MASK}" "${OVPN_IPV6_ARGS[@]}"
+# --- OpenVPN log, ban engine -------------------------------------------------------------------------------
+# OpenVPN writes its log to a file (--log-append below) that fail2ban watches; tail -F mirrors the file to stdout
+# so "docker compose logs" still shows it. The file is created before OpenVPN so that the jail can open it.
+OPENVPN_LOG="${AUDIT_LOG_DIR}/openvpn.log"
+touch "${OPENVPN_LOG}"
+chown nobody:nogroup "${OPENVPN_LOG}"
+chmod 600 "${OPENVPN_LOG}"
+tail -n 0 -F "${OPENVPN_LOG}" &
+
+# ban list and enforcement, see ovpn-ban.sh (installed fresh at every start)
+BAN_STATE_FILE="${AUDIT_LOG_DIR}/bans.tsv"
+export OVPN_BAN_STATE="${BAN_STATE_FILE}" OVPN_BAN_LOG="${OPENVPN_LOG}" OVPN_BAN_BANTIME="${BAN_BANTIME}" OVPN_IPTABLES_BIN="${IPTABLES_BIN}"
+BAN_TOOL="/usr/local/sbin/ovpn-ban.sh"
+install -D -m 0755 /etc/openvpn/setup/ovpn-ban.sh "${BAN_TOOL}"
+# clear the ban list once, before fail2ban starts: a fresh network namespace has no bans, so no stale rows
+"${BAN_TOOL}" init
+
+# start_fail2ban: writes the fail2ban config from the validated values above (always rebuilt, so nothing stale
+# survives a restart), starts the server and checks that the jail is running. Returns non-zero on any failure;
+# no "set -e" inside, because the caller tests the result.
+start_fail2ban() {
+  local i
+  # a container restart keeps the filesystem: remove the previous server's socket, pid file and ban database
+  rm -f /run/fail2ban/fail2ban.sock /run/fail2ban/fail2ban.pid /var/lib/fail2ban/fail2ban.sqlite3 || return 1
+  mkdir -p /etc/fail2ban/fail2ban.d /etc/fail2ban/filter.d /etc/fail2ban/action.d /etc/fail2ban/jail.d /run/fail2ban || return 1
+
+  # server log to a file (a daemonized server has no usable stderr), mirrored to stdout below; no ban database
+  cat > /etc/fail2ban/fail2ban.d/ovpn-admin.local <<EOF || return 1
+[Definition]
+loglevel = INFO
+logtarget = /var/log/fail2ban.log
+dbfile = None
+EOF
+
+  # only these two OpenVPN log lines count; the line starts with "IP:port" (OpenVPN's per-connection prefix):
+  #   IP:port VERIFY ERROR: ... certificate revoked
+  #   IP:port AUTH_FAILED   (also as "IP:port SENT CONTROL [user]: 'AUTH_FAILED' (status=1)", how OpenVPN 2.x logs it)
+  # TLS handshake failures, expired certificates and network errors do not match. IPv4 sources only.
+  cat > /etc/fail2ban/filter.d/ovpn-admin.conf <<'EOF' || return 1
+[Definition]
+failregex = ^\s*(?:\[AF_INET\])?<IP4>:\d+ VERIFY ERROR: .*certificate revoked
+            ^\s*(?:\[AF_INET\])?<IP4>:\d+ (?:SENT CONTROL \[[^]]*\]: ')?AUTH_FAILED
+ignoreregex =
+EOF
+
+  # actionban/actionunban go through ovpn-ban.sh: DROP rule in the OVPN_BAN chain plus the ban list for the UI.
+  # chain and jump are created at jail start and removed at jail stop. The iptables binary is the backend selector.
+  cat > /etc/fail2ban/action.d/ovpn-admin.conf <<EOF || return 1
+[Definition]
+actionstart = ${BAN_TOOL} teardown || true
+              ${IPTABLES_BIN} -w 5 -N OVPN_BAN
+              ${IPTABLES_BIN} -w 5 -I INPUT 1 -j OVPN_BAN
+actionstop = ${BAN_TOOL} teardown
+actioncheck = ${IPTABLES_BIN} -w 5 -n -L OVPN_BAN
+actionban = ${BAN_TOOL} ban <ip> <failures>
+actionunban = ${BAN_TOOL} unban <ip>
+EOF
+
+  cat > /etc/fail2ban/jail.d/ovpn-admin.local <<EOF || return 1
+[ovpn-admin]
+enabled = true
+filter = ovpn-admin
+action = ovpn-admin
+backend = polling
+logpath = ${OPENVPN_LOG}
+maxretry = ${BAN_MAXRETRY}
+findtime = ${BAN_FINDTIME}
+bantime = ${BAN_BANTIME}
+ignoreip = ${BAN_IGNOREIP}
+
+# the Alpine package enables sshd jails (jail.d/alpine-ssh.conf) that read /var/log/messages: not used in this container
+[sshd]
+enabled = false
+
+[sshd-ddos]
+enabled = false
+EOF
+
+  : >> /var/log/fail2ban.log || return 1
+  tail -n 0 -F /var/log/fail2ban.log &
+
+  # started in the background and polled: with a broken runtime directory the forking parent never returns on its own
+  fail2ban-server -b -x >/dev/null 2>&1 &
+  for i in $(seq 1 30); do
+    fail2ban-client ping >/dev/null 2>&1 && break
+    sleep 1
+  done
+  if ! fail2ban-client ping >/dev/null 2>&1; then
+    pkill -9 -f '[f]ail2ban-server' >/dev/null 2>&1 || true
+    return 1
+  fi
+  # the server answers ping even when a jail failed to load
+  fail2ban-client status ovpn-admin >/dev/null 2>&1 || return 1
+}
+
+if [ "${BAN_ENABLED}" = "true" ]; then
+  if start_fail2ban; then
+    echo "fail2ban: jail ovpn-admin running (maxretry=${BAN_MAXRETRY} findtime=${BAN_FINDTIME}s bantime=${BAN_BANTIME}s)"
+  else
+    echo "################################################################################" >&2
+    echo "ERROR: fail2ban did not start: failed OpenVPN logins and revoked certificates are NOT banned." >&2
+    echo "################################################################################" >&2
+    tail -n 20 /var/log/fail2ban.log >&2 2>/dev/null || true
+    if [ "${BAN_REQUIRED}" = "true" ]; then
+      echo "ERROR: OVPN_BAN_REQUIRED=true, stopping the container" >&2
+      exit 1
+    fi
+    echo "WARNING: OVPN_BAN_REQUIRED=false, continuing without the ban engine" >&2
+    # no half-started ban engine: stop a server that came up without a working jail, drop chain and jump
+    fail2ban-client stop >/dev/null 2>&1 || true
+    "${BAN_TOOL}" teardown || true
+  fi
+else
+  echo "fail2ban: disabled (OVPN_BAN_ENABLED=false)"
+  # a restarted container may still carry the chain of a previous run
+  "${BAN_TOOL}" teardown || true
+fi
+
+exec openvpn --config /etc/openvpn/openvpn.conf --client-config-dir /etc/openvpn/ccd --port 1194 --proto "${OVPN_SRV_PROTO}" --management 127.0.0.1 8989 --dev tun0 --server "${OVPN_SRV_NET}" "${OVPN_SRV_MASK}" "${OVPN_IPV6_ARGS[@]}" --log-append "${OPENVPN_LOG}"

@@ -14,6 +14,21 @@ services:
       OVPN_PROTO: "tcp6"
       # IPv4 firewall backend; older Docker hosts set iptables-legacy
       OVPN_IPTABLES_BIN: "${OVPN_IPTABLES_BIN:-iptables}"
+      # Ban engine (fail2ban inside this container, IPv4 only): bans a source address after OVPN_BAN_MAXRETRY failed
+      # logins (AUTH_FAILED) or revoked-certificate attempts within OVPN_BAN_FINDTIME seconds, for OVPN_BAN_BANTIME seconds.
+      # Ban rules live in the OVPN_BAN chain (same OVPN_IPTABLES_BIN as above, so older hosts set iptables-legacy once for both);
+      # the active bans are listed in bans.tsv in the audit directory. Bans are not kept across container restarts.
+      OVPN_BAN_ENABLED: "${OVPN_BAN_ENABLED:-true}"
+      # true: the container stops if fail2ban cannot start; false: OpenVPN runs without bans and logs an error
+      OVPN_BAN_REQUIRED: "${OVPN_BAN_REQUIRED:-false}"
+      OVPN_BAN_MAXRETRY: "${OVPN_BAN_MAXRETRY:-3}"
+      OVPN_BAN_FINDTIME: "${OVPN_BAN_FINDTIME:-600}"
+      OVPN_BAN_BANTIME: "${OVPN_BAN_BANTIME:-3600}"
+      # Allowlist, never banned: loopback and private ranges, which include the Docker networks (172.16.0.0/12).
+      # A client whose connection reaches OpenVPN through Docker's proxy shows up with the bridge gateway address (for
+      # example 172.20.0.1) and is therefore never banned: check the source addresses in the OpenVPN log before relying on bans.
+      # Add your own admin networks (space separated IPv4/IPv6 addresses or CIDR networks); the default is replaced, not extended.
+      OVPN_BAN_IGNOREIP: "${OVPN_BAN_IGNOREIP:-127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fe80::/10}"
     cap_add:
       - NET_ADMIN
     sysctls:
