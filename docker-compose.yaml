@@ -17,10 +17,17 @@ services:
       OVPN_IPTABLES_BIN: "${OVPN_IPTABLES_BIN:-iptables}"
       # connection audit log written by the OpenVPN hooks, read by ovpn-admin through the shared ./audit_master mount
       OVPN_AUDIT_LOG: "/etc/openvpn/audit/audit.tsv"
-      # Ban engine (fail2ban inside this container, IPv4 only): bans a source address after OVPN_BAN_MAXRETRY failed
+      # Ban engine (fail2ban inside this container, IPv4 and IPv6): bans a source address after OVPN_BAN_MAXRETRY failed
       # logins (AUTH_FAILED) or revoked-certificate attempts within OVPN_BAN_FINDTIME seconds, for OVPN_BAN_BANTIME seconds.
-      # Ban rules live in the OVPN_BAN chain (same OVPN_IPTABLES_BIN as above, so older hosts set iptables-legacy once for both);
-      # the active bans are listed in bans.tsv in the audit directory. Bans are not kept across container restarts.
+      # Ban rules live in the OVPN_BAN chain (iptables, IPv4) and the OVPN_BAN6 chain (ip6tables, IPv6); both are only
+      # reached for traffic to the OpenVPN listener port OVPN_BAN_PORT, never for the ovpn-admin port 8080.
+      # The active bans are listed in bans.tsv in the audit directory. Bans are not kept across container restarts.
+      # IPv6 firewall backend; set ip6tables-legacy together with iptables-legacy
+      OVPN_IP6TABLES_BIN: "${OVPN_IP6TABLES_BIN:-ip6tables}"
+      # OpenVPN listener port inside the container (the right side of the 1194 port mapping): bans apply to this port only
+      OVPN_BAN_PORT: "${OVPN_BAN_PORT:-1194}"
+      # openvpn.log and fail2ban.log larger than this many bytes are moved to <name>.1 when the container starts
+      OVPN_LOG_MAX_BYTES: "${OVPN_LOG_MAX_BYTES:-10485760}"
       OVPN_BAN_ENABLED: "${OVPN_BAN_ENABLED:-true}"
       # true: the container stops if fail2ban cannot start; false: OpenVPN runs without bans and logs an error
       OVPN_BAN_REQUIRED: "${OVPN_BAN_REQUIRED:-false}"
@@ -46,6 +53,11 @@ services:
       - ./easyrsa_master:/etc/openvpn/easyrsa
       - ./ccd_master:/etc/openvpn/ccd
       - ./audit_master:/etc/openvpn/audit
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
   ovpn-admin:
     build:
       context: .
@@ -77,6 +89,11 @@ services:
       - ./easyrsa_master:/mnt/easyrsa
       - ./ccd_master:/mnt/ccd
       - ./audit_master:/mnt/audit
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 networks:
   ovpn:

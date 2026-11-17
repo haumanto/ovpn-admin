@@ -14,10 +14,19 @@ services:
       OVPN_PROTO: "tcp6"
       # IPv4 firewall backend; older Docker hosts set iptables-legacy
       OVPN_IPTABLES_BIN: "${OVPN_IPTABLES_BIN:-iptables}"
-      # Ban engine (fail2ban inside this container, IPv4 only): bans a source address after OVPN_BAN_MAXRETRY failed
+      # connection audit log and ban list (bans.tsv) written into the shared ./audit_slave mount, read by ovpn-admin
+      OVPN_AUDIT_LOG: "/etc/openvpn/audit/audit.tsv"
+      # Ban engine (fail2ban inside this container, IPv4 and IPv6): bans a source address after OVPN_BAN_MAXRETRY failed
       # logins (AUTH_FAILED) or revoked-certificate attempts within OVPN_BAN_FINDTIME seconds, for OVPN_BAN_BANTIME seconds.
-      # Ban rules live in the OVPN_BAN chain (same OVPN_IPTABLES_BIN as above, so older hosts set iptables-legacy once for both);
-      # the active bans are listed in bans.tsv in the audit directory. Bans are not kept across container restarts.
+      # Ban rules live in the OVPN_BAN chain (iptables, IPv4) and the OVPN_BAN6 chain (ip6tables, IPv6); both are only
+      # reached for traffic to the OpenVPN listener port OVPN_BAN_PORT, never for the ovpn-admin port 8080.
+      # The active bans are listed in bans.tsv in the audit directory. Bans are not kept across container restarts.
+      # IPv6 firewall backend; set ip6tables-legacy together with iptables-legacy
+      OVPN_IP6TABLES_BIN: "${OVPN_IP6TABLES_BIN:-ip6tables}"
+      # OpenVPN listener port inside the container (the right side of the 1194 port mapping): bans apply to this port only
+      OVPN_BAN_PORT: "${OVPN_BAN_PORT:-1194}"
+      # openvpn.log and fail2ban.log larger than this many bytes are moved to <name>.1 when the container starts
+      OVPN_LOG_MAX_BYTES: "${OVPN_LOG_MAX_BYTES:-10485760}"
       OVPN_BAN_ENABLED: "${OVPN_BAN_ENABLED:-true}"
       # true: the container stops if fail2ban cannot start; false: OpenVPN runs without bans and logs an error
       OVPN_BAN_REQUIRED: "${OVPN_BAN_REQUIRED:-false}"
@@ -42,6 +51,12 @@ services:
     volumes:
       - ./easyrsa_slave:/etc/openvpn/easyrsa
       - ./ccd_slave:/etc/openvpn/ccd
+      - ./audit_slave:/etc/openvpn/audit
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
   ovpn-admin:
     build:
       context: .
@@ -59,10 +74,18 @@ services:
       # Basic Auth credentials of the master, used by the slave to sync from it
       OVPN_MASTER_USER: "${OVPN_MASTER_USER:?set OVPN_MASTER_USER}"
       OVPN_MASTER_PASSWORD: "${OVPN_MASTER_PASSWORD:?set OVPN_MASTER_PASSWORD}"
+      # login history and active bans (/api/bans) come from the audit directory of the openvpn service
+      OVPN_AUDIT_PATH: "/mnt/audit/audit.tsv"
     network_mode: service:openvpn
     volumes:
       - ./easyrsa_slave:/mnt/easyrsa
       - ./ccd_slave:/mnt/ccd
+      - ./audit_slave:/mnt/audit
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 networks:
   ovpn:
