@@ -116,6 +116,20 @@ func readCcdText(username string) string {
 	return ""
 }
 
+// removeCcdFile deletes the ccd file of a user; a missing file is not an error. username must be
+// path safe.
+func removeCcdFile(username string) error {
+	if !usernameIsPathSafe(username) {
+		return fmt.Errorf("username %q is not safe to use as a file name", username)
+	}
+	ccdMutex.Lock()
+	defer ccdMutex.Unlock()
+	if err := os.Remove(filepath.Join(*ccdDir, username)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove ccd of user %s: %w", username, err)
+	}
+	return nil
+}
+
 func (oAdmin *OvpnAdmin) getCcd(username string) (Ccd, error) {
 	if err := checkCcdUser(username); err != nil {
 		return Ccd{}, err

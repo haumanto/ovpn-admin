@@ -264,3 +264,98 @@ func TestUnrevokeRestoresAllFiles(t *testing.T) {
 		}
 	}
 }
+
+// F3: the ccd of a deleted user (static address, routes) must not survive for a user created later
+// with the same name.
+func TestDeleteUserRemovesCcd(t *testing.T) {
+	oAdmin, _ := setupFakeEasyrsa(t)
+	setNetworks(t, "172.16.100.0/24", "")
+	ccdPath := setupCcdDir(t, nil)
+	setFlag(t, ccdEnabled, true)
+
+	if ok, msg := oAdmin.userCreate("alice", ""); !ok {
+		t.Fatal(msg)
+	}
+	if ok, msg := oAdmin.modifyCcd(Ccd{User: "alice", ClientAddress: "172.16.100.50", CustomRoutes: []ccdRoute{{Address: "10.9.0.0", Mask: "255.255.0.0", Description: "lan"}}}); !ok {
+		t.Fatalf("modifyCcd: %s", msg)
+	}
+	ccdFile := filepath.Join(ccdPath, "alice")
+	if _, err := os.Stat(ccdFile); err != nil {
+		t.Fatalf("ccd file was not written: %v", err)
+	}
+	// an unrelated user keeps its ccd
+	if err := os.WriteFile(filepath.Join(ccdPath, "other"), []byte("ifconfig-push 172.16.100.60 255.255.255.0\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// the certificate is still valid here: delete revokes it, then removes the ccd
+	if err, msg := oAdmin.userDelete("alice"); err != nil {
+		t.Fatalf("userDelete: %v (%s)", err, msg)
+	}
+	if got := strings.Join(indexLines(t), ", "); got != "R REVOKED-alice" {
+		t.Errorf("index.txt = %s, want the deleted certificate revoked", got)
+	}
+	if _, err := os.Stat(ccdFile); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("ccd file of the deleted user: Stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(filepath.Join(ccdPath, "other")); err != nil {
+		t.Errorf("ccd of another user was touched: %v", err)
+	}
+
+	// a new alice does not inherit the old static address or routes ...
+	if ok, msg := oAdmin.userCreate("alice", ""); !ok {
+		t.Fatalf("userCreate after delete: %s", msg)
+	}
+	got, err := oAdmin.getCcd("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ClientAddress != ccdDynamicAddress || len(got.CustomRoutes) != 0 {
+		t.Errorf("recreated user inherited the old ccd: %+v", got)
+	}
+	// ... and the old static address is free again
+	if ok, msg := oAdmin.userCreate("bob", ""); !ok {
+		t.Fatal(msg)
+	}
+	if ok, msg := oAdmin.modifyCcd(Ccd{User: "bob", ClientAddress: "172.16.100.50"}); !ok {
+		t.Errorf("old static address was not released: %s", msg)
+	}
+}
+
+// A user without a ccd file (the usual case) and a revoked user can be deleted.
+func TestDeleteUserWithoutCcd(t *testing.T) {
+	oAdmin, _ := setupFakeEasyrsa(t)
+	setupCcdDir(t, nil)
+
+	for _, name := range []string{"carol", "dave"} {
+		if ok, msg := oAdmin.userCreate(name, ""); !ok {
+			t.Fatal(msg)
+		}
+	}
+	if err, msg := oAdmin.userRevoke("dave"); err != nil {
+		t.Fatal(msg)
+	}
+	for _, name := range []string{"carol", "dave"} {
+		if err, msg := oAdmin.userDelete(name); err != nil {
+			t.Errorf("userDelete(%s): %v (%s)", name, err, msg)
+		}
+	}
+}
+
+func TestRemoveCcdFileRejectsUnsafeNames(t *testing.T) {
+	dir := setupCcdDir(t, nil)
+	outside := filepath.Join(filepath.Dir(dir), "outside-ccd-test")
+	if err := os.WriteFile(outside, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(outside) })
+
+	for _, name := range []string{"", ".", "..", "../outside-ccd-test", "a/b"} {
+		if err := removeCcdFile(name); err == nil {
+			t.Errorf("removeCcdFile(%q) succeeded", name)
+		}
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Errorf("file outside the ccd dir was removed: %v", err)
+	}
+}

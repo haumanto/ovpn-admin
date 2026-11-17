@@ -1295,6 +1295,15 @@ func (oAdmin *OvpnAdmin) userDelete(username string) (error, string) {
 		if err := oAdmin.revokeBeforeReplace(username); err != nil {
 			return err, err.Error()
 		}
+		// the certificate is revoked: drop the ccd so a user created later with the same name
+		// does not inherit the static address and the routes (kubernetes.secrets keeps the ccd in
+		// the secret of the certificate, which easyrsaDelete retires)
+		if *storageBackend != "kubernetes.secrets" {
+			if err := removeCcdFile(username); err != nil {
+				log.Errorf("userDelete: %v", err)
+				return err, err.Error()
+			}
+		}
 		if *storageBackend == "kubernetes.secrets" {
 			err := app.easyrsaDelete(username)
 			if err != nil {
