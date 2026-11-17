@@ -1,6 +1,6 @@
 # Upgrading ovpn-admin (docker compose)
 
-One script covers every version: `scripts/upgrade.sh`. It backs up the bind-mounted data, builds or pulls the images, runs `up -d` and waits for `/ping`. The version you upgrade to comes from the compose file and the checkout you are on; `--target-version` (default `v0.1.1`) only changes the text of the messages, the name of the backup archive and the rollback text.
+One script covers every version: `scripts/upgrade.sh`. It backs up the bind-mounted data, builds or pulls the images, starts `openvpn`, waits for its management interface, then starts `ovpn-admin` and waits for `/ping`. The version you upgrade to comes from the compose file and the checkout you are on; `--target-version` (default `v0.1.1`) only changes the text of the messages, the name of the backup archive and the rollback text.
 
 Pick your section:
 
@@ -13,7 +13,7 @@ Kubernetes/Helm deployments: see `charts/openvpn-admin/README.md`. The historica
 
 * Preflight: docker compose, the compose file, required variables, bind-mount sources, a warning when there is no audit mount.
 * Backup (tar.gz, mode 600, in a mode 700 directory) of `easyrsa_master/`, `ccd_master/` and, when the compose file mounts it, `audit_master/`. It prints path, size, entries and sha256.
-* `build --pull` (compose file with `build:`) or `pull` (registry images), then `up -d`, then `GET /ping`.
+* `build --pull` (compose file with `build:`) or `pull` (registry images), then the ordered start (next paragraph), then `GET /ping`.
 * It never runs `down`, `down -v`, a volume removal or a delete, and it never rolls back by itself. On a failure it prints the rollback steps with your paths filled in.
 
 Options:
@@ -26,11 +26,14 @@ Options:
 --backup-dir DIR        default <project-dir>/backups
 --health-url URL        default http://127.0.0.1:8080/ping
 --health-timeout SECS   default 180
+--mgmt-timeout SECS     default 180; how long to wait for the OpenVPN management interface
 --previous-ref REF      tag or commit you are leaving; fills in the rollback steps
 --backup-only           preflight and backup, then stop (nothing is built or started)
 --dry-run               print the plan and every command, change nothing
 --yes                   no confirmation prompt
 ```
+
+**Ordered start.** The script runs `up -d --no-deps openvpn`, waits until the management interface answers inside the container (`nc` to `127.0.0.1:8989`, up to `--mgmt-timeout` seconds), and only then runs `up -d --no-deps ovpn-admin`. (The probe holds the connection open for a second: BusyBox `nc` exits on end of input and would otherwise drop the reply.) ovpn-admin connects to that management interface, and on a first start OpenVPN can take ~20s to generate DH parameters before it listens; a single `up -d` starts both at once and the admin retries against a port that is not open yet. If the interface does not answer in time, the script does not start or recreate ovpn-admin, prints the last 40 openvpn log lines and the rollback steps, and exits non-zero.
 
 The data of a running stack is often root-owned (the openvpn container hands `audit_master/` to the `nobody` user, mode 700). If the backup fails with a permission error, re-run with `sudo`.
 
@@ -72,7 +75,9 @@ mkdir -p audit_master && chmod 0755 audit_master   # only if it does not exist y
 tar -czf backups/pre-v0.1.1-$(date -u +%Y%m%dT%H%M%SZ).tar.gz easyrsa_master ccd_master audit_master
 sha256sum backups/pre-v0.1.1-*.tar.gz
 docker compose -p openvpn-master build --pull   # registry images: docker compose -p openvpn-master pull
-docker compose -p openvpn-master up -d
+docker compose -p openvpn-master up -d --no-deps openvpn
+until docker compose -p openvpn-master exec -T openvpn sh -c "(printf 'version\n'; sleep 1; printf 'quit\n') | nc -w 2 127.0.0.1 8989" | grep -q 'OpenVPN Version'; do sleep 2; done   # wait for the management interface
+docker compose -p openvpn-master up -d --no-deps ovpn-admin
 curl -fsS http://127.0.0.1:8080/ping
 ```
 
@@ -106,7 +111,9 @@ mkdir -p audit_master && chmod 0755 audit_master
 tar -czf backups/pre-v0.1.1-$(date -u +%Y%m%dT%H%M%SZ).tar.gz easyrsa_master ccd_master audit_master
 sha256sum backups/pre-v0.1.1-*.tar.gz
 docker compose -p openvpn-master build --pull   # registry images: docker compose -p openvpn-master pull
-docker compose -p openvpn-master up -d
+docker compose -p openvpn-master up -d --no-deps openvpn
+until docker compose -p openvpn-master exec -T openvpn sh -c "(printf 'version\n'; sleep 1; printf 'quit\n') | nc -w 2 127.0.0.1 8989" | grep -q 'OpenVPN Version'; do sleep 2; done   # wait for the management interface
+docker compose -p openvpn-master up -d --no-deps ovpn-admin
 curl -fsS http://127.0.0.1:8080/ping
 ```
 Never use `down -v` and never delete `easyrsa_master/` (it holds your CA) or `audit_master/` (it holds the login history).

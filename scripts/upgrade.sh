@@ -3,9 +3,10 @@
 # to a release of this fork (default: v0.1.1). One script for every version, see UPGRADING.md.
 #
 # What it does: preflight, backup of the bind-mounted data (easyrsa_master, ccd_master and, when the
-# compose file mounts it, audit_master), build --pull or pull, up -d, wait for /ping. It never runs
-# "down", never touches volumes, never deletes anything and never rolls back by itself: on a failure
-# it prints the rollback steps.
+# compose file mounts it, audit_master), build --pull or pull, then an ordered start: openvpn first,
+# wait until its management interface answers, only then ovpn-admin, then wait for /ping. It never
+# runs "down", never touches volumes, never deletes anything and never rolls back by itself: on a
+# failure it prints the rollback steps.
 set -euo pipefail
 
 PROG=$(basename "$0")
@@ -18,6 +19,7 @@ PROJECT_NAME="openvpn-master"
 BACKUP_DIR=""
 HEALTH_URL="http://127.0.0.1:8080/ping"
 HEALTH_TIMEOUT=180
+MGMT_TIMEOUT=180
 PREVIOUS_REF=""
 DRY_RUN=0
 ASSUME_YES=0
@@ -50,6 +52,8 @@ Options:
   --backup-dir DIR        where the backup archive is written (default: <project-dir>/backups)
   --health-url URL        URL that must answer 2xx after the upgrade (default: $HEALTH_URL)
   --health-timeout SECS   how long to wait for it (default: $HEALTH_TIMEOUT)
+  --mgmt-timeout SECS     how long to wait for the OpenVPN management interface (127.0.0.1:8989 inside
+                          the openvpn container) before ovpn-admin is started (default: $MGMT_TIMEOUT)
   --previous-ref REF      git tag or commit of the version you are leaving, only used to fill in
                           the rollback steps
   --backup-only           run the preflight and the backup, then stop (nothing is built or started)
@@ -138,6 +142,7 @@ while [[ $# -gt 0 ]]; do
     --backup-dir)     need_value "$@"; BACKUP_DIR=$2; shift 2 ;;
     --health-url)     need_value "$@"; HEALTH_URL=$2; shift 2 ;;
     --health-timeout) need_value "$@"; HEALTH_TIMEOUT=$2; shift 2 ;;
+    --mgmt-timeout)   need_value "$@"; MGMT_TIMEOUT=$2; shift 2 ;;
     --previous-ref)   need_value "$@"; PREVIOUS_REF=$2; shift 2 ;;
     --backup-only)    BACKUP_ONLY=1; shift ;;
     --dry-run)        DRY_RUN=1; shift ;;
@@ -149,6 +154,7 @@ done
 
 [[ -n "$PROJECT_DIR" ]] || { usage >&2; die "--project-dir is required"; }
 [[ "$HEALTH_TIMEOUT" =~ ^[0-9]+$ ]] || die "--health-timeout must be a number of seconds"
+[[ "$MGMT_TIMEOUT" =~ ^[0-9]+$ ]] || die "--mgmt-timeout must be a number of seconds"
 [[ "$TARGET_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "--target-version may only contain letters, digits, . _ and -"
 [[ "$PROJECT_NAME" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "--project-name must be lowercase letters, digits, - or _"
 [[ "$COMPOSE_FILE" != */* ]] || die "--compose-file is a file name inside the project dir, not a path"
@@ -187,6 +193,13 @@ preflight() {
 
   # compose validates the file; -q prints nothing, so no interpolated secret reaches the terminal
   compose config -q || die "docker compose config failed for $COMPOSE_FILE, see the message above"
+
+  # the ordered start names both services; a compose file without them (the slave file, for one) is not for this script
+  local svc
+  svc=$(compose config --services) || die "docker compose config --services failed for $COMPOSE_FILE"
+  if ! { grep -qx 'openvpn' <<<"$svc" && grep -qx 'ovpn-admin' <<<"$svc"; }; then
+    die "$COMPOSE_FILE has no 'openvpn' and 'ovpn-admin' services (found: $(tr '\n' ' ' <<<"$svc")). This script upgrades the master stack; a slave is upgraded by hand, see UPGRADING.md"
+  fi
 
   if docker ps -a --filter "label=com.docker.compose.project=${PROJECT_NAME}" -q 2>/dev/null | grep -q .; then
     log "project '${PROJECT_NAME}': existing containers found"
@@ -288,7 +301,9 @@ print_plan() {
     else
       log "upgrade:       docker compose -p $PROJECT_NAME -f $COMPOSE_FILE pull"
     fi
-    log "               docker compose -p $PROJECT_NAME -f $COMPOSE_FILE up -d"
+    log "start:         docker compose -p $PROJECT_NAME -f $COMPOSE_FILE up -d --no-deps openvpn"
+    log "               wait for the management interface for up to ${MGMT_TIMEOUT}s (probe below)"
+    log "               docker compose -p $PROJECT_NAME -f $COMPOSE_FILE up -d --no-deps ovpn-admin"
     log "health:        GET $HEALTH_URL for up to ${HEALTH_TIMEOUT}s"
   fi
   log "never run:     down, down -v, volume removal, rm"
@@ -352,7 +367,65 @@ upgrade() {
   else
     run docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" pull
   fi
-  run docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" up -d
+  # ordered start: ovpn-admin connects to the management interface of openvpn, which is not listening
+  # until openvpn has finished its first-start work (DH parameters take ~20s), so openvpn goes first
+  STAGE="start openvpn"
+  run docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" up -d --no-deps openvpn
+  wait_management
+  STAGE="start ovpn-admin"
+  run docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" up -d --no-deps ovpn-admin
+}
+
+# the management interface listens on 127.0.0.1:8989 inside the openvpn container (setup/configure.sh).
+# The sleep matters: BusyBox nc exits as soon as its stdin hits EOF, so "printf 'version\nquit\n' | nc"
+# only ever shows the banner (">INFO:OpenVPN Management Interface Version 6") and loses the reply.
+MGMT_PROBE="(printf 'version\\n'; sleep 1; printf 'quit\\n') | nc -w 2 127.0.0.1 8989"
+
+wait_management() {
+  STAGE="wait for management interface"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf '+ docker compose -p %s -f %s exec -T openvpn sh -c "%s" | grep -q %s   (every 2s, up to %ss; ovpn-admin is started only after it passes)\n' \
+      "$PROJECT_NAME" "$COMPOSE_FILE" "$MGMT_PROBE" "'OpenVPN Version'" "$MGMT_TIMEOUT"
+    return 0
+  fi
+  log "waiting up to ${MGMT_TIMEOUT}s for the OpenVPN management interface (127.0.0.1:8989 in the openvpn container)"
+  local start=$SECONDS deadline=$((SECONDS + MGMT_TIMEOUT)) attempt=0 out="" nc_ok=0 rc
+  while :; do
+    attempt=$((attempt + 1))
+    # a missing nc must be a clear error, not a silent timeout: "command -v" prints nothing and exits 1
+    # when nc is absent, while a container that is not running yet makes compose print an error
+    if [[ $nc_ok -eq 0 ]]; then
+      rc=0
+      out=$(compose exec -T openvpn sh -c 'command -v nc' 2>&1) || rc=$?
+      if [[ $rc -eq 0 ]]; then
+        nc_ok=1
+      elif [[ -z "$out" ]]; then
+        die "the 'nc' tool is missing in the openvpn container, so the management interface cannot be probed. The v0.1.1 openvpn image provides BusyBox nc: rebuild it (build --pull) and re-run. ovpn-admin was NOT started."
+      fi
+    fi
+    if [[ $nc_ok -eq 1 ]]; then
+      out=$(compose exec -T openvpn sh -c "$MGMT_PROBE" 2>&1) || true
+      if grep -q 'OpenVPN Version' <<<"$out"; then
+        log "management interface answered on attempt ${attempt} after about $((SECONDS - start))s"
+        return 0
+      fi
+    fi
+    if [[ $attempt -eq 1 || $((attempt % 5)) -eq 0 ]]; then
+      log "  attempt ${attempt} ($((SECONDS - start))s): management interface not answering yet"
+    fi
+    [[ $SECONDS -lt $deadline ]] || break
+    sleep 2
+  done
+  {
+    log "NOT ready: the management interface did not answer within ${MGMT_TIMEOUT}s (${attempt} attempts)"
+    log "last probe output (passwords and tokens redacted): ${out:-<none>}" | redact
+    log "ovpn-admin was NOT started or recreated."
+    log "-- container status"
+    compose ps -a || true
+    log "-- last 40 openvpn log lines (passwords and tokens redacted)"
+    compose logs --no-color --tail 40 openvpn 2>&1 | redact || true
+  } >&2
+  return 1
 }
 
 redact() { sed -E 's/((password|passwd|token|secret)[=:] *)[^ &"]+/\1[redacted]/Ig'; }
