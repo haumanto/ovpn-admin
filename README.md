@@ -16,9 +16,9 @@ Simple web UI to manage OpenVPN users, their certificates & routes in Linux. Whi
 * (optionally) Specifying the Kubernetes LoadBalancer if it's used in front of the OpenVPN server (to get an automatically defined `remote` in the `client.conf.tpl` template).
 * (optionally) Storing certificates and other files in Kubernetes Secrets (**Attention, this feature is experimental!**).
 * (optionally) IPv6: dual-stack web UI listener, IPv6 pool for VPN clients, static IPv6 addresses and IPv6 routes in CCD (see [IPv6](#ipv6)).
-* Automatic banning of sources that make repeated failed logins or present revoked certificates, run by fail2ban inside the OpenVPN container, IPv4 and IPv6 (see [Ban engine](#ban-engine)). New in v0.1.4 (release candidate).
+* Automatic banning of sources that make repeated failed logins or present revoked certificates, run by fail2ban inside the OpenVPN container, IPv4 and IPv6 (see [Ban engine](#ban-engine)). New in v0.1.4.
 * Read-only **Banned IPs** view in the admin UI (see [Banned IPs](#banned-ips)).
-* Mobile-first web UI: phone cards, a table on tablet and desktop, sheet dialogs (see [Mobile support](#mobile-support)). New in v0.1.4 (release candidate).
+* Mobile-first web UI: phone cards, a table on tablet and desktop, sheet dialogs (see [Mobile support](#mobile-support)). New in v0.1.4.
 
 ### Screenshots
 
@@ -30,7 +30,7 @@ An example of dashboard made using ovpn-admin metrics:
 
 ## Installation
 
-Release notes for the current release candidate: [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md) (v0.1.4 is not published yet). Latest published release: [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md) (published with the v0.1.3 release). Earlier releases: [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0, v0.1.1, v0.1.2 or v0.1.3: [UPGRADING.md](UPGRADING.md).
+Release notes for this version: [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md) (published with the v0.1.4 release). Earlier releases: [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md), [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0, v0.1.1, v0.1.2 or v0.1.3: [UPGRADING.md](UPGRADING.md).
 
 ### 1. Docker
 
@@ -53,7 +53,7 @@ export OVPN_MASTER_TOKEN="$(openssl rand -hex 32)"
 ./start.sh
 ```
 #### 1.1
-Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.2`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`. The v0.1.2 images are published with the v0.1.2 release. The v0.1.3 images are published with the v0.1.3 release. The v0.1.4 images are not published yet.
+Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.2`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`. The v0.1.2 images are published with the v0.1.2 release. The v0.1.3 images are published with the v0.1.3 release. The v0.1.4 images are published with the v0.1.4 release.
 
 ### 2. Building from source
 

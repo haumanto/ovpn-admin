@@ -8,6 +8,7 @@ ccd
 ccd_master
 ccd_slave
 audit_master/
+audit_slave/
 frontend/node_modules
 
 main-packr.go
