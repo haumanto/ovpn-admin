@@ -35,15 +35,20 @@ Requirements:
 You need [Docker](https://docs.docker.com/get-docker/) and [Docker Compose v2](https://docs.docker.com/compose/install/) (`docker compose`) installed.
 The example enables IPv6 for the containers, which needs a Docker Engine with IPv6 support (27.0+ recommended) and IPv6 enabled in the host kernel (see [IPv6 with Docker Compose](#docker-compose) to turn it off).
 
+Compose refuses to start unless `BASIC_USERNAME`, `BASIC_PASSWORD` and `OVPN_MASTER_TOKEN` are set (see [Secure deployment](#secure-deployment)).
+
 Commands to execute:
 
 ```bash
 git clone https://github.com/haumanto/ovpn-admin.git
 cd ovpn-admin
+export BASIC_USERNAME=admin
+export BASIC_PASSWORD='<a long random password>'
+export OVPN_MASTER_TOKEN="$(openssl rand -hex 32)"
 ./start.sh
 ```
 #### 1.1
-Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.0`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`.
+Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.0`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`. The v0.1.0 images are published with the v0.1.0 release; until then, build from source.
 
 ### 2. Building from source
 
@@ -67,16 +72,19 @@ cd ovpn-admin
 
 ### 3. Prebuilt binary
 
-You can also download and use prebuilt binaries from the [releases](https://github.com/haumanto/ovpn-admin/releases/latest) page — just choose a relevant tar.gz file (`linux-amd64` or `linux-arm64`).
+You can also download and use prebuilt binaries from the [releases](https://github.com/haumanto/ovpn-admin/releases/latest) page — just choose a relevant tar.gz file (`linux-amd64` or `linux-arm64`). The v0.1.0 binaries appear with the v0.1.0 release.
 
 
 ## Secure deployment
 
 * **Basic Auth is mandatory.** `docker-compose.yaml` and the Helm chart refuse to start without credentials: compose needs `BASIC_USERNAME`, `BASIC_PASSWORD` and `OVPN_MASTER_TOKEN` (generate the token with `openssl rand -hex 32`), `start.sh` passes your environment through; the chart fails to render until `ingress.basicAuth.user` and `ingress.basicAuth.password` are set (the old `admin`/`changeme` defaults are rejected).
+* **Scope of Basic Auth.** It covers the web UI, the API and `/metrics`. `/ping` stays open without credentials; the Helm chart's readiness and liveness probes use it.
 * **Terminate TLS in a reverse proxy** in front of the admin UI. Basic Auth over plain HTTP exposes the credentials.
 * **Block direct access to the backend** (port 8080 / 8000) with a firewall or NetworkPolicy, only the proxy may reach it.
 * **Compose binds the admin port to loopback** (`127.0.0.1:8080`); the VPN port 7777 stays on all interfaces. Publish the admin UI only through the proxy.
-* **Cross-host master/slave sync only over HTTPS** (`--master.host=https://...`, plus `--master.basic-auth.user/password`) with a unique random sync token. The slave compose file still targets `http://172.20.0.1:8080`, which the loopback binding no longer serves: put the proxy in between.
+* **Cross-host master/slave sync only over HTTPS** (`--master.host=https://...`, plus `--master.basic-auth.user/password`).
+* **Sync token.** Generate it with `openssl rand -hex 32`. The example values `TOKEN` and `VerySecureToken` and the former built-in default are refused at startup.
+* **Slave compose file (known issue).** `docker-compose-slave.yaml` still targets `http://172.20.0.1:8080`, which the loopback binding no longer serves: put the proxy in between. It also has a literal sync token and no Basic Auth, so it does not start as shipped. See `RELEASE-v0.1.0.md`.
 * **Chart upgrade notes:** `ovpnAdmin.tag` and `openvpn.tag` are new and default to the chart `appVersion` (the images were `:master`); no value was renamed. The Role is narrowed to `secrets` (get, list, create, update) and `services` (get) in the release namespace.
 
 ## Notes
@@ -287,4 +295,4 @@ ovpn-admin was originally created in [Flant](https://github.com/flant/) and used
 In March 2021, it [went public](https://medium.com/flant-com/introducing-ovpn-admin-a-web-interface-to-manage-openvpn-users-d81705ad8f23) and was still developed in Flant.
 Namely, [@vitaliy-sn](https://github.com/vitaliy-sn) created its first version in Python, and [@pashcovich](https://github.com/pashcovich) rewrote it in Go.
 
-In November 2024, this project was moved to [Palark](https://github.com/palark/), which is currently responsible for its maintenance and development.
+In November 2024, this project was moved to Palark, which maintained it. This fork (v0.1.0) is maintained by [haumanto](https://github.com/haumanto/ovpn-admin).
