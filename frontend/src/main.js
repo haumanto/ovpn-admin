@@ -1,4 +1,4 @@
-import { createApp } from 'vue';
+import { createApp, markRaw } from 'vue';
 import axios from 'axios';
 import Notifications from '@kyvg/vue3-notification'
 import VueGoodTablePlugin from 'vue-good-table-next'
@@ -257,6 +257,136 @@ var expiryInfo = function(row, nowMs) {
   return { date: date, text: 'in ' + daysSpan(diff), warn: false };
 };
 
+// ---- banned IPs (GET api/bans) ----
+
+// Unix seconds (number or numeric string, as in bans.tsv) or an RFC 3339
+// string; returns epoch milliseconds, 0 when unusable.
+var parseTimestamp = function(value) {
+  if (value === null || value === undefined || value === '') {
+    return 0;
+  }
+  if (typeof value === 'number' || /^\d+(\.\d+)?$/.test(String(value).trim())) {
+    var n = Number(value);
+    // seconds (10 digits) vs milliseconds (13 digits)
+    return n < 1e11 ? n * 1000 : n;
+  }
+  var ms = Date.parse(String(value));
+  return isNaN(ms) ? 0 : ms;
+};
+
+// Relative time of a future instant: 'in 46 min', 'in 2 h 5 min', 'in 3 days'.
+var relativeFuture = function(ts, nowMs) {
+  var s = Math.floor((ts - nowMs) / 1000);
+  if (s < 60) {
+    return 'in under a minute';
+  }
+  var min = Math.floor(s / 60);
+  if (min < 60) {
+    return 'in ' + min + ' min';
+  }
+  var h = Math.floor(min / 60);
+  if (h < 24) {
+    return 'in ' + h + ' h' + (min % 60 ? ' ' + (min % 60) + ' min' : '');
+  }
+  return 'in ' + plural(Math.floor(h / 24), 'day');
+};
+
+// 'HH:MM' for today, 'MM-DD HH:MM' for other days (browser time zone).
+var formatShortLocal = function(date, nowMs) {
+  var hm = pad2(date.getHours()) + ':' + pad2(date.getMinutes());
+  if (dayDiff(date, nowMs) === 0) {
+    return hm;
+  }
+  return pad2(date.getMonth() + 1) + '-' + pad2(date.getDate()) + ' ' + hm;
+};
+
+var REASON_LABELS = {
+  'revoked-certificate': 'Revoked certificate',
+  'auth-failed': 'Authentication failed',
+  'fail2ban': 'Repeated failures'
+};
+
+// The ban engine writes one word or two joined by '+'. Unknown values are
+// shown as they are: the UI never hides server data.
+var reasonLabel = function(reason) {
+  if (!reason) {
+    return 'No reason recorded';
+  }
+  return String(reason).split('+').map(function(part) {
+    return REASON_LABELS[part] || part;
+  }).join(' + ');
+};
+
+var normalizeBan = function(b) {
+  b = (b && typeof b === 'object') ? b : {};
+  return {
+    ip: String(b.ip || ''),
+    bannedMs: parseTimestamp(b.banned_at),
+    expiresMs: parseTimestamp(b.expires_at),
+    failures: Number(b.failures) || 0,
+    reason: String(b.reason || ''),
+    reasonLabel: reasonLabel(b.reason)
+  };
+};
+
+var viewFromHash = function() {
+  return window.location.hash === '#bans' ? 'bans' : 'users';
+};
+
+// Adds the derived fields the ban cards and rows read.
+var decorateBan = function(b, nowMs) {
+  var since = b.bannedMs ? new Date(b.bannedMs) : null;
+  var exp = b.expiresMs ? new Date(b.expiresMs) : null;
+  return Object.assign({}, b, {
+    _since: since ? {
+      relative: relativePast(b.bannedMs, nowMs),
+      short: formatShortLocal(since, nowMs),
+      full: formatLocal(since, false),
+      utc: formatUtcSeconds(since)
+    } : null,
+    _exp: exp ? {
+      relative: b.expiresMs > nowMs ? relativeFuture(b.expiresMs, nowMs) : 'expired',
+      short: formatShortLocal(exp, nowMs),
+      full: formatLocal(exp, false),
+      utc: formatUtcSeconds(exp)
+    } : null,
+    // past its expiry before the next refresh: the row stays, dimmed
+    _expired: b.expiresMs > 0 && b.expiresMs <= nowMs
+  });
+};
+
+var BANS_POLL_MS = 30000;
+var BANS_POLL_BACKOFF_MS = 120000;
+var BANS_BACKOFF_AFTER = 3;
+var BANS_COUNT_POLL_MS = 60000;
+var BANS_SEARCH_MIN_ROWS = 200;
+
+// Body scroll lock shared by dialogs and menus (counted, scroll position is
+// restored: iOS keeps the page offset otherwise).
+var scrollLock = {
+  count: 0,
+  y: 0,
+  lock: function() {
+    if (this.count === 0) {
+      this.y = window.pageYOffset || 0;
+      document.body.classList.add('ov-scroll-locked');
+    }
+    this.count++;
+  },
+  unlock: function() {
+    if (this.count === 0) {
+      return;
+    }
+    this.count--;
+    if (this.count === 0) {
+      document.body.classList.remove('ov-scroll-locked');
+      if ((window.pageYOffset || 0) !== this.y) {
+        window.scrollTo(0, this.y);
+      }
+    }
+  }
+};
+
 // Decimal units: 999 -> '999 B', 1203554810 -> '1.2 GB'.
 var formatBytes = function(n) {
   n = Number(n) || 0;
@@ -371,16 +501,19 @@ var AppDialog = {
     dialogCounter++;
     return { uid: 'dialog-' + dialogCounter };
   },
-  template: '<div class="ov-backdrop">' +
+  template: '<div class="ov-backdrop" @mousedown="onBackdropDown" @click="onBackdropClick">' +
     '<div class="ov-dialog" :class="\'ov-dialog-\' + size" role="dialog" aria-modal="true" ref="box" ' +
     ':aria-labelledby="uid + \'-title\'" :aria-describedby="describeBody ? uid + \'-body\' : null">' +
-    '<div class="ov-dialog-head"><h2 class="ov-dialog-title" :id="uid + \'-title\'">{{ title }}</h2>' +
+    '<div class="ov-dialog-head"><div class="ov-dialog-titles"><h2 class="ov-dialog-title" :id="uid + \'-title\'">{{ title }}</h2>' +
     '<p class="ov-dialog-meta" v-if="$slots.meta"><slot name="meta"></slot></p></div>' +
+    '<button type="button" class="ov-btn ov-btn-ghost ov-btn-icon ov-dialog-x" aria-label="Close" :disabled="busy" @click="$emit(\'close\')">' +
+    '<svg class="ov-icon" aria-hidden="true"><use href="#i-x"/></svg></button></div>' +
     '<div class="ov-dialog-body" :class="{\'ov-dialog-body-flush\': flush}" :id="uid + \'-body\'"><slot></slot></div>' +
     '<div class="ov-dialog-foot"><slot name="footer"></slot></div>' +
     '</div></div>',
   mounted() {
     this.opener = document.activeElement;
+    scrollLock.lock();
     document.addEventListener('keydown', this.onKeydown, true);
     var box = this.$refs.box;
     var target = null;
@@ -400,12 +533,25 @@ var AppDialog = {
     document.removeEventListener('keydown', this.onKeydown, true);
   },
   unmounted() {
+    scrollLock.unlock();
     var opener = this.opener;
     if (opener && opener.isConnected && typeof opener.focus === 'function') {
       opener.focus();
     }
   },
   methods: {
+    // a click closes only when it started and ended on the backdrop itself
+    // (a text selection that ends outside the dialog must not close it)
+    onBackdropDown(event) {
+      this.downOnBackdrop = event.target === event.currentTarget;
+    },
+    onBackdropClick(event) {
+      var started = this.downOnBackdrop;
+      this.downOnBackdrop = false;
+      if (started && event.target === event.currentTarget && !this.busy) {
+        this.$emit('close');
+      }
+    },
     focusables() {
       var nodes = this.$refs.box.querySelectorAll('button, input, textarea, select, a[href], [tabindex]');
       return Array.prototype.filter.call(nodes, function(el) {
@@ -473,6 +619,126 @@ var PasswordField = {
     '</div>'
 };
 
+// Action menu of a user row: bottom sheet on phones, popover anchored to the
+// opener from 769 px (see style.css). role=menu, Up/Down/Home/End, Escape and
+// a tap on the scrim close it, focus goes back to the opener.
+var AppMenu = {
+  props: {
+    title: { type: String, required: true },
+    subtitle: { type: String, default: '' },
+    items: { type: Array, required: true },
+    anchor: { default: null }
+  },
+  emits: ['select', 'close'],
+  data() {
+    return { menuStyle: {} };
+  },
+  template: '<div class="ov-menu-layer">' +
+    '<div class="ov-scrim" @click="$emit(\'close\')"></div>' +
+    '<div class="ov-menu" role="menu" ref="menu" :aria-label="\'Actions for \' + title" :style="menuStyle">' +
+    '<div class="ov-menu-head"><p class="ov-menu-title">{{ title }}</p><span class="ov-small ov-muted" v-if="subtitle">{{ subtitle }}</span></div>' +
+    '<ul class="ov-menu-list" role="none">' +
+    '<template v-for="(item, index) in items" :key="item.id">' +
+    '<li role="separator" class="ov-menu-sep" v-if="item.danger && index > 0 && !items[index - 1].danger"></li>' +
+    '<li role="none"><button type="button" role="menuitem" class="ov-menu-item" :class="{\'ov-menu-danger\': item.danger}" ' +
+    ':disabled="item.disabled" @click="$emit(\'select\', item)">' +
+    '<svg class="ov-icon" aria-hidden="true"><use :href="\'#\' + item.icon"/></svg>{{ item.label }}</button></li>' +
+    '</template>' +
+    '<li role="none"><button type="button" role="menuitem" class="ov-menu-item ov-menu-cancel" @click="$emit(\'close\')">Cancel</button></li>' +
+    '</ul></div></div>',
+  mounted() {
+    scrollLock.lock();
+    document.addEventListener('keydown', this.onKeydown, true);
+    window.addEventListener('resize', this.position);
+    this.position();
+    var items = this.visibleItems();
+    if (items.length) {
+      items[0].focus();
+    }
+  },
+  beforeUnmount() {
+    document.removeEventListener('keydown', this.onKeydown, true);
+    window.removeEventListener('resize', this.position);
+  },
+  unmounted() {
+    scrollLock.unlock();
+  },
+  methods: {
+    // popover position from 769 px (the sheet on phones ignores the variables)
+    position() {
+      if (!this.anchor || !this.anchor.getBoundingClientRect) {
+        return;
+      }
+      var r = this.anchor.getBoundingClientRect();
+      var menuH = this.$refs.menu ? this.$refs.menu.offsetHeight : 0;
+      var top = r.bottom + 4;
+      if (menuH && top + menuH > window.innerHeight - 8) {
+        top = Math.max(8, r.top - 4 - menuH);
+      }
+      this.menuStyle = { '--menu-top': top + 'px', '--menu-right': Math.max(8, window.innerWidth - r.right) + 'px' };
+    },
+    visibleItems() {
+      var nodes = this.$refs.menu.querySelectorAll('.ov-menu-item');
+      return Array.prototype.filter.call(nodes, function(el) {
+        return !el.disabled && el.offsetParent !== null;
+      });
+    },
+    onKeydown(event) {
+      var key = event.key;
+      if (key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        this.$emit('close');
+        return;
+      }
+      if (['ArrowDown', 'ArrowUp', 'Home', 'End', 'Tab'].indexOf(key) === -1) {
+        return;
+      }
+      var items = this.visibleItems();
+      if (items.length === 0) {
+        return;
+      }
+      event.preventDefault();
+      var current = items.indexOf(document.activeElement);
+      var next = current;
+      if (key === 'Home') {
+        next = 0;
+      } else if (key === 'End') {
+        next = items.length - 1;
+      } else if (key === 'ArrowDown' || (key === 'Tab' && !event.shiftKey)) {
+        next = current + 1 >= items.length ? 0 : current + 1;
+      } else {
+        next = current <= 0 ? items.length - 1 : current - 1;
+      }
+      items[next].focus();
+    }
+  }
+};
+
+// Centered state block of a list: loading skeleton, error, empty, no match.
+var AppState = {
+  props: {
+    kind: { type: String, required: true },
+    message: { type: String, default: '' },
+    count: { type: Number, default: 3 },
+    canAdd: { type: Boolean, default: false },
+    checked: { type: String, default: '' },
+    noun: { type: String, default: 'users' }
+  },
+  emits: ['retry', 'add', 'showall'],
+  template: '<div class="ov-state-wrap">' +
+    '<div v-if="kind == \'loading\'" role="status"><span class="visually-hidden">Loading {{ noun }}…</span>' +
+    '<div class="ov-skel" v-for="n in count" :key="n" aria-hidden="true"></div></div>' +
+    '<div v-else-if="kind == \'error\'" class="ov-state"><div class="ov-banner ov-banner-error" role="alert">{{ message }}</div>' +
+    '<button type="button" class="ov-btn" @click="$emit(\'retry\')">Try again</button></div>' +
+    '<div v-else-if="kind == \'empty\'" class="ov-state"><h3>{{ message }}</h3>' +
+    '<span class="ov-muted ov-small" v-if="checked">{{ checked }}</span>' +
+    '<button type="button" class="ov-btn ov-btn-primary" v-if="canAdd" @click="$emit(\'add\')">Add user</button></div>' +
+    '<div v-else class="ov-state"><h3>{{ message }}</h3>' +
+    '<button type="button" class="ov-btn" @click="$emit(\'showall\')">Show all users</button></div>' +
+    '</div>'
+};
+
 const app = createApp({
   data() {
     return {
@@ -514,17 +780,17 @@ const app = createApp({
         },
       ],
       rows: [],
-      // Order inside a group is the order on screen (History is always first
+      // order inside a group is the order on screen (History is always first
       // and is rendered separately). group 'danger' sits at the far right.
       actions: [
-        { name: 'u-unrevoke', label: 'Unrevoke', group: 'routine', showWhenStatus: ['Revoked'], showForServerRole: ['master'], showForModule: ['core'] },
-        { name: 'u-download-config', label: 'Download config', group: 'routine', showWhenStatus: ['Active'], showForServerRole: ['master', 'slave'], showForModule: ['core'] },
-        { name: 'u-edit-ccd', label: 'Edit routes', group: 'routine', showWhenStatus: ['Active'], showForServerRole: ['master'], showForModule: ['ccd'] },
-        { name: 'u-edit-ccd', label: 'Show routes', group: 'routine', showWhenStatus: ['Active'], showForServerRole: ['slave'], showForModule: ['ccd'] },
-        { name: 'u-change-password', label: 'Set password', group: 'routine', showWhenStatus: ['Active'], showForServerRole: ['master'], showForModule: ['passwdAuth'] },
-        { name: 'u-rotate', label: 'Rotate…', group: 'routine', showWhenStatus: ['Revoked', 'Expired'], showForServerRole: ['master'], showForModule: ['core'] },
-        { name: 'u-revoke', label: 'Revoke…', group: 'danger', showWhenStatus: ['Active'], showForServerRole: ['master'], showForModule: ['core'] },
-        { name: 'u-delete', label: 'Delete…', group: 'danger', showWhenStatus: ['Revoked', 'Expired'], showForServerRole: ['master'], showForModule: ['core'] },
+        { name: 'u-unrevoke', label: 'Unrevoke', icon: 'i-undo', group: 'routine', showWhenStatus: ['Revoked'], showForServerRole: ['master'], showForModule: ['core'] },
+        { name: 'u-download-config', label: 'Download config', icon: 'i-download', group: 'routine', showWhenStatus: ['Active'], showForServerRole: ['master', 'slave'], showForModule: ['core'] },
+        { name: 'u-edit-ccd', label: 'Edit routes', icon: 'i-route', group: 'routine', showWhenStatus: ['Active'], showForServerRole: ['master'], showForModule: ['ccd'] },
+        { name: 'u-edit-ccd', label: 'Show routes', icon: 'i-route', group: 'routine', showWhenStatus: ['Active'], showForServerRole: ['slave'], showForModule: ['ccd'] },
+        { name: 'u-change-password', label: 'Set password', icon: 'i-key', group: 'routine', showWhenStatus: ['Active'], showForServerRole: ['master'], showForModule: ['passwdAuth'] },
+        { name: 'u-rotate', label: 'Rotate…', icon: 'i-rotate', group: 'routine', showWhenStatus: ['Revoked', 'Expired'], showForServerRole: ['master'], showForModule: ['core'] },
+        { name: 'u-revoke', label: 'Revoke…', icon: 'i-ban', group: 'danger', showWhenStatus: ['Active'], showForServerRole: ['master'], showForModule: ['core'] },
+        { name: 'u-delete', label: 'Delete…', icon: 'i-trash', group: 'danger', showWhenStatus: ['Revoked', 'Expired'], showForServerRole: ['master'], showForModule: ['core'] },
       ],
       filters: {
         hideRevoked: cookies.get('hideRevoked') == "true",
@@ -541,11 +807,34 @@ const app = createApp({
       loaded: false,
       refreshing: false,
       updatedAt: null,
+      // a refresh failed while rows are on screen: the message
+      staleError: '',
       now: Date.now(),
       rowBusy: {},
       // the one open dialog: {kind: 'add'|'password'|'revoke'|'delete'|'rotate'|'config'|'routes'|'history', ...}
       dialog: null,
       notificationSpeed: (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) ? 0 : 900,
+      // layout: cards up to 768 px, tables from 769 px
+      isNarrow: window.matchMedia('(max-width: 768px)').matches,
+      // 'users' | 'bans', mirrored in location.hash
+      view: viewFromHash(),
+      offline: typeof navigator.onLine === 'boolean' ? !navigator.onLine : false,
+      // action menu of a row: {username, row key} or null (the opener element is kept out of the reactive state)
+      menu: null,
+      menuAnchor: null,
+      // banned IPs
+      bans: [],
+      bansLoaded: false,
+      bansLoading: true,
+      bansRefreshing: false,
+      bansError: '',
+      bansErrorNotFound: false,
+      bansStaleError: '',
+      bansUpdatedAt: null,
+      bansFailures: 0,
+      bansNow: Date.now(),
+      bansAnnounce: '',
+      bansSearch: '',
     }
   },
   mounted: function () {
@@ -554,6 +843,89 @@ const app = createApp({
     var _this = this;
     new MutationObserver(function() { _this.syncAriaSort(); })
       .observe(document.getElementById('app'), { subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'aria-sort'] });
+
+    // layout switch cards <-> table
+    this.mql = window.matchMedia('(max-width: 768px)');
+    this.onMql = function(event) { _this.isNarrow = event.matches; };
+    if (this.mql.addEventListener) {
+      this.mql.addEventListener('change', this.onMql);
+    } else if (this.mql.addListener) {
+      this.mql.addListener(this.onMql);
+    }
+
+    // view <-> hash, tab visibility and connectivity
+    this.onHashChange = function() {
+      var view = viewFromHash();
+      if (view !== _this.view) {
+        _this.view = view;
+      }
+    };
+    this.onVisibility = function() {
+      if (document.visibilityState === 'visible') {
+        _this.bansNow = Date.now();
+        _this.pollBans(true);
+      } else {
+        _this.stopBansTimer();
+      }
+    };
+    this.onOnline = function() {
+      _this.offline = false;
+      _this.pollBans(true);
+    };
+    this.onOffline = function() {
+      _this.offline = true;
+      _this.stopBansTimer();
+    };
+    window.addEventListener('hashchange', this.onHashChange);
+    document.addEventListener('visibilitychange', this.onVisibility);
+    window.addEventListener('online', this.onOnline);
+    window.addEventListener('offline', this.onOffline);
+
+    // relative times of the ban list move on without a request
+    this.nowTimer = setInterval(function() { _this.bansNow = Date.now(); }, BANS_POLL_MS);
+
+    // the sticky header height: offset of the sticky table header and scroll-padding
+    var header = this.$refs.header;
+    if (header) {
+      var setHeaderHeight = function() {
+        document.documentElement.style.setProperty('--header-h', header.offsetHeight + 'px');
+      };
+      setHeaderHeight();
+      if (window.ResizeObserver) {
+        this.headerObserver = new ResizeObserver(setHeaderHeight);
+        this.headerObserver.observe(header);
+      }
+    }
+
+    // the count badge needs the ban list even when the Users view is open
+    this.loadBans(true);
+  },
+  unmounted: function () {
+    this.stopBansTimer();
+    clearInterval(this.nowTimer);
+    window.removeEventListener('hashchange', this.onHashChange);
+    document.removeEventListener('visibilitychange', this.onVisibility);
+    window.removeEventListener('online', this.onOnline);
+    window.removeEventListener('offline', this.onOffline);
+    if (this.mql && this.mql.removeEventListener) {
+      this.mql.removeEventListener('change', this.onMql);
+    }
+    if (this.headerObserver) {
+      this.headerObserver.disconnect();
+    }
+  },
+  watch: {
+    view: function(view) {
+      var hash = view === 'bans' ? '#bans' : '#users';
+      if (window.location.hash !== hash) {
+        window.history.replaceState(null, '', hash);
+      }
+      this.menu = null;
+      if (view === 'bans') {
+        this.bansNow = Date.now();
+      }
+      this.pollBans(true);
+    },
   },
   computed: {
     ipv6Enabled: function () {
@@ -598,11 +970,257 @@ const app = createApp({
       }
       return plural(n, 'event');
     },
+    // cards have no sortable header: same default order as the table (name)
+    cardRows: function() {
+      return this.tableRows.slice().sort(function(a, b) {
+        return compareNames(a.Identity, b.Identity);
+      });
+    },
+    // 'loading' | 'error' | 'empty' | 'nomatch' | 'rows'
+    usersState: function() {
+      if (this.loading) {
+        return 'loading';
+      }
+      if (this.loadError) {
+        return 'error';
+      }
+      if (this.rows.length == 0) {
+        return 'empty';
+      }
+      return this.tableRows.length == 0 ? 'nomatch' : 'rows';
+    },
+    noMatchText: function() {
+      var q = this.search.trim();
+      return q ? 'No users match "' + q + '".' : 'No users match the filter.';
+    },
+    usersMeta: function() {
+      if (this.refreshing) {
+        return 'Refreshing…';
+      }
+      return this.updatedAt ? 'Updated ' + this.updatedTime + ' · ' + plural(this.rows.length, 'user') : '';
+    },
+    userCount: function() {
+      return this.loaded ? String(this.rows.length) : '';
+    },
+    bansCount: function() {
+      return this.bansLoaded ? this.bans.length : null;
+    },
+    bansTabLabel: function() {
+      return this.bansLoaded ? 'Banned IPs, ' + plural(this.bans.length, 'active ban') : 'Banned IPs';
+    },
+    bansUpdatedClock: function() {
+      return this.bansUpdatedAt ? formatClock(this.bansUpdatedAt) : '';
+    },
+    bansMeta: function() {
+      if (this.bansRefreshing) {
+        return 'Refreshing…';
+      }
+      if (!this.bansLoaded) {
+        return '';
+      }
+      return this.bans.length + ' active · ' + (this.offline ? 'paused while offline' : 'auto-refresh 30 s') + ' · updated ' + this.bansUpdatedClock;
+    },
+    bansShowSearch: function() {
+      return this.bans.length > BANS_SEARCH_MIN_ROWS;
+    },
+    // 'loading' | 'error' | 'empty' | 'rows'
+    bansState: function() {
+      if (!this.bansLoaded) {
+        return this.bansError ? 'error' : 'loading';
+      }
+      return this.bans.length == 0 ? 'empty' : 'rows';
+    },
+    banRows: function() {
+      var nowMs = this.bansNow;
+      var query = this.bansShowSearch ? this.bansSearch.trim().toLowerCase() : '';
+      return this.bans.filter(function(b) {
+        return query === '' || (b.ip + ' ' + b.reason + ' ' + b.reasonLabel).toLowerCase().indexOf(query) !== -1;
+      }).map(function(b) {
+        return decorateBan(b, nowMs);
+      });
+    },
+    bansErrorText: function() {
+      var text = 'Could not load banned IPs: ' + this.bansError + '.';
+      return this.bansErrorNotFound ? text + ' The ban list needs ovpn-admin v0.1.4 or later on the server.' : text;
+    },
+    menuRow: function() {
+      var username = this.menu ? this.menu.username : null;
+      var nowMs = this.now;
+      var row = this.rows.find(function(r) { return r.Identity == username; });
+      return row ? decorateRow(row, nowMs) : null;
+    },
+    menuItems: function() {
+      var row = this.menuRow;
+      if (!row) {
+        return [];
+      }
+      var _this = this;
+      var disabled = !!_this.rowBusy[row.Identity] || _this.offline;
+      var items = [{ id: 'history', label: 'Login history', icon: 'i-history', danger: false, disabled: !!_this.rowBusy[row.Identity] }];
+      ['routine', 'danger'].forEach(function(group) {
+        _this.rowActions(row, group).forEach(function(action) {
+          items.push({ id: action.name, label: action.label, icon: action.icon, danger: group == 'danger', disabled: disabled });
+        });
+      });
+      return items;
+    },
+    menuSubtitle: function() {
+      var row = this.menuRow;
+      return row ? row._statusLabel + (row._statusNote ? ' · ' + row._statusNote : '') : '';
+    },
+    tzLabel: function() {
+      return offsetLabel();
+    },
   },
   methods: {
+    // ---- layout, views, menu ----
+    focusMain: function() {
+      var main = document.getElementById('main');
+      if (main) {
+        main.focus();
+      }
+    },
+    refreshView: function() {
+      if (this.view == 'bans') {
+        this.loadBans(false);
+      } else {
+        this.loadUsers();
+      }
+    },
+    primaryAction: function(row) {
+      return this.rowActions(row, 'routine')[0] || null;
+    },
+    hasMore: function(row) {
+      return this.rowActions(row, 'routine').length + this.rowActions(row, 'danger').length > 0;
+    },
+    rowLocked: function(row) {
+      return !!this.rowBusy[row.Identity] || this.offline;
+    },
+    openMenu: function(row, event) {
+      this.menuAnchor = markRaw(event.currentTarget);
+      this.menu = { username: row.Identity };
+    },
+    closeMenu: function() {
+      var anchor = this.menuAnchor;
+      this.menu = null;
+      if (anchor && anchor.isConnected) {
+        anchor.focus();
+      }
+    },
+    // The menu closes first and focus goes back to its opener, so that a
+    // dialog opened by the action returns focus to the same button.
+    selectMenuItem: function(item) {
+      var _this = this;
+      var username = _this.menu ? _this.menu.username : '';
+      var anchor = _this.menuAnchor;
+      _this.menu = null;
+      if (anchor && anchor.isConnected) {
+        anchor.focus();
+      }
+      _this.$nextTick(function() {
+        if (item.id == 'history') {
+          _this.openHistory(username);
+        } else {
+          _this.rowActionFn(item.id, username);
+        }
+      });
+    },
+    iconFor: function(action) {
+      return '#' + action.icon;
+    },
+
+    // ---- banned IPs ----
+    pollingAllowed: function() {
+      return document.visibilityState !== 'hidden' && !this.offline;
+    },
+    stopBansTimer: function() {
+      if (this.bansTimer) {
+        clearTimeout(this.bansTimer);
+        this.bansTimer = null;
+      }
+    },
+    // 30 s while the Bans view is open (120 s after 3 failures in a row),
+    // 60 s to keep the count badge current while the Users view is open
+    scheduleBans: function() {
+      var _this = this;
+      _this.stopBansTimer();
+      if (!_this.pollingAllowed()) {
+        return;
+      }
+      var delay = BANS_COUNT_POLL_MS;
+      if (_this.view == 'bans') {
+        delay = _this.bansFailures >= BANS_BACKOFF_AFTER ? BANS_POLL_BACKOFF_MS : BANS_POLL_MS;
+      }
+      _this.bansTimer = setTimeout(function() { _this.pollBans(); }, delay);
+    },
+    pollBans: function() {
+      this.stopBansTimer();
+      if (this.pollingAllowed()) {
+        this.loadBans(true);
+      }
+    },
+    // one request at a time; the next poll is scheduled when it ends
+    loadBans: function(background) {
+      var _this = this;
+      if (_this.bansPromise) {
+        return _this.bansPromise;
+      }
+      _this.stopBansTimer();
+      _this.bansRefreshing = !background || !_this.bansLoaded;
+      if (!_this.bansLoaded) {
+        _this.bansLoading = true;
+        _this.bansError = '';
+      }
+      _this.bansPromise = axios.request(axios_cfg('api/bans'))
+        .then(function(response) {
+          var data = response.data;
+          var list = Array.isArray(data) ? data : (data && Array.isArray(data.bans) ? data.bans : null);
+          if (list === null) {
+            throw new Error('unexpected response');
+          }
+          var bans = list.map(normalizeBan).filter(function(b) { return b.ip !== ''; }).sort(function(a, b) {
+            return b.bannedMs - a.bannedMs;
+          });
+          var previous = _this.bansLoaded ? _this.bans.length : null;
+          _this.bans = bans;
+          _this.bansLoaded = true;
+          _this.bansUpdatedAt = new Date();
+          _this.bansNow = Date.now();
+          _this.bansFailures = 0;
+          _this.bansError = '';
+          _this.bansStaleError = '';
+          // announced only when the count changes: silent polls do not chatter
+          if (previous !== null && previous !== bans.length) {
+            _this.bansAnnounce = plural(bans.length, 'active ban');
+          }
+        })
+        .catch(function(error) {
+          _this.bansFailures++;
+          var message = trimPeriod(errorMessage(error));
+          if (_this.bansLoaded) {
+            _this.bansStaleError = message;
+          } else {
+            _this.bansError = message;
+            _this.bansErrorNotFound = !!(error.response && error.response.status === 404);
+          }
+        })
+        .then(function() {
+          _this.bansLoading = false;
+          _this.bansRefreshing = false;
+          _this.bansPromise = null;
+          _this.scheduleBans();
+        });
+      return _this.bansPromise;
+    },
+
     // vue-good-table-next marks every unsorted column aria-sort="descending";
     // only the column that is sorted may carry the attribute.
     syncAriaSort: function() {
+      document.querySelectorAll('table.ov-users').forEach(function(table) {
+        if (!table.hasAttribute('aria-label')) {
+          table.setAttribute('aria-label', 'Users');
+        }
+      });
       document.querySelectorAll('.ov-users thead th').forEach(function(th) {
         var asc = th.classList.contains('sorting-asc');
         var desc = th.classList.contains('sorting-desc');
@@ -1033,6 +1651,8 @@ const app = createApp({
         _this.loading = true;
         _this.loadError = '';
       }
+      // the Banned IPs count follows every user list load
+      _this.loadBans(true);
       return _this.fetchUsers()
         .then(function(rows) {
           _this.rows = rows;
@@ -1040,11 +1660,12 @@ const app = createApp({
           _this.updatedAt = new Date();
           _this.loaded = true;
           _this.loadError = '';
+          _this.staleError = '';
         })
         .catch(function(error) {
           if (_this.loaded) {
-            // rows are on screen: keep them
-            _this.toast('error', 'Could not refresh the user list', errorMessage(error));
+            // rows are on screen: keep them, say why they are old
+            _this.staleError = trimPeriod(errorMessage(error));
           } else {
             _this.loadError = trimPeriod(errorMessage(error));
           }
@@ -1078,6 +1699,8 @@ const app = createApp({
 });
 
 app.component('app-dialog', AppDialog);
+app.component('app-menu', AppMenu);
+app.component('app-state', AppState);
 app.component('password-field', PasswordField);
 app.use(Notifications);
 app.use(VueGoodTablePlugin);

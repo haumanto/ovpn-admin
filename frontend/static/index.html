@@ -2,101 +2,268 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#ffffff">
   <title>ovpn-admin</title>
 </head>
 <body>
 <script src="dist/style.min.js"></script>
+<!-- icon sprite: 24 px viewBox, drawn at 20 px, always aria-hidden next to a text label or aria-label -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6l7-3z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14.3-4.9L4 8"/><path d="M4 4v4h4"/><path d="M4 13a8 8 0 0 0 14.3 4.9L20 16"/><path d="M20 20v-4h-4"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></symbol>
+  <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></symbol>
+  <symbol id="i-route" viewBox="0 0 24 24"><circle cx="6" cy="18" r="2"/><circle cx="18" cy="6" r="2"/><path d="M8 18h7a3 3 0 0 0 0-6H9a3 3 0 0 1 0-6h7"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M17 6l2 2M15 8l2 2"/></symbol>
+  <symbol id="i-rotate" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/></symbol>
+  <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M6 6l12 12"/></symbol>
+  <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 5h16l-6 7v6l-4 2v-8z"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M18 14.5a6.5 6.5 0 0 1 3.5 5.5"/></symbol>
+</svg>
 <div id="app" v-cloak>
-  <div class="ov-topbar">
-    <div class="ov-search">
-      <label class="visually-hidden" for="user-search">Search users</label>
-      <input id="user-search" type="search" class="ov-input" placeholder="Search by name, status or IP" autocomplete="off" v-model="search">
-    </div>
-    <label class="ov-check">
-      <input type="checkbox" :checked="filters.hideRevoked" @change="setHideRevoked($event.target.checked)">
-      <span>Hide revoked and expired<span class="ov-muted" v-if="filters.hideRevoked && hiddenCount > 0"> ({{ hiddenCount }} hidden)</span></span>
-    </label>
-    <span class="ov-spacer"></span>
-    <span class="ov-muted" v-if="serverRole == 'slave'">Read-only replica · last sync {{ lastSync }}</span>
-    <span class="ov-muted ov-num" v-if="updatedAt">Updated {{ updatedTime }}</span>
-    <button type="button" class="ov-btn" :disabled="refreshing" :aria-busy="refreshing ? 'true' : null" @click="loadUsers()">Refresh</button>
-    <button type="button" id="add-user-btn" class="ov-btn ov-btn-primary" v-if="serverRole == 'master'" @click="openAddUser()">Add user</button>
-  </div>
+  <a class="ov-skip" href="#main" @click.prevent="focusMain()">Skip to content</a>
 
-  <vue-good-table
-    :columns="columns"
-    :rows="tableRows"
-    :line-numbers="false"
-    style-class="vgt-table ov-users"
-    :search-options="{ enabled: false }"
-    :sort-options="{ enabled: true, initialSortBy: { field: 'Identity', type: 'asc' } }">
-    <template v-slot:emptystate>
-      <div class="ov-table-state" v-if="loading">
-        <span class="ov-muted" role="status">Loading users…</span>
+  <header class="ov-header" ref="header">
+    <div class="ov-header-row">
+      <div class="ov-brand"><span class="ov-brand-mark" aria-hidden="true"><svg class="ov-icon"><use href="#i-shield"/></svg></span>ovpn-admin</div>
+      <nav class="ov-tabs" aria-label="Views">
+        <a class="ov-tab" href="#users" :aria-current="view == 'users' ? 'page' : null"><svg class="ov-icon" aria-hidden="true"><use href="#i-users"/></svg>Users <span class="ov-count ov-num" v-if="userCount">{{ userCount }}</span></a>
+        <a class="ov-tab" href="#bans" :aria-current="view == 'bans' ? 'page' : null" :aria-label="bansTabLabel"><svg class="ov-icon" aria-hidden="true"><use href="#i-ban"/></svg>Banned IPs <span class="ov-count ov-num" :class="{'ov-count-alert': bansCount > 0}" v-if="bansCount !== null" aria-hidden="true">{{ bansCount }}</span></a>
+      </nav>
+      <div class="ov-bar-end">
+        <button type="button" class="ov-btn ov-btn-ghost ov-btn-icon" aria-label="Refresh" :disabled="view == 'bans' ? bansRefreshing : refreshing" :aria-busy="(view == 'bans' ? bansRefreshing : refreshing) ? 'true' : null" @click="refreshView()"><svg class="ov-icon" :class="{'ov-spin': view == 'bans' ? bansRefreshing : refreshing}" aria-hidden="true"><use href="#i-refresh"/></svg></button>
+        <button type="button" id="add-user-btn" class="ov-btn ov-btn-primary" v-if="serverRole == 'master'" :disabled="offline" @click="openAddUser()"><svg class="ov-icon" aria-hidden="true"><use href="#i-plus"/></svg><span class="ov-add-label">Add user</span><span class="visually-hidden ov-add-sr">Add user</span></button>
       </div>
-      <div class="ov-table-state" v-else-if="loadError">
-        <div class="ov-alert" role="alert">Could not load users: {{ loadError }}.</div>
-        <button type="button" class="ov-btn" @click="loadUsers()">Try again</button>
+    </div>
+    <div class="ov-role" role="note" v-if="serverRole == 'slave'"><svg class="ov-icon" aria-hidden="true"><use href="#i-info"/></svg><span><strong>Read-only replica.</strong> Last sync {{ lastSync }}. Changes are made on the master.</span></div>
+  </header>
+
+  <!-- announced only when the number of active bans changes -->
+  <div class="visually-hidden" role="status" aria-live="polite">{{ bansAnnounce }}</div>
+
+  <main class="ov-main" id="main" tabindex="-1">
+    <div class="ov-banner ov-banner-warn" role="status" v-if="offline"><span><strong>You are offline.</strong> <template v-if="view == 'bans' ? bansUpdatedClock : updatedTime">Showing data from {{ view == 'bans' ? bansUpdatedClock : updatedTime }}. </template>Actions are disabled until the connection returns.</span></div>
+
+    <!-- USERS -->
+    <section v-show="view == 'users'" aria-labelledby="users-h">
+      <h1 id="users-h" class="visually-hidden">Users</h1>
+      <div class="ov-toolbar">
+        <div class="ov-search">
+          <label class="visually-hidden" for="user-search">Search users</label>
+          <svg class="ov-icon" aria-hidden="true"><use href="#i-search"/></svg>
+          <input id="user-search" type="search" class="ov-input" placeholder="Search name, status or IP" autocomplete="off" v-model="search">
+        </div>
+        <button type="button" class="ov-chip" :aria-pressed="filters.hideRevoked ? 'true' : 'false'" @click="setHideRevoked(!filters.hideRevoked)"><svg class="ov-icon" aria-hidden="true"><use href="#i-filter"/></svg><span>Hide revoked &amp; expired<span v-if="filters.hideRevoked && hiddenCount > 0"> ({{ hiddenCount }} hidden)</span></span></button>
+        <span class="ov-meta ov-num" role="status">{{ usersMeta }}</span>
       </div>
-      <div class="ov-table-state" v-else-if="rows.length == 0">
-        <span>No users yet.</span>
-        <button type="button" class="ov-btn ov-btn-primary" v-if="serverRole == 'master'" @click="openAddUser()">Add user</button>
-      </div>
-      <div class="ov-table-state" v-else>
-        <span>No users match the search or filter.</span>
-        <button type="button" class="ov-btn" @click="showAllUsers()">Show all users</button>
-      </div>
-    </template>
-    <template v-slot:table-row="props">
-      <template v-if="props.column.field == 'Identity'">{{ props.row.Identity }}</template>
-      <template v-else-if="props.column.field == '_rank'">
-        <span class="ov-badge" :class="props.row._badgeClass">{{ props.row._statusLabel }}</span>
-        <span class="ov-cell2" v-if="props.row._statusNote">{{ props.row._statusNote }}</span>
+      <div class="ov-banner ov-banner-warn" role="status" v-if="staleError"><span>Showing data from {{ updatedTime }}. Refresh failed: {{ staleError }}.</span><button type="button" class="ov-btn" :disabled="refreshing" @click="loadUsers()">Try again</button></div>
+
+      <!-- phones: cards -->
+      <template v-if="isNarrow">
+        <app-state v-if="usersState != 'rows'" :kind="usersState" :count="3" noun="users"
+          :message="usersState == 'error' ? 'Could not load users: ' + loadError + '.' : (usersState == 'empty' ? 'No users yet.' : noMatchText)"
+          :can-add="serverRole == 'master'" @retry="loadUsers()" @add="openAddUser()" @showall="showAllUsers()"></app-state>
+        <ul class="ov-list ov-users-cards" aria-label="Users" v-else>
+          <li class="ov-card" :class="{'ov-dimmed': row.AccountStatus == 'Revoked'}" v-for="row in cardRows" :key="row.Identity">
+            <div class="ov-card-head">
+              <h2 class="ov-card-name">{{ row.Identity }}</h2>
+              <span class="ov-badge" :class="row._badgeClass">{{ row._statusLabel }}</span>
+            </div>
+            <dl class="ov-card-facts">
+              <template v-if="row._statusNote"><dt>Status</dt><dd>{{ row._statusNote }}</dd></template>
+              <dt>Last login</dt>
+              <dd :title="row._login ? row._login.utc + ' UTC' : 'No connection found in the audit log. Logins before v0.1.1 are not recorded.'">
+                <template v-if="row._login"><span class="ov-num">{{ row._login.relative }}</span><span class="ov-muted ov-num" v-if="row.LastLoginIP"> · {{ row.LastLoginIP }}</span></template>
+                <span class="ov-muted" v-else>No record in audit log</span>
+              </dd>
+              <dt>Expires</dt>
+              <dd :title="row.ExpirationDate"><span class="ov-num">{{ row._expiry.date }}</span><span :class="row._expiry.warn ? 'ov-warn-text' : 'ov-muted'" v-if="row._expiry.text"> · {{ row._expiry.text }}</span></dd>
+            </dl>
+            <div class="ov-card-actions">
+              <button type="button" class="ov-btn ov-btn-main" v-if="primaryAction(row)"
+                :aria-label="actionAriaLabel(primaryAction(row), row.Identity)" :disabled="rowLocked(row)"
+                @click.left.stop="rowActionFn(primaryAction(row).name, row.Identity)"><svg class="ov-icon" aria-hidden="true"><use :href="iconFor(primaryAction(row))"/></svg>{{ primaryAction(row).label }}</button>
+              <button type="button" class="ov-btn" :class="{'ov-btn-main': !primaryAction(row)}" title="Login history"
+                :data-history-for="row.Identity" :aria-label="'History for ' + row.Identity" :disabled="!!rowBusy[row.Identity]"
+                @click.left.stop="openHistory(row.Identity)"><svg class="ov-icon" aria-hidden="true"><use href="#i-history"/></svg><span class="ov-hide-phone">History</span></button>
+              <button type="button" class="ov-btn ov-btn-icon" v-if="hasMore(row)" aria-haspopup="menu"
+                :aria-expanded="menu && menu.username == row.Identity ? 'true' : 'false'" :aria-label="'More actions for ' + row.Identity"
+                :disabled="!!rowBusy[row.Identity]" @click.left.stop="openMenu(row, $event)"><svg class="ov-icon" aria-hidden="true"><use href="#i-more"/></svg></button>
+            </div>
+          </li>
+        </ul>
       </template>
-      <div v-else-if="props.column.field == '_loginTs'" :title="props.row._login ? props.row._login.utc + ' UTC' : 'No connection found in the audit log. Logins before v0.1.1 are not recorded.'">
-        <template v-if="props.row._login">
-          <span class="ov-num">{{ props.row._login.local }}</span>
-          <span class="ov-cell2 ov-num">{{ props.row._login.relative }}<template v-if="props.row.LastLoginIP"> from {{ props.row.LastLoginIP }}</template></span>
-        </template>
-        <template v-else>
-          <span>No record</span>
-          <span class="ov-cell2">not in the audit log</span>
-        </template>
+
+      <!-- tablet and desktop: table -->
+      <div class="ov-table-wrap" v-else>
+        <vue-good-table
+          :columns="columns"
+          :rows="tableRows"
+          :line-numbers="false"
+          style-class="vgt-table ov-users"
+          :search-options="{ enabled: false }"
+          :sort-options="{ enabled: true, initialSortBy: { field: 'Identity', type: 'asc' } }">
+          <template v-slot:emptystate>
+            <app-state :kind="usersState" :count="5" noun="users"
+              :message="usersState == 'error' ? 'Could not load users: ' + loadError + '.' : (usersState == 'empty' ? 'No users yet.' : noMatchText)"
+              :can-add="serverRole == 'master'" @retry="loadUsers()" @add="openAddUser()" @showall="showAllUsers()"></app-state>
+          </template>
+          <template v-slot:table-row="props">
+            <template v-if="props.column.field == 'Identity'">{{ props.row.Identity }}</template>
+            <template v-else-if="props.column.field == '_rank'">
+              <span class="ov-badge" :class="props.row._badgeClass">{{ props.row._statusLabel }}</span>
+              <span class="ov-cell2" v-if="props.row._statusNote">{{ props.row._statusNote }}</span>
+            </template>
+            <div v-else-if="props.column.field == '_loginTs'" :title="props.row._login ? props.row._login.utc + ' UTC' : 'No connection found in the audit log. Logins before v0.1.1 are not recorded.'">
+              <template v-if="props.row._login">
+                <span class="ov-num">{{ props.row._login.local }}</span>
+                <span class="ov-cell2 ov-num">{{ props.row._login.relative }}<template v-if="props.row.LastLoginIP"> from {{ props.row.LastLoginIP }}</template></span>
+              </template>
+              <template v-else>
+                <span>No record</span>
+                <span class="ov-cell2">not in the audit log</span>
+              </template>
+            </div>
+            <div v-else-if="props.column.field == 'ExpirationDate'" :title="props.row.ExpirationDate">
+              <span class="ov-num">{{ props.row._expiry.date }}</span>
+              <span class="ov-cell2" :class="{'ov-warn-text': props.row._expiry.warn}" v-if="props.row._expiry.text">{{ props.row._expiry.text }}</span>
+            </div>
+            <div class="ov-row-actions" v-else-if="props.column.field == 'actions'">
+              <button
+                type="button"
+                class="ov-btn"
+                :data-history-for="props.row.Identity"
+                :aria-label="'History for ' + props.row.Identity"
+                :disabled="!!rowBusy[props.row.Identity]"
+                @click.left.stop="openHistory(props.row.Identity)">History</button>
+              <!-- tablet (769-1024): primary action + More -->
+              <button
+                type="button"
+                class="ov-btn ov-tab-only"
+                v-if="primaryAction(props.row)"
+                :aria-label="actionAriaLabel(primaryAction(props.row), props.row.Identity)"
+                :disabled="rowLocked(props.row)"
+                @click.left.stop="rowActionFn(primaryAction(props.row).name, props.row.Identity)">{{ primaryAction(props.row).label }}</button>
+              <button
+                type="button"
+                class="ov-btn ov-btn-icon ov-tab-only"
+                v-if="hasMore(props.row)"
+                aria-haspopup="menu"
+                :aria-expanded="menu && menu.username == props.row.Identity ? 'true' : 'false'"
+                :aria-label="'More actions for ' + props.row.Identity"
+                :disabled="!!rowBusy[props.row.Identity]"
+                @click.left.stop="openMenu(props.row, $event)"><svg class="ov-icon" aria-hidden="true"><use href="#i-more"/></svg></button>
+              <!-- desktop (>1024): every routine action inline, danger actions on the right -->
+              <button
+                type="button"
+                class="ov-btn ov-desk-only"
+                v-for="action in rowActions(props.row, 'routine')"
+                :key="action.name + action.label"
+                :aria-label="actionAriaLabel(action, props.row.Identity)"
+                :disabled="rowLocked(props.row)"
+                @click.left.stop="rowActionFn(action.name, props.row.Identity)">{{ action.label }}</button>
+              <span class="ov-danger-slot ov-desk-only" v-if="rowActions(props.row, 'danger').length > 0">
+                <button
+                  type="button"
+                  class="ov-btn ov-btn-danger-outline"
+                  v-for="action in rowActions(props.row, 'danger')"
+                  :key="action.name + action.label"
+                  :aria-label="actionAriaLabel(action, props.row.Identity)"
+                  :disabled="rowLocked(props.row)"
+                  @click.left.stop="rowActionFn(action.name, props.row.Identity)">{{ action.label }}</button>
+              </span>
+            </div>
+          </template>
+        </vue-good-table>
       </div>
-      <div v-else-if="props.column.field == 'ExpirationDate'" :title="props.row.ExpirationDate">
-        <span class="ov-num">{{ props.row._expiry.date }}</span>
-        <span class="ov-cell2" :class="{'ov-warn': props.row._expiry.warn}" v-if="props.row._expiry.text">{{ props.row._expiry.text }}</span>
+    </section>
+
+    <!-- BANNED IPS (read-only) -->
+    <section v-if="view == 'bans'" aria-labelledby="bans-h">
+      <div class="ov-toolbar">
+        <h1 id="bans-h" class="ov-view-title">Banned IPs</h1>
+        <div class="ov-search" v-if="bansShowSearch">
+          <label class="visually-hidden" for="ban-search">Search banned IPs</label>
+          <svg class="ov-icon" aria-hidden="true"><use href="#i-search"/></svg>
+          <input id="ban-search" type="search" class="ov-input" placeholder="Search IP or reason" autocomplete="off" v-model="bansSearch">
+        </div>
+        <span class="ov-meta ov-num">{{ bansMeta }}</span>
       </div>
-      <div class="ov-actions" v-else-if="props.column.field == 'actions'">
-        <button
-          type="button"
-          class="ov-btn ov-btn-row"
-          :data-history-for="props.row.Identity"
-          :aria-label="'History for ' + props.row.Identity"
-          :disabled="!!rowBusy[props.row.Identity]"
-          @click.left.stop="openHistory(props.row.Identity)">History</button>
-        <button
-          type="button"
-          class="ov-btn ov-btn-row"
-          v-for="action in rowActions(props.row, 'routine')"
-          :key="action.name + action.label"
-          :aria-label="actionAriaLabel(action, props.row.Identity)"
-          :disabled="!!rowBusy[props.row.Identity]"
-          @click.left.stop="rowActionFn(action.name, props.row.Identity)">{{ action.label }}</button>
-        <span class="ov-danger-slot" v-if="rowActions(props.row, 'danger').length > 0">
-          <button
-            type="button"
-            class="ov-btn ov-btn-row ov-btn-danger-outline"
-            v-for="action in rowActions(props.row, 'danger')"
-            :key="action.name + action.label"
-            :aria-label="actionAriaLabel(action, props.row.Identity)"
-            :disabled="!!rowBusy[props.row.Identity]"
-            @click.left.stop="rowActionFn(action.name, props.row.Identity)">{{ action.label }}</button>
-        </span>
-      </div>
-    </template>
-  </vue-good-table>
+      <div class="ov-banner ov-banner-warn" role="status" v-if="bansStaleError"><span>Showing data from {{ bansUpdatedClock }}. Refresh failed: {{ bansStaleError }}.</span><button type="button" class="ov-btn" :disabled="bansRefreshing" @click="loadBans(false)">Try again</button></div>
+
+      <app-state v-if="bansState != 'rows'" :kind="bansState" :count="isNarrow ? 3 : 5" noun="banned IPs"
+        :message="bansState == 'error' ? bansErrorText : 'No IPs are banned right now.'"
+        :checked="bansState == 'empty' ? 'Checked ' + bansUpdatedClock + '. This list refreshes every 30 seconds.' : ''"
+        @retry="loadBans(false)"></app-state>
+
+      <template v-else>
+        <ul class="ov-list ov-bans-cards" aria-label="Active bans" v-if="isNarrow">
+          <li class="ov-ban" :class="{'ov-ban-expired': ban._expired}" v-for="ban in banRows" :key="ban.ip">
+            <div class="ov-ban-head">
+              <h2 class="ov-ban-ip">{{ ban.ip }}</h2>
+              <span class="ov-badge ov-badge-reason">{{ ban.reasonLabel }}</span>
+              <span class="ov-badge ov-badge-revoked" v-if="ban._expired">Expired · removed on next refresh</span>
+            </div>
+            <dl class="ov-ban-facts">
+              <div>
+                <dt>Banned</dt>
+                <dd class="ov-num" v-if="ban._since" :title="ban._since.utc + ' UTC'">{{ ban._since.relative }}<span class="ov-cell2">{{ ban._since.short }}</span></dd>
+                <dd v-else><span class="ov-muted">—</span></dd>
+              </div>
+              <div>
+                <dt>Expires</dt>
+                <dd class="ov-num" v-if="ban._exp" :title="ban._exp.utc + ' UTC'">{{ ban._exp.relative }}<span class="ov-cell2">{{ ban._exp.short }}</span></dd>
+                <dd v-else><span class="ov-muted">—</span></dd>
+              </div>
+              <div>
+                <dt>Attempts</dt>
+                <dd class="ov-num">{{ ban.failures }}</dd>
+              </div>
+            </dl>
+          </li>
+        </ul>
+        <div class="ov-table-wrap" v-else>
+          <table class="ov-table ov-bans">
+            <caption class="visually-hidden">Active bans, newest first</caption>
+            <thead>
+              <tr>
+                <th scope="col">IP address</th>
+                <th scope="col">Reason</th>
+                <th scope="col">Attempts</th>
+                <th scope="col" aria-sort="descending">Banned since</th>
+                <th scope="col">Expires</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="ban in banRows" :key="ban.ip" :class="{'ov-ban-expired': ban._expired}">
+                <td class="c-name ov-mono">{{ ban.ip }}</td>
+                <td>
+                  <span class="ov-badge ov-badge-reason">{{ ban.reasonLabel }}</span>
+                  <span class="ov-cell2" v-if="ban._expired">Expired · removed on next refresh</span>
+                </td>
+                <td class="ov-num">{{ ban.failures }}</td>
+                <td class="ov-num" :title="ban._since ? ban._since.utc + ' UTC' : null"><template v-if="ban._since">{{ ban._since.full }}<span class="ov-cell2">{{ ban._since.relative }}</span></template><template v-else>—</template></td>
+                <td class="ov-num" :title="ban._exp ? ban._exp.utc + ' UTC' : null"><template v-if="ban._exp">{{ ban._exp.full }}<span class="ov-cell2">{{ ban._exp.relative }}</span></template><template v-else>—</template></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="ov-note"><svg class="ov-icon" aria-hidden="true"><use href="#i-info"/></svg><span>Read-only. The server bans an IP after repeated rejected logins or connections with a revoked certificate. Bans end on their own at the expiry time. Times are in your time zone, {{ tzLabel }}.</span></p>
+      </template>
+    </section>
+  </main>
+
+  <!-- Row action menu -->
+  <app-menu v-if="menu && menuRow" :title="menuRow.Identity" :subtitle="menuSubtitle" :items="menuItems" :anchor="menuAnchor"
+    @select="selectMenuItem($event)" @close="closeMenu()"></app-menu>
 
   <!-- Add user -->
   <app-dialog v-if="dialog && dialog.kind == 'add'" title="Add user" :busy="dialog.busy" @close="closeDialog()">
@@ -115,7 +282,7 @@
     <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
     <template #footer>
       <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
-      <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" :disabled="dialog.busy">{{ dialog.busy ? 'Creating…' : 'Create user' }}</button>
+      <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" :disabled="dialog.busy || offline">{{ dialog.busy ? 'Creating…' : 'Create user' }}</button>
     </template>
   </app-dialog>
 
@@ -129,7 +296,7 @@
     <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
     <template #footer>
       <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
-      <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" :disabled="dialog.busy">{{ dialog.busy ? 'Saving…' : 'Set password' }}</button>
+      <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" :disabled="dialog.busy || offline">{{ dialog.busy ? 'Saving…' : 'Set password' }}</button>
     </template>
   </app-dialog>
 
@@ -148,7 +315,7 @@
     <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
     <template #footer>
       <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
-      <button type="button" class="ov-btn ov-btn-danger" :disabled="dialog.busy" @click="revokeUser()">{{ dialog.busy ? 'Revoking…' : (dialog.sessions > 0 ? 'Revoke and disconnect' : 'Revoke') }}</button>
+      <button type="button" class="ov-btn ov-btn-danger" :disabled="dialog.busy || offline" @click="revokeUser()">{{ dialog.busy ? 'Revoking…' : (dialog.sessions > 0 ? 'Revoke and disconnect' : 'Revoke') }}</button>
     </template>
   </app-dialog>
 
@@ -156,7 +323,7 @@
   <app-dialog v-if="dialog && dialog.kind == 'delete'" :title="'Delete ' + dialog.username + ' permanently?'" :busy="dialog.busy"
     initial-focus="cancel" describe-body @close="closeDialog()">
     <p><strong>This cannot be undone.</strong> These are removed:</p>
-    <ul class="ov-list">
+    <ul class="ov-bullets">
       <li>the certificate and config file</li>
       <li>the static address and routes</li>
       <li v-if="modulesEnabled.includes('passwdAuth')">the password</li>
@@ -165,7 +332,7 @@
     <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
     <template #footer>
       <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
-      <button type="button" class="ov-btn ov-btn-danger" :disabled="dialog.busy" @click="deleteUser()">{{ dialog.busy ? 'Deleting…' : 'Delete user' }}</button>
+      <button type="button" class="ov-btn ov-btn-danger" :disabled="dialog.busy || offline" @click="deleteUser()">{{ dialog.busy ? 'Deleting…' : 'Delete user' }}</button>
     </template>
   </app-dialog>
 
@@ -180,7 +347,7 @@
     <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
     <template #footer>
       <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
-      <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" :disabled="dialog.busy">{{ dialog.busy ? 'Rotating…' : 'Rotate certificate' }}</button>
+      <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" :disabled="dialog.busy || offline">{{ dialog.busy ? 'Rotating…' : 'Rotate certificate' }}</button>
     </template>
   </app-dialog>
 
@@ -211,7 +378,42 @@
         </div>
       </div>
       <div class="ov-help" v-if="serverRole == 'master'">"dynamic" (Clear) lets OpenVPN assign an address from the pool.</div>
-      <div class="ov-routes-wrap">
+
+      <!-- phones: one card per route -->
+      <template v-if="isNarrow">
+        <ul class="ov-routes-cards" aria-label="Custom routes">
+          <li class="ov-route" v-for="(customRoute, index) in dialog.ccd.CustomRoutes" :key="index">
+            <template v-if="serverRole == 'slave'">
+              <dl class="ov-route-ro">
+                <dt>Address</dt><dd class="ov-num">{{ customRoute.Address }}</dd>
+                <dt>Mask / Prefix</dt><dd class="ov-num">{{ customRoute.Mask }}</dd>
+                <dt>Description</dt><dd>{{ customRoute.Description }}</dd>
+              </dl>
+            </template>
+            <template v-else>
+              <div class="ov-route-row">
+                <div><label class="ov-label" :for="'route-addr-' + index">Address</label><input :id="'route-addr-' + index" class="ov-input" v-model="customRoute.Address"></div>
+                <div><label class="ov-label" :for="'route-mask-' + index">Mask / Prefix</label><input :id="'route-mask-' + index" class="ov-input" v-model="customRoute.Mask"></div>
+              </div>
+              <div><label class="ov-label" :for="'route-desc-' + index">Description</label><input :id="'route-desc-' + index" class="ov-input" v-model="customRoute.Description"></div>
+              <button type="button" class="ov-btn ov-btn-danger-outline" :aria-label="'Delete route ' + customRoute.Address" @click="dialog.ccd.CustomRoutes.splice(index, 1)">Delete route</button>
+            </template>
+          </li>
+          <li class="ov-route ov-route-new" v-if="serverRole == 'master'">
+            <span class="ov-small ov-muted">New route</span>
+            <div class="ov-route-row">
+              <div><label class="ov-label" for="route-new-addr">Address</label><input id="route-new-addr" type="text" class="ov-input" placeholder="10.1.0.0 or fd00:1::" v-model="dialog.newRoute.Address"></div>
+              <div><label class="ov-label" for="route-new-mask">Mask / Prefix</label><input id="route-new-mask" type="text" class="ov-input" placeholder="255.255.0.0 or 64" v-model="dialog.newRoute.Mask"></div>
+            </div>
+            <div><label class="ov-label" for="route-new-desc">Description</label><input id="route-new-desc" type="text" class="ov-input" v-model="dialog.newRoute.Description"></div>
+            <button type="button" class="ov-btn" :disabled="dialog.newRoute.Address.trim() == ''" @click="addRoute()">Add route</button>
+          </li>
+        </ul>
+        <p class="ov-help ov-route-help">Mask / Prefix: IPv4 - netmask, e.g. 255.255.255.0; IPv6 - prefix length, e.g. 64 (or Address as fd00:1::/64 with empty Mask).</p>
+      </template>
+
+      <!-- tablet and desktop: the route table -->
+      <div class="ov-routes-wrap" v-else>
         <table class="ov-routes">
           <caption class="ov-help">Mask / Prefix: IPv4 - netmask, e.g. 255.255.255.0; IPv6 - prefix length, e.g. 64 (or Address as fd00:1::/64 with empty Mask).</caption>
           <thead>
@@ -252,7 +454,7 @@
     <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
     <template #footer>
       <button type="button" class="ov-btn" data-dialog-cancel data-dialog-close :disabled="dialog.busy" @click="closeDialog()">{{ serverRole == 'master' ? 'Cancel' : 'Close' }}</button>
-      <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" v-if="serverRole == 'master'" :disabled="!dialog.loaded || dialog.busy">{{ dialog.busy ? 'Saving…' : 'Save' }}</button>
+      <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" v-if="serverRole == 'master'" :disabled="!dialog.loaded || dialog.busy || offline">{{ dialog.busy ? 'Saving…' : 'Save' }}</button>
     </template>
   </app-dialog>
 
@@ -270,6 +472,19 @@
       <strong>No login events recorded for {{ dialog.username }}.</strong>
       <span class="ov-muted ov-small">Logins are recorded from v0.1.1 on. Earlier logins are not available.</span>
     </div>
+    <ul class="ov-hist-list" aria-label="Login events" v-else-if="isNarrow">
+      <li v-for="(ev, index) in dialog.events" :key="index">
+        <div class="ov-hist-l1">
+          <span :class="eventClass(ev)">{{ eventLabel(ev) }}</span>
+          <span class="ov-num ov-muted" :title="eventTimeUtc(ev) ? eventTimeUtc(ev) + ' UTC' : null">{{ eventTimeLocal(ev) }}</span>
+        </div>
+        <div class="ov-hist-l2 ov-num">
+          <span><span class="ov-muted">Client IP</span> <template v-if="ev.IP">{{ ev.IP }}</template><span class="ov-none" aria-label="not recorded" v-else>—</span></span>
+          <span><span class="ov-muted">VPN IP</span> <template v-if="ev.VirtualIP">{{ ev.VirtualIP }}</template><span class="ov-none" aria-label="not recorded" v-else>—</span></span>
+        </div>
+        <div class="ov-hist-l3 ov-num" v-if="ev.Event == 'disconnect'"><span class="ov-muted">Data</span> {{ formatBytes(ev.BytesSent) }} down · {{ formatBytes(ev.BytesReceived) }} up</div>
+      </li>
+    </ul>
     <table class="ov-hist" v-else>
       <thead>
         <tr>
