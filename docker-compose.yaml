@@ -13,6 +13,8 @@ services:
       # tcp6 = dual-stack listener: accepts clients over IPv4 and IPv6
       OVPN_PROTO: "tcp6"
       OVPN_PASSWD_AUTH: "true"
+      # connection audit log written by the OpenVPN hooks, read by ovpn-admin through the shared ./audit_master mount
+      OVPN_AUDIT_LOG: "/etc/openvpn/audit/audit.tsv"
     cap_add:
       - NET_ADMIN
     sysctls:
@@ -26,6 +28,7 @@ services:
     volumes:
       - ./easyrsa_master:/etc/openvpn/easyrsa
       - ./ccd_master:/etc/openvpn/ccd
+      - ./audit_master:/etc/openvpn/audit
   ovpn-admin:
     build:
       context: .
@@ -50,11 +53,13 @@ services:
       OVPN_AUTH_DB_PATH: "/mnt/easyrsa/pki/users.db"
       # master/slave sync token, shared with the slave (docker-compose-slave.yaml); generate it with: openssl rand -hex 32
       OVPN_MASTER_TOKEN: "${OVPN_MASTER_TOKEN:?set OVPN_MASTER_TOKEN}"
+      OVPN_AUDIT_PATH: "/mnt/audit/audit.tsv"
       LOG_LEVEL: "debug"
     network_mode: service:openvpn
     volumes:
       - ./easyrsa_master:/mnt/easyrsa
       - ./ccd_master:/mnt/ccd
+      - ./audit_master:/mnt/audit
 
 networks:
   ovpn:

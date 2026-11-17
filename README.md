@@ -144,6 +144,7 @@ The `openvpn` image (`Dockerfile.openvpn`, [setup/configure.sh](setup/configure.
 | `OVPN_PROTO` | `tcp` | Transport of the listener (`--proto`): `tcp` listens on IPv4 only, `tcp6` is dual-stack and accepts clients over IPv4 and IPv6. Independent of `OVPN_SERVER_NET6` |
 | `OVPN_PASSWD_AUTH` | `false` | Enable the additional password authentication |
 | `OVPN_ROLE` | `master` | `slave` waits for the first successful sync of its ovpn-admin with the master instead of generating new certificates |
+| `OVPN_AUDIT_LOG` | `/etc/openvpn/audit/audit.tsv` | Connection audit log written by the OpenVPN hooks, see [Audit log](#audit-log) |
 
 IPv6 forwarding (`net.ipv6.conf.all.forwarding=1`) has to be enabled in the network namespace of the container. `configure.sh` tries to set it, but `/proc/sys` is usually read-only in containers, so set it from the outside (e.g. `sysctls` in Docker Compose), otherwise only a warning is printed and IPv6 traffic of the clients is not routed. Use the same pool for `OVPN_SERVER_NET6` and ovpn-admin's `OVPN_NETWORK_IPV6`.
 
@@ -173,6 +174,24 @@ helm install openvpn-admin charts/openvpn-admin \
   --set openvpn.inlet=ExternalIP \
   --set 'openvpn.externalIPs={203.0.113.10,2001:db8::10}'
 ```
+
+### Audit log
+
+The `openvpn` image installs the hooks [client-connect.sh](setup/client-connect.sh) and [client-disconnect.sh](setup/client-disconnect.sh) and the password check [auth.sh](setup/auth.sh) (with `OVPN_PASSWD_AUTH=true`); all three append to one audit log through [audit.sh](setup/audit.sh):
+
+* **Path:** `/etc/openvpn/audit/audit.tsv` in the OpenVPN container (`OVPN_AUDIT_LOG`). ovpn-admin reads the same file through `OVPN_AUDIT_PATH` (`/mnt/audit/audit.tsv`); Docker Compose shares it as the host directory `./audit_master`, the Helm chart as an `emptyDir` volume `audit` (it is lost when the pod is recreated: mount a persistent volume there to keep it).
+* **Format:** append-only, one tab-separated line per event, a missing value is `-`, tabs and line breaks inside a value are replaced by a space and every value is cut to 128 characters:
+
+  ```
+  event  time_unix  username  real_ip  real_port  virtual_ip4  virtual_ip6  bytes_received  bytes_sent
+  ```
+
+  `event` is `connect` (client connected), `disconnect` (client left, with the byte counters of the session), `auth_ok` or `auth_fail` (password authentication result; the address of a client that is not yet connected is the one it connects from).
+* **One line per connection:** each connection writes a `connect` and later a `disconnect` line, plus an `auth_ok` or `auth_fail` line for each password check.
+* **Passwords are never logged**, only the username, address and port. The directory is `700` and the file `600`, owned by the `nobody` user that the hooks run as.
+* **Retention is operator-managed:** nothing rotates or truncates the file. Rotate it with `copytruncate` (or move it and restart the container), and keep its size in mind: ovpn-admin only reads the tail.
+* A failed write never blocks a client: the hooks print a warning to the container log and exit `0`.
+* The hooks need `script-security 2`, which `configure.sh` now always sets. The Helm chart's `openvpn.conf` loads the hooks from `/etc/openvpn/setup/` of the image, so use an image that contains them (the chart `appVersion` has to be the release that ships them).
 
 ## Upgrade notes
 

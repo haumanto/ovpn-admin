@@ -71,6 +71,9 @@ spec:
             secretKeyRef:
               name: basic-auth
               key: password
+        # connection audit log written by the OpenVPN hooks, shared through the "audit" volume
+        - name: OVPN_AUDIT_PATH
+          value: /mnt/audit/audit.tsv
         ports:
         - name: ovpn-admin
           protocol: TCP
@@ -96,9 +99,15 @@ spec:
             mountPath: /mnt/certs
           - name: ccd
             mountPath: /mnt/ccd
+          - name: audit
+            mountPath: /mnt/audit
       - name: openvpn
         image: {{ .Values.openvpn.repo }}:{{ include "openvpn-admin.imageTag" (dict "tag" .Values.openvpn.tag "appVersion" .Chart.AppVersion) }}
         command: [ '/entrypoint.sh' ]
+        env:
+        # connection audit log written by the OpenVPN hooks (client-connect, client-disconnect), read by ovpn-admin
+        - name: OVPN_AUDIT_LOG
+          value: /etc/openvpn/audit/audit.tsv
         # imagePullPolicy: Always
         securityContext:
           allowPrivilegeEscalation: false
@@ -127,6 +136,8 @@ spec:
           mountPath: /etc/openvpn/certs
         - name: ccd
           mountPath: /etc/openvpn/ccd
+        - name: audit
+          mountPath: /etc/openvpn/audit
         - name: config
           mountPath: /etc/openvpn/openvpn.conf
           subPath: openvpn.conf
@@ -143,6 +154,8 @@ spec:
       - name: certs
         emptyDir: {}
       - name: ccd
+        emptyDir: {}
+      - name: audit
         emptyDir: {}
       - name: config
         configMap:

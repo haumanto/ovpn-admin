@@ -15,4 +15,4 @@ RUN apk add --update bash openvpn easy-rsa iptables ip6tables sqlite && \
     rm -rf /tmp/* /var/tmp/* /var/cache/apk/* /var/cache/distfiles/*
 RUN if [ -f "/usr/local/bin/openvpn-user-${TARGETARCH}" ]; then ln -s /usr/local/bin/openvpn-user-${TARGETARCH} /usr/local/bin/openvpn-user; fi
 COPY setup/ /etc/openvpn/setup
-RUN chmod +x /etc/openvpn/setup/configure.sh
+RUN chmod +x /etc/openvpn/setup/*.sh

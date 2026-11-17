@@ -74,12 +74,32 @@ fi
 
 cp -f /etc/openvpn/setup/openvpn.conf /etc/openvpn/openvpn.conf
 
+# connection audit log: the hooks append one line per connect, disconnect and password-auth result
+# (format and path: audit.sh, env OVPN_AUDIT_LOG; ovpn-admin reads the same file)
+mkdir -p /etc/openvpn/scripts/
+for script in audit.sh client-connect.sh client-disconnect.sh; do
+  cp -f "/etc/openvpn/setup/${script}" "/etc/openvpn/scripts/${script}"
+  chmod +x "/etc/openvpn/scripts/${script}"
+done
+echo "script-security 2" | tee -a /etc/openvpn/openvpn.conf
+echo "client-connect /etc/openvpn/scripts/client-connect.sh" | tee -a /etc/openvpn/openvpn.conf
+echo "client-disconnect /etc/openvpn/scripts/client-disconnect.sh" | tee -a /etc/openvpn/openvpn.conf
+# the hooks run as the unprivileged "user nobody" of openvpn.conf, so it owns the directory (and an existing log);
+# the directory is 700 and the log is created 600 (umask 077 in audit.sh)
+AUDIT_LOG_FILE="${OVPN_AUDIT_LOG:-/etc/openvpn/audit/audit.tsv}"
+AUDIT_LOG_DIR="$(dirname "${AUDIT_LOG_FILE}")"
+mkdir -p "${AUDIT_LOG_DIR}"
+chown nobody:nogroup "${AUDIT_LOG_DIR}"
+chmod 700 "${AUDIT_LOG_DIR}"
+if [ -f "${AUDIT_LOG_FILE}" ]; then
+  chown nobody:nogroup "${AUDIT_LOG_FILE}"
+  chmod 600 "${AUDIT_LOG_FILE}"
+fi
+
 if [ "${OVPN_PASSWD_AUTH:-false}" = "true" ]; then
-  mkdir -p /etc/openvpn/scripts/
   cp -f /etc/openvpn/setup/auth.sh /etc/openvpn/scripts/auth.sh
   chmod +x /etc/openvpn/scripts/auth.sh
   echo "auth-user-pass-verify /etc/openvpn/scripts/auth.sh via-file" | tee -a /etc/openvpn/openvpn.conf
-  echo "script-security 2" | tee -a /etc/openvpn/openvpn.conf
   echo "verify-client-cert require" | tee -a /etc/openvpn/openvpn.conf
   # db-init also creates the "migrations" table that openvpn-user >= 1.0.5 needs for db-migrate on a database created by <= 1.0.4
   openvpn-user db-init --db.path="${EASY_RSA_LOC}/pki/users.db" && openvpn-user db-migrate --db.path="${EASY_RSA_LOC}/pki/users.db"

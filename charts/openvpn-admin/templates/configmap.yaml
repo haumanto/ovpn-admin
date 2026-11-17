@@ -66,6 +66,11 @@ data:
     tls-auth /etc/openvpn/certs/pki/ta.key
     client-config-dir /etc/openvpn/ccd
 
+    # connection audit log (OVPN_AUDIT_LOG): the hooks of the openvpn image append one line per connect and disconnect
+    script-security 2
+    client-connect /etc/openvpn/setup/client-connect.sh
+    client-disconnect /etc/openvpn/setup/client-disconnect.sh
+
   entrypoint.sh: |-
     #!/bin/sh
     set -x

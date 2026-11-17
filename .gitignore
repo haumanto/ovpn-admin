@@ -7,6 +7,7 @@ easyrsa_slave
 ccd
 ccd_master
 ccd_slave
+audit_master/
 frontend/node_modules
 
 main-packr.go
