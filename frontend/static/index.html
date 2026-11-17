@@ -8,232 +8,306 @@
 <body>
 <script src="dist/style.min.js"></script>
 <div id="app" v-cloak>
+  <div class="ov-topbar">
+    <div class="ov-search">
+      <label class="visually-hidden" for="user-search">Search users</label>
+      <input id="user-search" type="search" class="ov-input" placeholder="Search by name, status or IP" autocomplete="off" v-model="search">
+    </div>
+    <label class="ov-check">
+      <input type="checkbox" :checked="filters.hideRevoked" @change="setHideRevoked($event.target.checked)">
+      <span>Hide revoked and expired<span class="ov-muted" v-if="filters.hideRevoked && hiddenCount > 0"> ({{ hiddenCount }} hidden)</span></span>
+    </label>
+    <span class="ov-spacer"></span>
+    <span class="ov-muted" v-if="serverRole == 'slave'">Read-only replica · last sync {{ lastSync }}</span>
+    <span class="ov-muted ov-num" v-if="updatedAt">Updated {{ updatedTime }}</span>
+    <button type="button" class="ov-btn" :disabled="refreshing" :aria-busy="refreshing ? 'true' : null" @click="loadUsers()">Refresh</button>
+    <button type="button" id="add-user-btn" class="ov-btn ov-btn-primary" v-if="serverRole == 'master'" @click="openAddUser()">Add user</button>
+  </div>
+
   <vue-good-table
     :columns="columns"
-    :rows="filteredRows"
-    :line-numbers="true"
-    :row-style-class="rowStyleClassFn"
-    :search-options="{ enabled: true }">
-    <template v-slot:table-actions>
-      <button type="button" class="btn btn-sm btn-success el-square" v-show="serverRole == 'master'" v-on:click.stop="u.modalNewUserVisible=true">Add user</button>
-      <span class="badge text-bg-info el-square" v-if="serverRole == 'slave'">Slave - last sync: {{ lastSync }}</span>
-      <button type="button" class="btn btn-sm btn-secondary el-square" v-on:click.stop="toggleRevokedFilter()">{{ revokeFilterText }}</button>
-    </template>
+    :rows="tableRows"
+    :line-numbers="false"
+    style-class="vgt-table ov-users"
+    :search-options="{ enabled: false }"
+    :sort-options="{ enabled: true, initialSortBy: { field: 'Identity', type: 'asc' } }">
     <template v-slot:emptystate>
-      <div class="d-flex justify-content-center">
-        <h4>No users have been created yet.</h4>
-        <br>
-        <button type="button" class="btn btn-sm btn-success el-square" v-if="serverRole == 'master'" v-on:click.stop="u.modalNewUserVisible=true">Add user</button>
+      <div class="ov-table-state" v-if="loading">
+        <span class="ov-muted" role="status">Loading users…</span>
+      </div>
+      <div class="ov-table-state" v-else-if="loadError">
+        <div class="ov-alert" role="alert">Could not load users: {{ loadError }}.</div>
+        <button type="button" class="ov-btn" @click="loadUsers()">Try again</button>
+      </div>
+      <div class="ov-table-state" v-else-if="rows.length == 0">
+        <span>No users yet.</span>
+        <button type="button" class="ov-btn ov-btn-primary" v-if="serverRole == 'master'" @click="openAddUser()">Add user</button>
+      </div>
+      <div class="ov-table-state" v-else>
+        <span>No users match the search or filter.</span>
+        <button type="button" class="ov-btn" @click="showAllUsers()">Show all users</button>
       </div>
     </template>
     <template v-slot:table-row="props">
-      <span v-if="props.column.field == 'actions'">
+      <template v-if="props.column.field == 'Identity'">{{ props.row.Identity }}</template>
+      <template v-else-if="props.column.field == '_rank'">
+        <span class="ov-badge" :class="props.row._badgeClass">{{ props.row._statusLabel }}</span>
+        <span class="ov-cell2" v-if="props.row._statusNote">{{ props.row._statusNote }}</span>
+      </template>
+      <div v-else-if="props.column.field == '_loginTs'" :title="props.row._login ? props.row._login.utc + ' UTC' : 'No connection found in the audit log. Logins before v0.1.1 are not recorded.'">
+        <template v-if="props.row._login">
+          <span class="ov-num">{{ props.row._login.local }}</span>
+          <span class="ov-cell2 ov-num">{{ props.row._login.relative }}<template v-if="props.row.LastLoginIP"> from {{ props.row.LastLoginIP }}</template></span>
+        </template>
+        <template v-else>
+          <span>No record</span>
+          <span class="ov-cell2">not in the audit log</span>
+        </template>
+      </div>
+      <div v-else-if="props.column.field == 'ExpirationDate'" :title="props.row.ExpirationDate">
+        <span class="ov-num">{{ props.row._expiry.date }}</span>
+        <span class="ov-cell2" :class="{'ov-warn': props.row._expiry.warn}" v-if="props.row._expiry.text">{{ props.row._expiry.text }}</span>
+      </div>
+      <div class="ov-actions" v-else-if="props.column.field == 'actions'">
         <button
-          class="btn btn-sm el-square modal-el-margin"
           type="button"
-          v-for="action in rowActions(props.row)"
-          :key="action.name"
-          :title="action.label"
-          v-bind:class="action.class"
-          @click.left.stop="rowActionFn(action.name, props.row.Identity)">
-          {{ action.label }}
-        </button>
-      </span>
-      <span v-else>{{ props.formattedRow[props.column.field] }}</span>
+          class="ov-btn ov-btn-row"
+          :data-history-for="props.row.Identity"
+          :aria-label="'History for ' + props.row.Identity"
+          :disabled="!!rowBusy[props.row.Identity]"
+          @click.left.stop="openHistory(props.row.Identity)">History</button>
+        <button
+          type="button"
+          class="ov-btn ov-btn-row"
+          v-for="action in rowActions(props.row, 'routine')"
+          :key="action.name + action.label"
+          :aria-label="actionAriaLabel(action, props.row.Identity)"
+          :disabled="!!rowBusy[props.row.Identity]"
+          @click.left.stop="rowActionFn(action.name, props.row.Identity)">{{ action.label }}</button>
+        <span class="ov-danger-slot" v-if="rowActions(props.row, 'danger').length > 0">
+          <button
+            type="button"
+            class="ov-btn ov-btn-row ov-btn-danger-outline"
+            v-for="action in rowActions(props.row, 'danger')"
+            :key="action.name + action.label"
+            :aria-label="actionAriaLabel(action, props.row.Identity)"
+            :disabled="!!rowBusy[props.row.Identity]"
+            @click.left.stop="rowActionFn(action.name, props.row.Identity)">{{ action.label }}</button>
+        </span>
+      </div>
     </template>
   </vue-good-table>
 
-  <div class="modal modal-wrapper" v-if="u.modalNewUserVisible" v-bind:style="modalNewUserDisplay">
-    <div class="modal-dialog modal-lg">
-        <div class="modal-content">
-        <div class="modal-header">
-          <h4>Add new user</h4>
-        </div>
-        <div class="modal-body">
-          <input type="text" class="form-control el-square modal-el-margin" placeholder="Username [_a-zA-Z0-9\.-]" v-model="u.newUserName">
-          <input type="password" class="form-control el-square modal-el-margin" minlength="6" autocomplete="off" placeholder="Password [_a-zA-Z0-9\.-]" v-model="u.newUserPassword" v-if="modulesEnabled.includes('passwdAuth')">
-        </div>
+  <!-- Add user -->
+  <app-dialog v-if="dialog && dialog.kind == 'add'" title="Add user" :busy="dialog.busy" @close="closeDialog()">
+    <form id="dialog-form" novalidate @submit.prevent="createUser()">
+      <div class="ov-field">
+        <label class="ov-label" for="f-username">Username</label>
+        <input id="f-username" class="ov-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+          v-model="dialog.username" :aria-invalid="fieldError('username') ? 'true' : null"
+          aria-describedby="f-username-help f-username-err">
+        <div class="ov-help" id="f-username-help">Letters, digits, and . _ - @</div>
+        <div class="ov-error" id="f-username-err" v-if="fieldError('username')">{{ fieldError('username') }}</div>
+      </div>
+      <password-field v-if="modulesEnabled.includes('passwdAuth')" id="f-password" label="Password"
+        help="At least 6 characters." v-model="dialog.password" :error="fieldError('password')"></password-field>
+    </form>
+    <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
+    <template #footer>
+      <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
+      <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" :disabled="dialog.busy">{{ dialog.busy ? 'Creating…' : 'Create user' }}</button>
+    </template>
+  </app-dialog>
 
-        <div class="modal-footer justify-content-center" v-if="u.newUserCreateError.length > 0">
-          <div class="alert alert-danger" role="alert" >
-            {{ u.newUserCreateError }}
-          </div>
-        </div>
-        <div class="modal-footer">
-            <button type="button" class="btn btn-success el-square modal-el-margin" v-on:click.stop="createUser()">Create</button>
-            <button type="button" class="btn btn-primary el-square d-flex justify-content-sm-end modal-el-margin" v-on:click.stop="u.newUserName='';u.newUserPassword='nopass';u.newUserCreateError='';u.modalNewUserVisible=false">Close</button>
+  <!-- Set password -->
+  <app-dialog v-if="dialog && dialog.kind == 'password'" :title="'Set password for ' + dialog.username" :busy="dialog.busy" @close="closeDialog()">
+    <form id="dialog-form" novalidate @submit.prevent="changeUserPassword()">
+      <password-field id="f-password" label="New password"
+        help="At least 6 characters. The user's current VPN session is not affected."
+        v-model="dialog.password" :error="fieldError('password')"></password-field>
+    </form>
+    <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
+    <template #footer>
+      <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
+      <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" :disabled="dialog.busy">{{ dialog.busy ? 'Saving…' : 'Set password' }}</button>
+    </template>
+  </app-dialog>
+
+  <!-- Revoke -->
+  <app-dialog v-if="dialog && dialog.kind == 'revoke'" :title="'Revoke ' + dialog.username + '?'" :busy="dialog.busy"
+    initial-focus="cancel" describe-body @close="closeDialog()">
+    <p class="ov-impact" role="status">
+      <template v-if="dialog.checking">Checking live sessions…</template>
+      <template v-else-if="dialog.sessions === null">Any live session of {{ dialog.username }} is disconnected immediately.</template>
+      <template v-else-if="dialog.sessions > 1"><strong>{{ dialog.username }} is connected now ({{ dialog.sessions }} sessions).</strong> Revoking disconnects them immediately.</template>
+      <template v-else-if="dialog.sessions == 1"><strong>{{ dialog.username }} is connected now.</strong> Revoking disconnects the session immediately.</template>
+      <template v-else>{{ dialog.username }} is not connected now.</template>
+    </p>
+    <p>{{ dialog.username }} can no longer connect. Their certificate is revoked.</p>
+    <p class="ov-muted">You can undo this with Unrevoke. The same config file then works again.</p>
+    <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
+    <template #footer>
+      <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
+      <button type="button" class="ov-btn ov-btn-danger" :disabled="dialog.busy" @click="revokeUser()">{{ dialog.busy ? 'Revoking…' : (dialog.sessions > 0 ? 'Revoke and disconnect' : 'Revoke') }}</button>
+    </template>
+  </app-dialog>
+
+  <!-- Delete -->
+  <app-dialog v-if="dialog && dialog.kind == 'delete'" :title="'Delete ' + dialog.username + ' permanently?'" :busy="dialog.busy"
+    initial-focus="cancel" describe-body @close="closeDialog()">
+    <p><strong>This cannot be undone.</strong> These are removed:</p>
+    <ul class="ov-list">
+      <li>the certificate and config file</li>
+      <li>the static address and routes</li>
+      <li v-if="modulesEnabled.includes('passwdAuth')">the password</li>
+    </ul>
+    <p class="ov-muted">Login history stays in the audit log. The name {{ dialog.username }} can be used again.</p>
+    <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
+    <template #footer>
+      <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
+      <button type="button" class="ov-btn ov-btn-danger" :disabled="dialog.busy" @click="deleteUser()">{{ dialog.busy ? 'Deleting…' : 'Delete user' }}</button>
+    </template>
+  </app-dialog>
+
+  <!-- Rotate -->
+  <app-dialog v-if="dialog && dialog.kind == 'rotate'" :title="'Rotate certificate for ' + dialog.username + '?'" :busy="dialog.busy"
+    :initial-focus="modulesEnabled.includes('passwdAuth') ? 'first' : 'cancel'" describe-body @close="closeDialog()">
+    <p>A new certificate is issued and {{ dialog.username }} becomes Active again. The old config file stops working. Download the new config and send it to {{ dialog.username }}.</p>
+    <form id="dialog-form" novalidate @submit.prevent="rotateUser()">
+      <password-field v-if="modulesEnabled.includes('passwdAuth')" id="f-password" label="New password"
+        help="At least 6 characters. Replaces the old password." v-model="dialog.password" :error="fieldError('password')"></password-field>
+    </form>
+    <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
+    <template #footer>
+      <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
+      <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" :disabled="dialog.busy">{{ dialog.busy ? 'Rotating…' : 'Rotate certificate' }}</button>
+    </template>
+  </app-dialog>
+
+  <!-- Show config (no row action opens it yet) -->
+  <app-dialog v-if="dialog && dialog.kind == 'config'" :title="'ovpn config for ' + dialog.username" size="md" @close="closeDialog()">
+    <pre class="ov-config">{{ dialog.text }}</pre>
+    <template #footer>
+      <button type="button" class="ov-btn" @click="copyConfig()">Copy</button>
+      <button type="button" class="ov-btn" data-dialog-close @click="closeDialog()">Close</button>
+    </template>
+  </app-dialog>
+
+  <!-- Routes -->
+  <app-dialog v-if="dialog && dialog.kind == 'routes'" :title="'Routes table for: ' + dialog.username" size="md" :busy="dialog.busy" @close="closeDialog()">
+    <form id="dialog-form" novalidate @submit.prevent="ccdApply()">
+      <div class="ov-field">
+        <label class="ov-label" for="static-address">Static IPv4 address</label>
+        <div class="ov-pw-row">
+          <input id="static-address" type="text" class="ov-input" v-model="dialog.ccd.ClientAddress" placeholder="172.16.100.10" :readonly="serverRole != 'master'">
+          <button id="static-address-clear" class="ov-btn" type="button" v-if="serverRole == 'master'" :disabled="dialog.ccd.ClientAddress == 'dynamic'" @click="dialog.ccd.ClientAddress = 'dynamic'">Clear</button>
         </div>
       </div>
+      <div class="ov-field" v-if="showIPv6Address">
+        <label class="ov-label" for="static-address-ipv6">Static IPv6 address</label>
+        <div class="ov-pw-row">
+          <input id="static-address-ipv6" type="text" class="ov-input" v-model="dialog.ccd.ClientAddressIPv6" placeholder="fd00:16:100::10" :readonly="serverRole != 'master'">
+          <button id="static-address-ipv6-clear" class="ov-btn" type="button" v-if="serverRole == 'master'" :disabled="dialog.ccd.ClientAddressIPv6 == 'dynamic'" @click="dialog.ccd.ClientAddressIPv6 = 'dynamic'">Clear</button>
+        </div>
+      </div>
+      <div class="ov-help" v-if="serverRole == 'master'">"dynamic" (Clear) lets OpenVPN assign an address from the pool.</div>
+      <div class="ov-routes-wrap">
+        <table class="ov-routes">
+          <caption class="ov-help">Mask / Prefix: IPv4 - netmask, e.g. 255.255.255.0; IPv6 - prefix length, e.g. 64 (or Address as fd00:1::/64 with empty Mask).</caption>
+          <thead>
+            <tr>
+              <th scope="col">Address</th>
+              <th scope="col">Mask / Prefix</th>
+              <th scope="col">Description</th>
+              <th scope="col" v-if="serverRole == 'master'"><span class="visually-hidden">Action</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(customRoute, index) in dialog.ccd.CustomRoutes" :key="index">
+              <template v-if="serverRole == 'slave'">
+                <td>{{ customRoute.Address }}</td>
+                <td>{{ customRoute.Mask }}</td>
+                <td>{{ customRoute.Description }}</td>
+              </template>
+              <template v-else>
+                <td><input class="ov-input" aria-label="Route address" v-model="customRoute.Address"></td>
+                <td><input class="ov-input" aria-label="Route mask or prefix" v-model="customRoute.Mask"></td>
+                <td><input class="ov-input" aria-label="Route description" v-model="customRoute.Description"></td>
+                <td class="ov-routes-act"><button type="button" class="ov-btn ov-btn-danger-outline" :aria-label="'Delete route ' + customRoute.Address" @click="dialog.ccd.CustomRoutes.splice(index, 1)">Delete</button></td>
+              </template>
+            </tr>
+          </tbody>
+          <tbody v-if="serverRole == 'master'">
+            <tr class="ov-newroute-cap"><td colspan="4">New route</td></tr>
+            <tr>
+              <td><input type="text" class="ov-input" aria-label="Route address" placeholder="10.1.0.0 or fd00:1::" v-model="dialog.newRoute.Address"></td>
+              <td><input type="text" class="ov-input" aria-label="Route mask or prefix" placeholder="255.255.0.0 or 64" v-model="dialog.newRoute.Mask"></td>
+              <td><input type="text" class="ov-input" aria-label="Route description" v-model="dialog.newRoute.Description"></td>
+              <td class="ov-routes-act"><button type="button" class="ov-btn" :disabled="dialog.newRoute.Address.trim() == ''" @click="addRoute()">Add</button></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </form>
+    <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
+    <template #footer>
+      <button type="button" class="ov-btn" data-dialog-cancel data-dialog-close :disabled="dialog.busy" @click="closeDialog()">{{ serverRole == 'master' ? 'Cancel' : 'Close' }}</button>
+      <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" v-if="serverRole == 'master'" :disabled="!dialog.loaded || dialog.busy">{{ dialog.busy ? 'Saving…' : 'Save' }}</button>
+    </template>
+  </app-dialog>
+
+  <!-- Login history -->
+  <app-dialog v-if="dialog && dialog.kind == 'history'" :title="'Login history: ' + dialog.username" size="lg" flush initial-focus="close" @close="closeDialog()">
+    <template #meta>Newest first. Times are in your time zone, {{ offsetLabel }}.</template>
+    <div class="ov-hist-state" v-if="dialog.status == 'loading'" role="status">
+      <span class="ov-muted">Loading login history…</span>
     </div>
-  </div>
-
-  <div class="modal modal-wrapper" v-if="u.modalChangePasswordVisible" v-bind:style="modalChangePasswordDisplay">
-    <div class="modal-dialog modal-lg">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h4>Change password for: <strong>{{ username }}</strong></h4>
-        </div>
-        <div class="modal-body">
-          <input type="password" class="form-control el-square modal-el-margin" minlength="6" autocomplete="off" placeholder="Password [_a-zA-Z0-9\.-]" v-model="u.newPassword">
-        </div>
-
-        <div class="modal-footer justify-content-center" v-if="u.passwordChangeMessage.length > 0">
-          <div class="alert" v-bind:class="passwordChangeStatusCssClass" role="alert" >
-            {{ u.passwordChangeMessage }}
-          </div>
-        </div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-success el-square modal-el-margin" v-on:click.stop="changeUserPassword(username)">Change password</button>
-          <button type="button" class="btn btn-primary el-square d-flex justify-content-sm-end modal-el-margin" v-on:click.stop="u.newPassword='';u.passwordChangeMessage='';u.modalChangePasswordVisible=false">Close</button>
-        </div>
-      </div>
+    <div class="ov-hist-state" v-else-if="dialog.status == 'error'">
+      <div class="ov-alert" role="alert">Could not load login history: {{ dialog.error }}.</div>
+      <button type="button" class="ov-btn" @click="loadHistory()">Try again</button>
     </div>
-  </div>
-
-  <div class="modal modal-wrapper" v-if="u.modalShowConfigVisible" v-bind:style="modalShowConfigDisplay">
-    <div class="modal-dialog modal-lg">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h4>ovpn config for: <strong>{{ username }}</strong></h4>
-        </div>
-        <div class="modal-body">
-          <div class="d-flex">
-            <pre class="modal-show-config-txt-box">{{ u.openvpnConfig }}</pre>
-          </div>
-        </div>
-        <div class="modal-footer">
-          <div class="d-flex">
-            <button type="button" class="btn btn-success el-square modal-el-margin" v-on:click.stop="copyConfig()">Copy </button>
-            <button type="button" class="btn btn-primary el-square modal-el-margin" v-on:click.stop="u.openvpnConfig='';u.modalShowConfigVisible=false">Cancel</button>
-          </div>
-        </div>
-      </div>
-      </div>
+    <div class="ov-hist-state" v-else-if="dialog.events.length == 0">
+      <strong>No login events recorded for {{ dialog.username }}.</strong>
+      <span class="ov-muted ov-small">Logins are recorded from v0.1.1 on. Earlier logins are not available.</span>
     </div>
+    <table class="ov-hist" v-else>
+      <thead>
+        <tr>
+          <th scope="col">Time</th>
+          <th scope="col">Event</th>
+          <th scope="col">Client IP</th>
+          <th scope="col">VPN IP</th>
+          <th scope="col">Data transferred</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="(ev, index) in dialog.events" :key="index">
+          <td class="ov-num" :title="eventTimeUtc(ev) ? eventTimeUtc(ev) + ' UTC' : null">{{ eventTimeLocal(ev) }}</td>
+          <td :class="eventClass(ev)">{{ eventLabel(ev) }}</td>
+          <td class="ov-num"><template v-if="ev.IP">{{ ev.IP }}</template><span class="ov-none" aria-label="not recorded" v-else>—</span></td>
+          <td class="ov-num"><template v-if="ev.VirtualIP">{{ ev.VirtualIP }}</template><span class="ov-none" aria-label="not recorded" v-else>—</span></td>
+          <td class="ov-num"><template v-if="ev.Event == 'disconnect'">{{ formatBytes(ev.BytesSent) }} down · {{ formatBytes(ev.BytesReceived) }} up</template><span class="ov-none" aria-label="not recorded" v-else>—</span></td>
+        </tr>
+      </tbody>
+    </table>
+    <template #footer>
+      <span class="ov-foot-left" aria-live="polite" v-if="dialog.status == 'loaded'">{{ historyCountText }}</span>
+      <button type="button" class="ov-btn" v-if="dialog.status != 'error'" :disabled="dialog.status == 'loading' || dialog.refreshing" @click="loadHistory(true)">{{ dialog.refreshing ? 'Refreshing…' : 'Refresh' }}</button>
+      <button type="button" class="ov-btn" data-dialog-close @click="closeDialog()">Close</button>
+    </template>
+  </app-dialog>
 
-  <div class="modal modal-wrapper" v-if="u.modalShowCcdVisible" v-bind:style="modalShowCcdDisplay">
-    <div class="modal-dialog modal-lg modal-dialog-scrollable">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h3 class="static-address-label ">Routes table for: <strong>{{ username }}</strong></h3>
+  <notifications position="top right" :width="360" :max="3" :speed="notificationSpeed">
+    <template #body="props">
+      <div class="ov-toast" :class="'ov-toast-' + props.item.type" :role="props.item.type == 'error' ? 'alert' : 'status'">
+        <div class="ov-toast-main">
+          <div class="ov-toast-title">{{ props.item.title }}</div>
+          <div class="ov-toast-text" v-if="props.item.text">{{ props.item.text }}</div>
         </div>
-        <div class="modal-body">
-          <div class="input-group">
-            <label class="input-group-text ccd-address-label" for="static-address">Static IPv4 address</label>
-            <input id="static-address" type="text" class="form-control" v-model="u.ccd.ClientAddress" placeholder="172.16.100.10">
-            <button id="static-address-clear" class="btn btn-warning" type="button" v-on:click="u.ccd.ClientAddress = 'dynamic'" v-if="serverRole == 'master'" v-bind:disabled="customAddressDynamic">Clear</button>
-          </div>
-          <div class="input-group mt-2" v-if="showIPv6Address">
-            <label class="input-group-text ccd-address-label" for="static-address-ipv6">Static IPv6 address</label>
-            <input id="static-address-ipv6" type="text" class="form-control" v-model="u.ccd.ClientAddressIPv6" placeholder="fd00:16:100::10">
-            <button id="static-address-ipv6-clear" class="btn btn-warning" type="button" v-on:click="u.ccd.ClientAddressIPv6 = 'dynamic'" v-if="serverRole == 'master'" v-bind:disabled="customAddressIPv6Dynamic">Clear</button>
-          </div>
-          <div class="form-text" v-if="serverRole == 'master'">"dynamic" (Clear) lets OpenVPN assign an address from the pool.</div>
-        </div>
-        <div class="modal-body">
-          <table class="table table-bordered table-hover ccd-routes" >
-            <caption>Mask / Prefix: IPv4 - netmask, e.g. 255.255.255.0; IPv6 - prefix length, e.g. 64 (or Address as fd00:1::/64 with empty Mask).</caption>
-            <thead>
-              <tr>
-                <th scope="col">Address</th>
-                <th scope="col">Mask / Prefix</th>
-                <th scope="col">Description</th>
-                <th scope="col" v-if="serverRole == 'master'">Action</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="(customRoute, index) in u.ccd.CustomRoutes">
-                <td>
-                  <div v-if="serverRole == 'slave'">
-                    {{ customRoute.Address }}
-                  </div>
-                  <input class="form-control form-control-sm" v-if="serverRole == 'master'" v-model="customRoute.Address">
-                </td>
-                <td>
-                  <div v-if="serverRole == 'slave'">
-                  {{ customRoute.Mask }}
-                  </div>
-                  <input class="form-control form-control-sm" v-if="serverRole == 'master'" v-model="customRoute.Mask">
-                </td>
-                <td>
-                  <div v-if="serverRole == 'slave'">
-                  {{ customRoute.Description }}
-                  </div>
-                  <input class="form-control form-control-sm" v-if="serverRole == 'master'" v-model="customRoute.Description">
-                </td>
-                <td class="text-end" v-if="serverRole == 'master'">
-                    <button type="button" class="btn btn-danger btn-sm el-square modal-el-margin" v-on:click.stop="u.ccd.CustomRoutes.splice(index, 1)">Delete</button>
-                </td>
-              </tr>
-              <tr v-if="serverRole == 'master'">
-                <td><input type="text" class="form-control form-control-sm" placeholder="10.1.0.0 or fd00:1::" v-model="u.newRoute.Address"></td>
-                <td><input type="text" class="form-control form-control-sm" placeholder="255.255.0.0 or 64" v-model="u.newRoute.Mask"></td>
-                <td><input type="text" class="form-control form-control-sm" v-model="u.newRoute.Description"></td>
-                <td class="text-end">
-                  <button type="button" class="btn btn-success btn-sm el-square modal-el-margin" v-bind:disabled="u.newRoute.Address.trim() == ''" v-on:click.stop="addRoute()">Add</button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <div class="modal-footer justify-content-center" v-if="u.ccdApplyStatusMessage.length > 0">
-            <div class="alert" v-bind:class="ccdApplyStatusCssClass" role="alert">
-              {{ u.ccdApplyStatusMessage }}
-            </div>
-        </div>
-        <div class="modal-footer">
-            <button type="button" class="btn btn-success el-square modal-el-margin" v-if="serverRole == 'master'" v-bind:disabled="!u.ccdLoaded" v-on:click.stop="ccdApply()">Save</button>
-            <button type="button" class="btn btn-primary el-square modal-el-margin" v-on:click.stop="closeCcdModal()">Close</button>
-        </div>
+        <button type="button" class="ov-toast-x" aria-label="Dismiss" @click="props.close()">×</button>
       </div>
-    </div>
-  </div>
-
-  <div class="modal modal-wrapper" v-if="u.modalRotateUserVisible" v-bind:style="modalRotateUserDisplay">
-    <div class="modal-dialog modal-lg">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h4>Confirm rotating certificates for user: <strong>{{ username }}</strong></h4>
-        </div>
-        <div class="modal-body" v-if="modulesEnabled.includes('passwdAuth')">
-          <h4>Enter new password:</h4>
-          <input type="password" class="form-control el-square modal-el-margin" minlength="6" autocomplete="off" placeholder="Password [_a-zA-Z0-9\.-]" v-model="u.newPassword">
-        </div>
-
-        <div class="modal-footer justify-content-center" v-if="u.rotateUserMessage.length > 0">
-          <div class="alert" v-bind:class="userRotateStatusCssClass" role="alert" >
-            {{ u.rotateUserMessage }}
-          </div>
-        </div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-danger el-square modal-el-margin" v-on:click.stop="rotateUser(username)">Rotate</button>
-          <button type="button" class="btn btn-primary el-square d-flex justify-content-sm-end modal-el-margin" v-on:click.stop="u.newPassword='';u.rotateUserMessage='';u.modalRotateUserVisible=false">Close</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="modal modal-wrapper" v-if="u.modalDeleteUserVisible" v-bind:style="modalDeleteUserDisplay">
-    <div class="modal-dialog modal-lg">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h4>Confirm deleting user: <strong>{{ username }}</strong></h4>
-        </div>
-
-        <div class="modal-footer justify-content-center" v-if="u.deleteUserMessage.length > 0">
-          <div class="alert" v-bind:class="deleteUserStatusCssClass" role="alert" >
-            {{ u.deleteUserMessage }}
-          </div>
-        </div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-danger el-square modal-el-margin" v-on:click.stop="deleteUser(username)">Delete</button>
-          <button type="button" class="btn btn-primary el-square d-flex justify-content-sm-end modal-el-margin" v-on:click.stop="u.deleteUserMessage='';u.modalDeleteUserVisible=false">Close</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <notifications position="bottom left" :speed="900"></notifications>
+    </template>
+  </notifications>
 </div>
 <script src="dist/bundle.min.js"></script>
 </body>
