@@ -1,0 +1,103 @@
+# nginx reverse proxy for ovpn-admin (v0.1.1): TLS termination, HSTS, per-client rate limit
+# and an access log that fail2ban can read.
+#
+# Install: copy to /etc/nginx/conf.d/ovpn-admin.conf (this file is included in the http{} context,
+# so limit_req_zone, map and log_format are valid here), edit the CHANGE-ME values (server_name twice, certificate and key paths), then:
+#   nginx -t && systemctl reload nginx
+#
+# Assumes ovpn-admin listens on 127.0.0.1:8080 (docker-compose.yaml publishes it on loopback only)
+# and that nginx runs on the same host. If nginx runs in a container, point the upstream at the
+# address that container can reach and keep 8080 closed to everything else.
+# The Basic Auth check stays in ovpn-admin (BASIC_USERNAME / BASIC_PASSWORD); nginx forwards the
+# Authorization header unchanged.
+
+# 1 when the request carries an Authorization header, 0 when it does not. The header value itself
+# is never logged. A browser's first request has no header and gets a 401 challenge: that is not
+# an attack, so the fail2ban filter only counts 401 lines with auth=1.
+map $http_authorization $ovpn_admin_auth_sent {
+    default 1;
+    ""      0;
+}
+
+# combined format plus the auth flag. $remote_addr is the client address as nginx sees it.
+# nginx escapes quotes inside $request, $http_referer and $http_user_agent, so a client cannot
+# forge extra fields. The user name field is a fixed "-": nginx would fill $remote_user from the
+# Authorization header even though ovpn-admin does the check, and that string is attacker-chosen
+# (it may contain spaces), so it stays out of the log and out of the fail2ban regex.
+log_format ovpn_admin '$remote_addr - - [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" "$http_user_agent" '
+                      'auth=$ovpn_admin_auth_sent';
+
+# one bucket per client address (IPv6 addresses take 16 bytes, IPv4 4 bytes); 10 MB holds ~160k buckets
+limit_req_zone $binary_remote_addr zone=ovpn_admin:10m rate=10r/s;
+
+upstream ovpn_admin_backend {
+    server 127.0.0.1:8080;
+    keepalive 4;
+}
+
+# plain HTTP only redirects: Basic Auth must never travel unencrypted
+server {
+    listen 80;
+    listen [::]:80;
+    server_name admin.example.com;   # CHANGE-ME
+
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name admin.example.com;   # CHANGE-ME
+
+    # CHANGE-ME: your certificate (for example from certbot)
+    ssl_certificate     /etc/nginx/tls/ovpn-admin.crt;
+    ssl_certificate_key /etc/nginx/tls/ovpn-admin.key;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:ovpn_admin_tls:10m;
+    ssl_session_timeout 1h;
+    ssl_session_tickets off;
+
+    server_tokens off;
+
+    # the log fail2ban's ovpn-admin-http-401 jail reads (see docs/hardening/fail2ban/jail.d)
+    access_log /var/log/nginx/ovpn-admin.access.log ovpn_admin;
+    error_log  /var/log/nginx/ovpn-admin.error.log warn;
+
+    # HSTS. Set it only once https works for this host name: browsers remember it.
+    # ovpn-admin sets X-Frame-Options, CSP frame-ancestors, nosniff and Referrer-Policy itself.
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    # small bodies only: the API takes short JSON documents and form posts
+    client_max_body_size 1m;
+    client_header_timeout 10s;
+    client_body_timeout 10s;
+    send_timeout 30s;
+
+    # per client address: 10 requests/s steady, bursts of 30 are served at once, the rest is
+    # answered with 429 instead of the default 503. Every request counts, authenticated or not.
+    limit_req zone=ovpn_admin burst=30 nodelay;
+    limit_req_status 429;
+    limit_req_log_level warn;
+
+    location / {
+        proxy_pass http://ovpn_admin_backend;
+        proxy_http_version 1.1;
+
+        # keep the Host header the client sent (including a non-default port), and tell the
+        # backend how the client reached nginx. ovpn-admin ignores X-Forwarded-For; do not add
+        # a trust relationship to it.
+        proxy_set_header Host              $http_host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection        "";
+
+        # creating a client certificate runs easy-rsa and can take a few seconds
+        proxy_connect_timeout 5s;
+        proxy_send_timeout    30s;
+        proxy_read_timeout    60s;
+    }
+}

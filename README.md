@@ -77,6 +77,8 @@ You can also download and use prebuilt binaries from the [releases](https://gith
 
 ## Secure deployment
 
+Step-by-step guide with a ready nginx config and fail2ban jails: [docs/hardening/README.md](docs/hardening/README.md). fail2ban can watch both the OpenVPN audit log (`audit_master/audit.tsv`) and the reverse proxy's access log.
+
 * **Basic Auth is mandatory.** `docker-compose.yaml` and the Helm chart refuse to start without credentials: compose needs `BASIC_USERNAME`, `BASIC_PASSWORD` and `OVPN_MASTER_TOKEN` (generate the token with `openssl rand -hex 32`), `start.sh` passes your environment through; the chart fails to render until `ingress.basicAuth.user` and `ingress.basicAuth.password` are set (the old `admin`/`changeme` defaults are rejected).
 * **Scope of Basic Auth.** It covers the web UI, the API and `/metrics`. `/ping` stays open without credentials; the Helm chart's readiness and liveness probes use it.
 * **Failed logins are logged.** A request with wrong credentials writes one warn line, `auth failed remote=<address> path=<path>` (no credentials, no `X-Forwarded-For`); a request without an `Authorization` header writes nothing. Behind a reverse proxy `remote` is the proxy address: use the line for detection, not for banning.

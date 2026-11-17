@@ -1,0 +1,44 @@
+# fail2ban jails for ovpn-admin. Install as /etc/fail2ban/jail.d/ovpn-admin.local together with
+# the two filters in filter.d/ (copy them to /etc/fail2ban/filter.d/). See ../README.md.
+# Edit the two logpath lines; keep enabled = true only after `fail2ban-regex` matched your logs.
+
+[DEFAULT]
+# never ban yourself: add your own admin addresses (space separated) next to the loopback ones
+ignoreip = 127.0.0.1/8 ::1
+
+# --- OpenVPN: wrong passwords, from the audit log written by the OpenVPN hooks -------------------
+[ovpn-admin-audit]
+enabled   = true
+filter    = ovpn-admin-audit
+backend   = auto
+# the host directory that docker-compose.yaml mounts as /etc/openvpn/audit (CHANGE-ME: absolute path).
+# The directory is mode 700 and the file 600 for the container user "nobody"; fail2ban runs as root.
+logpath   = /opt/ovpn-admin/audit_master/audit.tsv
+maxretry  = 5
+findtime  = 10m
+bantime   = 1h
+protocol  = tcp
+# The VPN port is published by Docker (7777:1194). Docker's NAT rules take the traffic before the
+# INPUT chain, so the default fail2ban action does not stop it. Ban in DOCKER-USER, which Docker
+# evaluates first for published ports. There the packet already carries its container address, so
+# match the CONTAINER port (1194), not the published one (7777). If your compose maps another
+# port, use the container side of the mapping. Use protocol = udp when OVPN_PROTO is udp.
+port      = 1194
+chain     = DOCKER-USER
+banaction = iptables-multiport
+
+# --- Admin panel: wrong Basic Auth credentials, from the nginx access log -------------------------
+[ovpn-admin-http-401]
+enabled   = true
+filter    = ovpn-admin-http-401
+backend   = auto
+# access_log of nginx-ovpn-admin.conf.example
+logpath   = /var/log/nginx/ovpn-admin.access.log
+maxretry  = 5
+findtime  = 10m
+bantime   = 1h
+protocol  = tcp
+port      = http,https
+# nginx on the host: the default INPUT chain applies. If nginx itself runs in a Docker container,
+# add "chain = DOCKER-USER" and set "port = 443".
+# A browser that keeps sending an old saved password counts too: put your own address in ignoreip.
