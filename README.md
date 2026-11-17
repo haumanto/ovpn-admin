@@ -16,6 +16,9 @@ Simple web UI to manage OpenVPN users, their certificates & routes in Linux. Whi
 * (optionally) Specifying the Kubernetes LoadBalancer if it's used in front of the OpenVPN server (to get an automatically defined `remote` in the `client.conf.tpl` template).
 * (optionally) Storing certificates and other files in Kubernetes Secrets (**Attention, this feature is experimental!**).
 * (optionally) IPv6: dual-stack web UI listener, IPv6 pool for VPN clients, static IPv6 addresses and IPv6 routes in CCD (see [IPv6](#ipv6)).
+* Automatic banning of sources that make repeated failed logins or present revoked certificates, run by fail2ban inside the OpenVPN container, IPv4 and IPv6 (see [Ban engine](#ban-engine)). New in v0.1.4 (release candidate).
+* Read-only **Banned IPs** view in the admin UI (see [Banned IPs](#banned-ips)).
+* Mobile-first web UI: phone cards, a table on tablet and desktop, sheet dialogs (see [Mobile support](#mobile-support)). New in v0.1.4 (release candidate).
 
 ### Screenshots
 
@@ -27,7 +30,7 @@ An example of dashboard made using ovpn-admin metrics:
 
 ## Installation
 
-Release notes for this version: [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md) (published with the v0.1.3 release). Earlier releases: [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0, v0.1.1 or v0.1.2: [UPGRADING.md](UPGRADING.md).
+Release notes for the current release candidate: [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md) (v0.1.4 is not published yet). Latest published release: [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md) (published with the v0.1.3 release). Earlier releases: [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0, v0.1.1, v0.1.2 or v0.1.3: [UPGRADING.md](UPGRADING.md).
 
 ### 1. Docker
 
@@ -50,7 +53,7 @@ export OVPN_MASTER_TOKEN="$(openssl rand -hex 32)"
 ./start.sh
 ```
 #### 1.1
-Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.2`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`. The v0.1.2 images are published with the v0.1.2 release. The v0.1.3 images are published with the v0.1.3 release.
+Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.2`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`. The v0.1.2 images are published with the v0.1.2 release. The v0.1.3 images are published with the v0.1.3 release. The v0.1.4 images are not published yet.
 
 ### 2. Building from source
 
@@ -203,13 +206,44 @@ The `openvpn` image installs the hooks [client-connect.sh](setup/client-connect.
   `event` is `connect` (client connected), `disconnect` (client left, with the byte counters of the session), `auth_ok` or `auth_fail` (password authentication result; the address of a client that is not yet connected is the one it connects from).
 * **One line per connection:** each connection writes a `connect` and later a `disconnect` line, plus an `auth_ok` or `auth_fail` line for each password check.
 * **Passwords are never logged**, only the username, address and port. The directory is `700` and the file `600`, owned by the `nobody` user that the hooks run as.
-* **Retention is operator-managed:** nothing rotates or truncates the file. Rotate it with `copytruncate` (or move it and restart the container), and keep its size in mind: ovpn-admin only reads the tail.
+* **Retention is operator-managed:** nothing rotates or truncates `audit.tsv`. Rotate it with `copytruncate` (or move it and restart the container), and keep its size in mind: ovpn-admin only reads the tail. The container does rotate its own `openvpn.log` and `fail2ban.log` from v0.1.4 (see [Ban engine](#ban-engine)).
 * A failed write never blocks a client: the hooks print a warning to the container log and exit `0`.
 * The hooks need `script-security 2`, which `configure.sh` now always sets. The Helm chart's `openvpn.conf` loads the hooks from `/etc/openvpn/setup/` of the image, so use an image that contains them (the chart `appVersion` has to be the release that ships them).
 
+### Ban engine
+
+The `openvpn` container runs fail2ban 1.1.0 (jail `ovpn-admin`). It reads `openvpn.log` and bans a source address after repeated failures:
+
+* **What counts:** a revoked certificate (`VERIFY ERROR: ... certificate revoked`, one line per attempt) and a wrong password (`SENT CONTROL [UNDEF]: 'AUTH_FAILED'`, one per wrong password; the second `AUTH_FAILED` line of the same attempt is not counted). Nothing else counts.
+* **Default rule:** 3 failures in 600 seconds ban the address for 3600 seconds. Measured with 120 s and 60 s timers, real clients, IPv4 and IPv6: the ban starts within about half a second of the third failure and lifts at 59 to 60 seconds.
+* **Enforcement:** DROP rules in the `OVPN_BAN` (IPv4) and `OVPN_BAN6` (IPv6) chains, only for the OpenVPN listener port `OVPN_SERVER_PORT`. The admin port is never affected.
+* **Restarts:** bans are not kept, but recent failures are counted again at start, so a source still inside the findtime is banned again within seconds. See [UPGRADING.md](UPGRADING.md#v013--v014).
+* **Allowlist:** `OVPN_BAN_IGNOREIP` (default: loopback, `10/8`, `172.16/12`, `192.168/16`, `fe80::/10`). Unique-local `fd00::/8` is not on the default list.
+* **Logs:** `openvpn.log` and `bans.tsv` live in the audit volume. `openvpn.log` and `fail2ban.log` are rotated in the container (`OVPN_LOG_MAX_BYTES`, `OVPN_LOG_KEEP`, `OVPN_LOG_ROTATE_INTERVAL`).
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `OVPN_BAN_ENABLED` | `true` | turn the ban engine on or off |
+| `OVPN_BAN_MAXRETRY` | `3` | failures that trigger a ban |
+| `OVPN_BAN_FINDTIME` | `600` | window in seconds for counting failures |
+| `OVPN_BAN_BANTIME` | `3600` | ban length in seconds |
+| `OVPN_BAN_IGNOREIP` | `127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fe80::/10` | never banned (replaces the default list) |
+| `OVPN_BAN_REQUIRED` | `false` | `true` stops the container if fail2ban cannot start; `false` runs without bans and logs an error |
+| `OVPN_BAN_IPV6_REQUIRED` | `true` | `true` stops the container if IPv6 is on and the IPv6 ban chain cannot be built; `false` runs without IPv6 bans and prints a warning |
+
+Full list, measured behavior and limits: [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md). Check the filter against your own log with `fail2ban-regex`, as described in [docs/hardening/README.md](docs/hardening/README.md).
+
+### Banned IPs
+
+The **Banned IPs** tab of the admin UI is a read-only list: IP address, reason, attempts, banned since, expires, and a count badge that matches the number of rows. It refreshes on a timer and has no unban control. Data comes from `GET /api/bans`, which reads `bans.tsv`. It sits behind the same Basic Auth as the rest of the UI.
+
+### Mobile support
+
+The admin UI is mobile-first from v0.1.4. Up to 768 px each user is a card with its actions; from 769 px up it is a table. Dialogs are sheets on phones and centered dialogs on desktop. Touch targets are 44 px on phones and tablets (per the design spec; target sizes were not measured). Tested in QA on the candidate UI (frontend unchanged since `e3233a9`) at 390 × 844 (phone emulation) and 1280 px (desktop). Tablet widths 769 to 1024 px and real devices were not tested. Details: [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md).
+
 ## Upgrade notes
 
-Upgrading a docker compose deployment (upstream, v0.1.0, v0.1.1, v0.1.2): follow [UPGRADING.md](UPGRADING.md); `scripts/upgrade.sh` backs up first and covers the audit volume.
+Upgrading a docker compose deployment (upstream, v0.1.0, v0.1.1, v0.1.2, v0.1.3): follow [UPGRADING.md](UPGRADING.md); `scripts/upgrade.sh` backs up first and covers the audit volume. v0.1.4 steps: [UPGRADING.md](UPGRADING.md#v013--v014).
 
 * **openvpn-user v1.0.4 → v1.0.9** (only relevant with password authentication, `--auth.password` / `OVPN_PASSWD_AUTH=true`). openvpn-user v1.0.9 adds the columns `secret` and `app_configured` to `users.db`. The column `secret` is added without a default value, so for every user whose password was saved by openvpn-user v1.0.4 or older it is `NULL`, and `openvpn-user auth` of v1.0.9 rejects these users (`converting NULL to string is unsupported`) — they cannot connect to the VPN any more. Users created by v1.0.9 are not affected. Additionally `openvpn-user db-migrate` does nothing on a database created by v1.0.4 until `openvpn-user db-init` has created the `migrations` table, and until the database is migrated `openvpn-user create` reports success without saving the user.
   * The Docker images handle this: `setup/configure.sh` of the openvpn image and ovpn-admin itself (when started with `--auth.password` or `--auth.db-init`) run `db-init` and `db-migrate` on start and then replace `NULL` in `secret` with an empty string (the value v1.0.9 stores for new users). All steps are idempotent.

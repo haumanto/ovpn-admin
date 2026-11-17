@@ -7,6 +7,7 @@ Pick your section:
 * [v0.1.0 → v0.1.1](#v010--v011)
 * [v0.1.1 → v0.1.2](#v011--v012)
 * [v0.1.2 → v0.1.3](#v012--v013)
+* [v0.1.3 → v0.1.4](#v013--v014) (release candidate, not published)
 * [upstream → v0.1.x](#upstream--v01x)
 
 Kubernetes/Helm deployments: see `charts/openvpn-admin/README.md`. The historical notes of the first release stay in `UPGRADING-v0.1.0.md`.
@@ -147,6 +148,32 @@ curl -fsS http://127.0.0.1:8080/ping
 ```
 
 Known limits of this upgrade: a real upgrade run was not done (QA used the dry run only). Older Docker hosts were not tested, and the Alpine 3.23 path is not tested through compose. The arm64 build was not tested. See `RELEASE-v0.1.3.md`, Known limitations.
+
+## v0.1.3 → v0.1.4
+
+Status: release candidate. v0.1.4 is not tagged or published yet. The steps below apply once the images are built from the v0.1.4 checkout. Details: [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md).
+
+1. **Note your current version** (`git describe --tags --always`, or the image tags). You need it for a rollback.
+2. **Update the checkout and the compose file.** Use the v0.1.4 `docker-compose.yaml` (or `docker-compose-slave.yaml` on a slave). It carries the ban and log variables with their defaults. Re-apply your own edits (network, ports, `OVPN_*`, `BASIC_*`, `OVPN_MASTER_TOKEN`).
+3. **Rebuild both images.** The ban engine (fail2ban and setup scripts) is in the `openvpn` image. The Banned IPs API and UI are in the `ovpn-admin` image. Use `scripts/upgrade.sh --target-version v0.1.4 --previous-ref <old ref> --project-dir <dir>` (it backs up first and builds with `--pull`), or run `docker compose up -d --build` by hand.
+4. **No database migration.** `easyrsa_master/`, `ccd_master/` and `users.db` are not changed. The new state lives in files in the audit volume.
+5. **Audit volume gets two new files:**
+   * `openvpn.log` (`audit_master/openvpn.log`, or `audit_slave/` on a slave): the connection log the ban engine reads. It is mode 0600, owned by `nobody`. Rotated in the container; see step 8.
+   * `bans.tsv`: the list of active bans that the UI shows. Root, mode 0600. It is emptied at every start.
+   The backup from `scripts/upgrade.sh` already includes `audit_master/`.
+6. **Optional ban settings** (all have defaults; no setting is required): `OVPN_BAN_ENABLED` (`true`), `OVPN_BAN_MAXRETRY` (`3`), `OVPN_BAN_FINDTIME` (`600`), `OVPN_BAN_BANTIME` (`3600`), `OVPN_BAN_IGNOREIP`, `OVPN_BAN_REQUIRED` (`false`), `OVPN_BAN_IPV6_REQUIRED` (`true`), `OVPN_SERVER_PORT` (`1194`). The full table is in [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md#configuration). `OVPN_BAN_IPV6_REQUIRED=false` is the only way to run IPv6 without IPv6 bans, and it prints a warning on every start.
+7. **Restarts clear the bans but re-derive recent ones.** At start, the ban rules, the ban chains and `bans.tsv` are emptied. Then the engine re-reads `openvpn.log` and bans again any source that still has `OVPN_BAN_MAXRETRY` failures inside `OVPN_BAN_FINDTIME`. Measured in QA: a restart within the findtime banned the same address again 9 seconds later. After the findtime has passed, nothing is banned.
+8. **Log growth:** `openvpn.log` and `fail2ban.log` are rotated past `OVPN_LOG_MAX_BYTES` (10 MiB) and keep `OVPN_LOG_KEEP` (3) copies, checked every `OVPN_LOG_ROTATE_INTERVAL` (60 s). Worst case per log with the defaults: 40 MiB plus one minute of log. `audit.tsv` is not rotated; manage it as before (see the README audit log section).
+9. **Check the ban engine after the start:**
+   ```bash
+   docker compose -p openvpn-master exec -T openvpn fail2ban-client status ovpn-admin
+   docker compose -p openvpn-master exec -T openvpn fail2ban-regex /etc/openvpn/audit/openvpn.log /etc/fail2ban/filter.d/ovpn-admin.conf
+   ```
+   The jail should be running. `fail2ban-regex` should match lines on a log that holds failed logins. `Failregex: 0 total` on such a log means the filter does not fit your OpenVPN version.
+10. **IPv4 and IPv6 are both banned, but IPv6 was measured for one client only.** Check your IPv6 setup with `ip6tables` before you rely on it. Use `OVPN_IP6TABLES_BIN` and `OVPN_IPTABLES_BIN` together for legacy backends.
+11. **Default allowlist:** `127.0.0.0/8`, `::1`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fe80::/10`. Unique-local IPv6 (`fd00::/8`, including the example compose subnet `fd00:172:20::/64`) is not on the list, so those sources can be banned. `OVPN_BAN_IGNOREIP` replaces the whole default list, so copy the entries you want to keep.
+
+Rollback: as in the Rollback section below, with `--previous-ref` set to the old tag, and keep the audit volume so the login history is kept. A downgrade with the new `openvpn.log` and `bans.tsv` files in place was not tested.
 
 ## upstream → v0.1.x
 
