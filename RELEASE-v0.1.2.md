@@ -110,5 +110,5 @@ These were in the v0.1.1 candidate and are not changed by v0.1.2. QA re-verified
 
 ## Not done
 
-- No tag, no push, no release, no registry image.
-- The `v0.1.2` tag does not exist yet. Upgrade steps that name it apply after publication.
+- Published: tag `v0.1.2`, GitHub release with amd64/arm64 binaries, GHCR images, chart release.
+- The `v0.1.2` tag is published.

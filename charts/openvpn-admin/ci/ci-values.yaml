@@ -1,0 +1,6 @@
+# Test values for chart-testing (ct install). The chart intentionally refuses to
+# render without admin credentials, so CI must provide non-default test credentials.
+ingress:
+  basicAuth:
+    user: ci-user
+    password: ci-test-password-not-for-production
