@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"testing/fstest"
+
+	log "github.com/sirupsen/logrus"
 )
 
 func TestCacheControlWrapper(t *testing.T) {
@@ -193,6 +197,111 @@ func TestValidateBasicAuthConfig(t *testing.T) {
 		err := validateBasicAuthConfig(tt.user, tt.pass)
 		if (err != nil) != tt.wantErr {
 			t.Errorf("validateBasicAuthConfig(%q, %q) error = %v, wantErr %v", tt.user, tt.pass, err, tt.wantErr)
+		}
+	}
+}
+
+// Passwords, tokens and user names travel in the query string: the access log of a handler must
+// only contain the path.
+func TestHandlersDoNotLogTheQueryString(t *testing.T) {
+	oAdmin := &OvpnAdmin{role: "slave", createUserMutex: &sync.Mutex{}}
+	handlers := map[string]http.HandlerFunc{
+		"/api/user/create":          oAdmin.userCreateHandler,
+		"/api/user/rotate":          oAdmin.userRotateHandler,
+		"/api/user/delete":          oAdmin.userDeleteHandler,
+		"/api/user/revoke":          oAdmin.userRevokeHandler,
+		"/api/user/unrevoke":        oAdmin.userUnrevokeHandler,
+		"/api/user/change-password": oAdmin.userChangePasswordHandler,
+		"/api/user/ccd/apply":       oAdmin.userApplyCcdHandler,
+		"/api/data/certs/download":  oAdmin.downloadCertsHandler,
+		"/api/data/ccd/download":    oAdmin.downloadCcdHandler,
+	}
+
+	var buf bytes.Buffer
+	oldOut, oldLevel := log.StandardLogger().Out, log.GetLevel()
+	log.SetOutput(&buf)
+	log.SetLevel(log.DebugLevel)
+	t.Cleanup(func() { log.SetOutput(oldOut); log.SetLevel(oldLevel) })
+
+	const secret = "s3cr3t-Pa55w0rd"
+	for path, h := range handlers {
+		buf.Reset()
+		req := httptest.NewRequest(http.MethodPost, path+"?username=alice&password="+secret+"&token="+secret, nil)
+		h(httptest.NewRecorder(), req)
+		out := buf.String()
+		if !strings.Contains(out, path) {
+			t.Errorf("%s: the request was not logged: %q", path, out)
+		}
+		for _, leaked := range []string{secret, "password=", "token=", "username="} {
+			if strings.Contains(out, leaked) {
+				t.Errorf("%s: log line contains %q: %q", path, leaked, out)
+			}
+		}
+	}
+}
+
+// The slave only mirrors the master: every call that changes users is refused with 423.
+func TestSlaveRefusesUserChanges(t *testing.T) {
+	setupUsers(t, "alice")
+	setFlag(t, authByPassword, true)
+	oAdmin := &OvpnAdmin{role: "slave", createUserMutex: &sync.Mutex{}}
+	handlers := map[string]http.HandlerFunc{
+		"create":          oAdmin.userCreateHandler,
+		"rotate":          oAdmin.userRotateHandler,
+		"delete":          oAdmin.userDeleteHandler,
+		"revoke":          oAdmin.userRevokeHandler,
+		"unrevoke":        oAdmin.userUnrevokeHandler,
+		"change-password": oAdmin.userChangePasswordHandler,
+		"ccd-apply":       oAdmin.userApplyCcdHandler,
+	}
+	for name, h := range handlers {
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(http.MethodPost, "/api/user/"+name+"?username=alice&password=x", nil))
+		if rec.Code != http.StatusLocked || strings.TrimSpace(rec.Body.String()) != `{"status":"error"}` {
+			t.Errorf("%s on a slave: %d %q, want 423 {\"status\":\"error\"}", name, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// userChangePasswordHandler: the slave guard comes before the --auth.password check, so a slave
+// answers 423 whatever the flag says (the master answers 501 when password auth is off).
+func TestChangePasswordHandlerSlaveGuard(t *testing.T) {
+	for _, authOn := range []bool{true, false} {
+		setFlag(t, authByPassword, authOn)
+
+		slave := &OvpnAdmin{role: "slave", createUserMutex: &sync.Mutex{}}
+		rec := httptest.NewRecorder()
+		slave.userChangePasswordHandler(rec, httptest.NewRequest(http.MethodPost, "/api/user/change-password?username=alice&password=x", nil))
+		if rec.Code != http.StatusLocked || strings.TrimSpace(rec.Body.String()) != `{"status":"error"}` {
+			t.Errorf("slave, authByPassword=%v: %d %q, want 423", authOn, rec.Code, rec.Body.String())
+		}
+	}
+
+	setFlag(t, authByPassword, false)
+	master := &OvpnAdmin{role: "master", createUserMutex: &sync.Mutex{}}
+	rec := httptest.NewRecorder()
+	master.userChangePasswordHandler(rec, httptest.NewRequest(http.MethodPost, "/api/user/change-password?username=alice&password=x", nil))
+	if rec.Code != http.StatusNotImplemented {
+		t.Errorf("master with password auth off: %d, want 501", rec.Code)
+	}
+}
+
+// No handler may log r.RequestURI (it carries the query string).
+func TestNoRequestURIInSources(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(src), "RequestURI") {
+			t.Errorf("%s uses RequestURI, log r.URL.Path instead", f)
 		}
 	}
 }
