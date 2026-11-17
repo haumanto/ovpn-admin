@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
 	"embed"
 	"encoding/hex"
@@ -68,6 +69,8 @@ var (
 	listenBaseUrl            = kingpin.Flag("listen.base-url", "base url for ovpn-admin").Default("/").Envar("OVPN_LISTEN_BASE_URL").String()
 	serverRole               = kingpin.Flag("role", "server role, master or slave").Default("master").Envar("OVPN_ROLE").HintOptions("master", "slave").String()
 	masterHost               = kingpin.Flag("master.host", "URL for the master server, IPv6 hosts in brackets: http://[fd00::1]:8080").Default("http://127.0.0.1").Envar("OVPN_MASTER_HOST").String()
+	basicUsername            = kingpin.Flag("basic.username", "username for HTTP Basic Auth on the web UI, API and metrics (except /ping); requires --basic.password, both empty disables it").Default("").Envar("BASIC_USERNAME").String()
+	basicPassword            = kingpin.Flag("basic.password", "password for HTTP Basic Auth on the web UI, API and metrics (except /ping); requires --basic.username, both empty disables it").Default("").Envar("BASIC_PASSWORD").String()
 	masterBasicAuthUser      = kingpin.Flag("master.basic-auth.user", "user for master server's Basic Auth").Default("").Envar("OVPN_MASTER_USER").String()
 	masterBasicAuthPassword  = kingpin.Flag("master.basic-auth.password", "password for master server's Basic Auth").Default("").Envar("OVPN_MASTER_PASSWORD").String()
 	masterSyncFrequency      = kingpin.Flag("master.sync-frequency", "master host data sync frequency in seconds").Default("600").Envar("OVPN_MASTER_SYNC_FREQUENCY").Int()
@@ -492,6 +495,10 @@ func main() {
 	log.SetLevel(logLevels[*logLevel])
 	log.SetFormatter(logFormats[*logFormat])
 
+	if err := validateBasicAuthConfig(*basicUsername, *basicPassword); err != nil {
+		log.Fatal(err)
+	}
+
 	if err := initNetworkConfig(); err != nil {
 		log.Fatal(err)
 	}
@@ -595,7 +602,56 @@ func main() {
 	})
 
 	log.Printf("Bind: %s", bindURL(*listenHost, *listenPort, *listenBaseUrl))
-	log.Fatal(http.ListenAndServe(listenAddress(*listenHost, *listenPort), nil))
+	// /ping stays open for health checks; everything else, /metrics included, needs credentials
+	handler := basicAuthMiddleware(http.DefaultServeMux, *basicUsername, *basicPassword, *listenBaseUrl+"ping")
+	if *basicUsername != "" {
+		log.Info("HTTP Basic Auth is enabled")
+	}
+	log.Fatal(http.ListenAndServe(listenAddress(*listenHost, *listenPort), handler))
+}
+
+// validateBasicAuthConfig fails closed: setting only one of the two credentials
+// would otherwise leave the server silently unprotected or unusable.
+func validateBasicAuthConfig(username, password string) error {
+	if (username == "") != (password == "") {
+		return errors.New("--basic.username and --basic.password must be set together (or both left empty to disable HTTP Basic Auth)")
+	}
+	return nil
+}
+
+// basicAuthMiddleware requires HTTP Basic credentials on every request except
+// those whose URL path is exactly one of openPaths. Username and password are
+// both always compared, in constant time. With both credentials empty the
+// authentication is disabled and next is returned unchanged.
+func basicAuthMiddleware(next http.Handler, username, password string, openPaths ...string) http.Handler {
+	if username == "" && password == "" {
+		return next
+	}
+
+	// hashing first gives ConstantTimeCompare equal-length inputs, so the
+	// length of the configured secrets does not leak through timing
+	wantUser := sha256.Sum256([]byte(username))
+	wantPass := sha256.Sum256([]byte(password))
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if slices.Contains(openPaths, r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		gotUser, gotPass, ok := r.BasicAuth()
+		userHash := sha256.Sum256([]byte(gotUser))
+		passHash := sha256.Sum256([]byte(gotPass))
+		userOK := subtle.ConstantTimeCompare(userHash[:], wantUser[:])
+		passOK := subtle.ConstantTimeCompare(passHash[:], wantPass[:])
+
+		if !ok || userOK&passOK != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="ovpn-admin", charset="UTF-8"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // CacheControlWrapper makes browsers revalidate the embedded web UI on every load:
