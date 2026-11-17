@@ -79,6 +79,7 @@ You can also download and use prebuilt binaries from the [releases](https://gith
 
 * **Basic Auth is mandatory.** `docker-compose.yaml` and the Helm chart refuse to start without credentials: compose needs `BASIC_USERNAME`, `BASIC_PASSWORD` and `OVPN_MASTER_TOKEN` (generate the token with `openssl rand -hex 32`), `start.sh` passes your environment through; the chart fails to render until `ingress.basicAuth.user` and `ingress.basicAuth.password` are set (the old `admin`/`changeme` defaults are rejected).
 * **Scope of Basic Auth.** It covers the web UI, the API and `/metrics`. `/ping` stays open without credentials; the Helm chart's readiness and liveness probes use it.
+* **Failed logins are logged.** A request with wrong credentials writes one warn line, `auth failed remote=<address> path=<path>` (no credentials, no `X-Forwarded-For`); a request without an `Authorization` header writes nothing. Behind a reverse proxy `remote` is the proxy address: use the line for detection, not for banning.
 * **Terminate TLS in a reverse proxy** in front of the admin UI. Basic Auth over plain HTTP exposes the credentials.
 * **Block direct access to the backend** (port 8080 / 8000) with a firewall or NetworkPolicy, only the proxy may reach it.
 * **Compose binds the admin port to loopback** (`127.0.0.1:8080`); the VPN port 7777 stays on all interfaces. Publish the admin UI only through the proxy.

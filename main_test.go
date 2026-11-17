@@ -559,3 +559,121 @@ func TestReadRoutesStillAnswerGet(t *testing.T) {
 		}
 	}
 }
+
+// captureLog redirects the logrus output into a buffer for the length of the test.
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	oldOut, oldLevel := log.StandardLogger().Out, log.GetLevel()
+	log.SetOutput(&buf)
+	log.SetLevel(log.DebugLevel)
+	t.Cleanup(func() { log.SetOutput(oldOut); log.SetLevel(oldLevel) })
+	return &buf
+}
+
+// A request with wrong credentials leaves exactly one detection line without any credential text;
+// a request without Authorization (the normal browser challenge) leaves none.
+func TestFailedLoginLogLine(t *testing.T) {
+	const wantUser, wantPass = "admin", "s3cret"
+	const sentUser, sentPass = "mallory-user", "Wr0ng-Passw0rd"
+
+	tests := []struct {
+		name      string
+		auth      func(*http.Request)
+		wantLines int
+	}{
+		{"wrong password", func(r *http.Request) { r.SetBasicAuth(sentUser, sentPass) }, 1},
+		{"right user, wrong password", func(r *http.Request) { r.SetBasicAuth(wantUser, sentPass) }, 1},
+		{"unparsable Authorization header", func(r *http.Request) { r.Header.Set("Authorization", "Bearer tok-"+sentPass) }, 1},
+		{"no Authorization header", func(r *http.Request) {}, 0},
+		{"correct credentials", func(r *http.Request) { r.SetBasicAuth(wantUser, wantPass) }, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf := captureLog(t)
+			req := httptest.NewRequest(http.MethodGet, "/api/users/list?token=qs-secret", nil)
+			req.RemoteAddr = "203.0.113.7:51234"
+			req.Header.Set("X-Forwarded-For", "198.51.100.99")
+			tt.auth(req)
+			authTestServer(wantUser, wantPass).ServeHTTP(httptest.NewRecorder(), req)
+
+			out := buf.String()
+			if got := strings.Count(out, "auth failed"); got != tt.wantLines {
+				t.Fatalf("%d \"auth failed\" lines, want %d: %q", got, tt.wantLines, out)
+			}
+			if tt.wantLines == 0 {
+				if out != "" {
+					t.Errorf("unexpected log output: %q", out)
+				}
+				return
+			}
+			for _, want := range []string{"level=warning", "auth failed remote=203.0.113.7:51234 path=/api/users/list"} {
+				if !strings.Contains(out, want) {
+					t.Errorf("log %q lacks %q", out, want)
+				}
+			}
+			for _, leaked := range []string{sentUser, sentPass, wantPass, "Basic ", "Bearer", "Authorization", "198.51.100.99", "qs-secret", "X-Forwarded-For"} {
+				if strings.Contains(out, leaked) {
+					t.Errorf("log %q contains %q", out, leaked)
+				}
+			}
+		})
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	staticFS := fstest.MapFS{"index.html": {Data: []byte("<html></html>")}}
+	mux := http.NewServeMux()
+	mux.Handle("/", CacheControlWrapper(http.FileServer(http.FS(staticFS)), staticFS))
+	mux.HandleFunc("/api/users/list", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("users")) })
+	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("pong")) })
+	handler := securityHeadersMiddleware(basicAuthMiddleware(mux, "admin", "s3cret", "/ping"), "/api/")
+
+	want := map[string]string{
+		"X-Frame-Options":         "DENY",
+		"Content-Security-Policy": "frame-ancestors 'none'",
+		"X-Content-Type-Options":  "nosniff",
+		"Referrer-Policy":         "same-origin",
+	}
+	tests := []struct {
+		name, path string
+		auth       bool
+		wantStatus int
+		wantCache  string
+		wantETag   bool
+	}{
+		{name: "UI", path: "/", auth: true, wantStatus: 200, wantCache: "no-cache", wantETag: true},
+		{name: "API", path: "/api/users/list", auth: true, wantStatus: 200, wantCache: "no-store"},
+		{name: "API 401", path: "/api/users/list", wantStatus: 401, wantCache: "no-store"},
+		{name: "UI 401", path: "/", wantStatus: 401, wantCache: ""},
+		{name: "open ping", path: "/ping", wantStatus: 200, wantCache: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			if tt.auth {
+				req.SetBasicAuth("admin", "s3cret")
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
+			}
+			for k, v := range want {
+				if got := rec.Header().Get(k); got != v {
+					t.Errorf("%s = %q, want %q", k, got, v)
+				}
+			}
+			if got := rec.Header().Get("Cache-Control"); got != tt.wantCache {
+				t.Errorf("Cache-Control = %q, want %q", got, tt.wantCache)
+			}
+			if tt.wantETag && rec.Header().Get("ETag") == "" {
+				t.Error("static ETag lost")
+			}
+			if got := rec.Header().Get("Strict-Transport-Security"); got != "" {
+				t.Errorf("the app must not send HSTS, got %q", got)
+			}
+		})
+	}
+}

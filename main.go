@@ -642,7 +642,9 @@ func main() {
 
 	log.Printf("Bind: %s", bindURL(*listenHost, *listenPort, *listenBaseUrl))
 	// /ping stays open for health checks; everything else, /metrics included, needs credentials
-	handler := basicAuthMiddleware(http.DefaultServeMux, *basicUsername, *basicPassword, *listenBaseUrl+"ping")
+	handler := securityHeadersMiddleware(
+		basicAuthMiddleware(http.DefaultServeMux, *basicUsername, *basicPassword, *listenBaseUrl+"ping"),
+		*listenBaseUrl+"api/")
 	if *basicUsername != "" {
 		log.Info("HTTP Basic Auth is enabled")
 	}
@@ -744,9 +746,33 @@ func basicAuthMiddleware(next http.Handler, username, password string, openPaths
 		passOK := subtle.ConstantTimeCompare(passHash[:], wantPass[:])
 
 		if !ok || userOK&passOK != 1 {
+			// Only attempts with credentials are logged: the plain browser challenge is not an
+			// attack. Neither the credentials nor X-Forwarded-For are written. Behind a reverse
+			// proxy remote is the proxy address, so the line serves detection, not banning.
+			if r.Header.Get("Authorization") != "" {
+				log.Warnf("auth failed remote=%s path=%s", r.RemoteAddr, r.URL.Path)
+			}
 			w.Header().Set("WWW-Authenticate", `Basic realm="ovpn-admin", charset="UTF-8"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// securityHeadersMiddleware adds the hardening headers to every answer, the 401 of the auth
+// middleware included, so it has to be the outermost handler. Answers under apiPrefix also
+// get Cache-Control: no-store (the static UI keeps its own no-cache + ETag, set by
+// CacheControlWrapper). HSTS is left to the TLS-terminating proxy.
+func securityHeadersMiddleware(next http.Handler, apiPrefix string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy", "frame-ancestors 'none'")
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "same-origin")
+		if strings.HasPrefix(r.URL.Path, apiPrefix) {
+			h.Set("Cache-Control", "no-store")
 		}
 		next.ServeHTTP(w, r)
 	})
