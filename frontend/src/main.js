@@ -164,7 +164,7 @@ var formatUtcSeconds = function(date) {
 };
 
 var formatClock = function(date) {
-  return pad2(date.getHours()) + ':' + pad2(date.getMinutes()) + ':' + pad2(date.getSeconds());
+  return pad2(date.getHours()) + ':' + pad2(date.getMinutes());
 };
 
 // 'UTC+07:00' from the browser offset.
@@ -418,9 +418,11 @@ var decorateRow = function(row, nowMs) {
   var label = online ? 'Online' : (row.AccountStatus || '');
   var badgeClass = 'ov-badge-active';
   var note = '';
+  var sessions = 0;
   if (online) {
     badgeClass = 'ov-badge-online';
-    note = plural(Math.max(1, Number(row.Connections) || 0), 'session');
+    sessions = Math.max(1, Number(row.Connections) || 0);
+    note = plural(sessions, 'session');
   } else if (row.AccountStatus === 'Expired') {
     badgeClass = 'ov-badge-expired';
   } else if (row.AccountStatus === 'Revoked') {
@@ -440,6 +442,7 @@ var decorateRow = function(row, nowMs) {
     _statusLabel: label,
     _badgeClass: badgeClass,
     _statusNote: note,
+    _sessions: sessions,
     _rank: label in STATUS_RANK ? STATUS_RANK[label] : 1,
     _loginTs: isNaN(ts) ? 0 : ts,
     _login: login,

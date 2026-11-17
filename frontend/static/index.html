@@ -24,6 +24,7 @@
   <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M6 6l12 12"/></symbol>
   <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></symbol>
   <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
   <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 5h16l-6 7v6l-4 2v-8z"/></symbol>
   <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></symbol>
   <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M18 14.5a6.5 6.5 0 0 1 3.5 5.5"/></symbol>
@@ -61,7 +62,7 @@
           <svg class="ov-icon" aria-hidden="true"><use href="#i-search"/></svg>
           <input id="user-search" type="search" class="ov-input" placeholder="Search name, status or IP" autocomplete="off" v-model="search">
         </div>
-        <button type="button" class="ov-chip" :aria-pressed="filters.hideRevoked ? 'true' : 'false'" @click="setHideRevoked(!filters.hideRevoked)"><svg class="ov-icon" aria-hidden="true"><use href="#i-filter"/></svg><span>Hide revoked &amp; expired<span v-if="filters.hideRevoked && hiddenCount > 0"> ({{ hiddenCount }} hidden)</span></span></button>
+        <button type="button" class="ov-chip" :aria-pressed="filters.hideRevoked ? 'true' : 'false'" @click="setHideRevoked(!filters.hideRevoked)"><svg class="ov-icon" aria-hidden="true"><use :href="filters.hideRevoked ? '#i-check' : '#i-filter'"/></svg><span>Hide revoked &amp; expired<span v-if="filters.hideRevoked && hiddenCount > 0"> ({{ hiddenCount }} hidden)</span></span></button>
         <span class="ov-meta ov-num" role="status">{{ usersMeta }}</span>
       </div>
       <div class="ov-banner ov-banner-warn" role="status" v-if="staleError"><span>Showing data from {{ updatedTime }}. Refresh failed: {{ staleError }}.</span><button type="button" class="ov-btn" :disabled="refreshing" @click="loadUsers()">Try again</button></div>
@@ -74,18 +75,19 @@
         <ul class="ov-list ov-users-cards" aria-label="Users" v-else>
           <li class="ov-card" :class="{'ov-dimmed': row.AccountStatus == 'Revoked'}" v-for="row in cardRows" :key="row.Identity">
             <div class="ov-card-head">
-              <h2 class="ov-card-name">{{ row.Identity }}</h2>
-              <span class="ov-badge" :class="row._badgeClass">{{ row._statusLabel }}</span>
+              <h2 class="ov-card-name" :title="row.Identity"><span class="ov-clamp">{{ row.Identity }}</span></h2>
+              <span class="ov-badge" :class="row._badgeClass" :title="row.AccountStatus == 'Revoked' && row._statusNote ? 'Revoked ' + row._statusNote : null">{{ row._statusLabel }}</span>
             </div>
             <dl class="ov-card-facts">
-              <template v-if="row._statusNote"><dt>Status</dt><dd>{{ row._statusNote }}</dd></template>
               <dt>Last login</dt>
               <dd :title="row._login ? row._login.utc + ' UTC' : 'No connection found in the audit log. Logins before v0.1.1 are not recorded.'">
                 <template v-if="row._login"><span class="ov-num">{{ row._login.relative }}</span><span class="ov-muted ov-num" v-if="row.LastLoginIP"> · {{ row.LastLoginIP }}</span></template>
-                <span class="ov-muted" v-else>No record in audit log</span>
+                <span class="ov-muted" v-else>No record</span>
               </dd>
               <dt>Expires</dt>
               <dd :title="row.ExpirationDate"><span class="ov-num">{{ row._expiry.date }}</span><span :class="row._expiry.warn ? 'ov-warn-text' : 'ov-muted'" v-if="row._expiry.text"> · {{ row._expiry.text }}</span></dd>
+              <dt>Sessions</dt>
+              <dd class="ov-num"><template v-if="row._sessions > 0">{{ row._sessions }}</template><span class="ov-muted" v-else>No sessions</span></dd>
             </dl>
             <div class="ov-card-actions">
               <button type="button" class="ov-btn ov-btn-main" v-if="primaryAction(row)"
@@ -117,7 +119,7 @@
               :can-add="serverRole == 'master'" @retry="loadUsers()" @add="openAddUser()" @showall="showAllUsers()"></app-state>
           </template>
           <template v-slot:table-row="props">
-            <template v-if="props.column.field == 'Identity'">{{ props.row.Identity }}</template>
+            <div class="ov-name" v-if="props.column.field == 'Identity'" :title="props.row.Identity"><span class="ov-clamp">{{ props.row.Identity }}</span></div>
             <template v-else-if="props.column.field == '_rank'">
               <span class="ov-badge" :class="props.row._badgeClass">{{ props.row._statusLabel }}</span>
               <span class="ov-cell2" v-if="props.row._statusNote">{{ props.row._statusNote }}</span>
