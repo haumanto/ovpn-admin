@@ -1,6 +1,6 @@
 # openvpn-admin
 
-![Version: 0.1.0](https://img.shields.io/badge/Version-0.1.0-informational?style=flat-square) ![AppVersion: 2.0.2](https://img.shields.io/badge/AppVersion-2.0.2-informational?style=flat-square)
+![Version: 0.1.0](https://img.shields.io/badge/Version-0.1.0-informational?style=flat-square) ![AppVersion: v0.1.0](https://img.shields.io/badge/AppVersion-v0.1.0-informational?style=flat-square)
 
 Simple web UI to manage OpenVPN users, their certificates & routes in Linux. While backend is written in Go, frontend is based on Vue.js.
 
@@ -12,7 +12,7 @@ Simple web UI to manage OpenVPN users, their certificates & routes in Linux. Whi
 
 ## Source Code
 
-* <https://github.com/palark/openvpn-admin>
+* <https://github.com/haumanto/ovpn-admin>
 
 ## Requirements
 
@@ -22,8 +22,8 @@ Kubernetes: `>=1.14.0-0`
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| ovpnAdmin.repo | string | `"ghcr.io/palark/ovpn-admin/ovpn-admin"` |  |
-| openvpn.repo | string | `"ghcr.io/palark/ovpn-admin/openvpn"` |  |
+| ovpnAdmin.repo | string | `"ghcr.io/haumanto/ovpn-admin/ovpn-admin"` |  |
+| openvpn.repo | string | `"ghcr.io/haumanto/ovpn-admin/openvpn"` |  |
 | openvpn.subnet | string | `"172.16.200.0/255.255.255.0"` | IPv4 pool for VPN clients in the `address/netmask` format (OpenVPN `server`). |
 | openvpn.subnetIPv6 | string | `""` | IPv6 pool for VPN clients in the CIDR format (OpenVPN `server-ipv6`), e.g. `fd00:16:200::/64`. Empty disables IPv6 inside the tunnel. The pod needs IPv6 forwarding, see `podSecurityContext`. |
 | openvpn.dualStack | bool | `false` | Accept OpenVPN clients over IPv4 and IPv6: `tcp6-server` listener and `ipFamilyPolicy: PreferDualStack` for the Services (IPv6 Service addresses require a dual-stack cluster). |

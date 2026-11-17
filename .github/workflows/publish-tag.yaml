@@ -14,6 +14,10 @@ env:
   WERF_BUILDAH_MODE: auto
   WERF_ENV: ${{ (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')) && 'release' || 'pr' }}
 
+permissions:
+  contents: write
+  packages: write
+
 jobs:
   build:
     name: build images for tag
@@ -40,12 +44,15 @@ jobs:
 
       - name: Login into ghcr.io
         shell: bash
-        run: werf cr login -u ${{ github.actor }} -p ${{ github.token }} ghcr.io/${{ github.repository }}
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: werf cr login -u "$REGISTRY_USER" -p "$REGISTRY_TOKEN" ghcr.io/${{ github.repository }}
 
       - name: Extract Docker metadata
         uses: docker/metadata-action@v6.2.0
         with:
-          images: ghcr.io/${{ github.repository }}/${{ matrix.name }}
+          images: ghcr.io/${{ github.repository }}
 
       - name: Build Image
         if: ${{ github.event_name == 'pull_request' }}

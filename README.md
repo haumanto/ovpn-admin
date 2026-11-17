@@ -20,16 +20,16 @@ Simple web UI to manage OpenVPN users, their certificates & routes in Linux. Whi
 ### Screenshots
 
 Managing users in ovpn-admin:
-![ovpn-admin UI](https://raw.githubusercontent.com/palark/ovpn-admin/master/img/ovpn-admin-users.png)
+![ovpn-admin UI](https://raw.githubusercontent.com/haumanto/ovpn-admin/master/img/ovpn-admin-users.png)
 
 An example of dashboard made using ovpn-admin metrics:
-![ovpn-admin metrics](https://raw.githubusercontent.com/palark/ovpn-admin/master/img/ovpn-admin-metrics.png)
+![ovpn-admin metrics](https://raw.githubusercontent.com/haumanto/ovpn-admin/master/img/ovpn-admin-metrics.png)
 
 ## Installation
 
 ### 1. Docker
 
-There is a ready-to-use [docker-compose.yaml](https://github.com/palark/ovpn-admin/blob/master/docker-compose.yaml), so you can just change/add values you need and start it with [start.sh](https://github.com/palark/ovpn-admin/blob/master/start.sh).
+There is a ready-to-use [docker-compose.yaml](https://github.com/haumanto/ovpn-admin/blob/master/docker-compose.yaml), so you can just change/add values you need and start it with [start.sh](https://github.com/haumanto/ovpn-admin/blob/master/start.sh).
 
 Requirements:
 You need [Docker](https://docs.docker.com/get-docker/) and [Docker Compose v2](https://docs.docker.com/compose/install/) (`docker compose`) installed.
@@ -38,12 +38,12 @@ The example enables IPv6 for the containers, which needs a Docker Engine with IP
 Commands to execute:
 
 ```bash
-git clone https://github.com/palark/ovpn-admin.git
+git clone https://github.com/haumanto/ovpn-admin.git
 cd ovpn-admin
 ./start.sh
 ```
 #### 1.1
-Ready docker images are published to the GitHub Container Registry: [`ghcr.io/palark/ovpn-admin/ovpn-admin`](https://github.com/palark/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/palark/ovpn-admin/openvpn`](https://github.com/palark/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v2.0.2`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`.
+Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.0`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`.
 
 ### 2. Building from source
 
@@ -56,7 +56,7 @@ The frontend and templates are embedded into the binary with `go:embed`, no C to
 Commands to execute:
 
 ```bash
-git clone https://github.com/palark/ovpn-admin.git
+git clone https://github.com/haumanto/ovpn-admin.git
 cd ovpn-admin
 ./bootstrap.sh
 ./build.sh
@@ -67,7 +67,7 @@ cd ovpn-admin
 
 ### 3. Prebuilt binary
 
-You can also download and use prebuilt binaries from the [releases](https://github.com/palark/ovpn-admin/releases/latest) page — just choose a relevant tar.gz file (`linux-amd64` or `linux-arm64`).
+You can also download and use prebuilt binaries from the [releases](https://github.com/haumanto/ovpn-admin/releases/latest) page — just choose a relevant tar.gz file (`linux-amd64` or `linux-arm64`).
 
 
 ## Notes

@@ -3,6 +3,9 @@ on:
   release:
     types: [created]
 
+permissions:
+  contents: write
+
 jobs:
   releases-matrix:
     name: Release Go Binary
@@ -12,7 +15,7 @@ jobs:
     strategy:
       matrix:
         goos: [linux]
-        goarch: ["amd64"]
+        goarch: ["amd64", "arm64"]
     steps:
       - name: checkout code
         uses: actions/checkout@v7

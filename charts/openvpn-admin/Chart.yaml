@@ -1,5 +1,5 @@
 apiVersion: v1
-appVersion: "2.0.2"
+appVersion: "v0.1.0"
 description: Simple web UI to manage OpenVPN users, their certificates & routes in Linux. While backend is written in Go, frontend is based on Vue.js.
 name: openvpn-admin
 version: "0.1.0"
@@ -9,7 +9,7 @@ maintainers:
   email: max.nabokih@gmail.com
   url: github.com/nabokihms
 sources:
-  - https://github.com/palark/openvpn-admin
+  - https://github.com/haumanto/ovpn-admin
 keywords:
   - kubernetes
   - openvpn
