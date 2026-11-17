@@ -27,7 +27,7 @@ An example of dashboard made using ovpn-admin metrics:
 
 ## Installation
 
-Release notes for this version: [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md) (release candidate, not published yet). Earlier releases: [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0, v0.1.1 or v0.1.2: [UPGRADING.md](UPGRADING.md).
+Release notes for this version: [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md) (published with the v0.1.3 release). Earlier releases: [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0, v0.1.1 or v0.1.2: [UPGRADING.md](UPGRADING.md).
 
 ### 1. Docker
 
@@ -50,7 +50,7 @@ export OVPN_MASTER_TOKEN="$(openssl rand -hex 32)"
 ./start.sh
 ```
 #### 1.1
-Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.2`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`. The v0.1.2 images are published with the v0.1.2 release. The v0.1.3 images are not published yet; build from source.
+Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.2`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`. The v0.1.2 images are published with the v0.1.2 release. The v0.1.3 images are published with the v0.1.3 release.
 
 ### 2. Building from source
 
@@ -74,7 +74,7 @@ cd ovpn-admin
 
 ### 3. Prebuilt binary
 
-You can also download and use prebuilt binaries from the [releases](https://github.com/haumanto/ovpn-admin/releases/latest) page — just choose a relevant tar.gz file (`linux-amd64` or `linux-arm64`). The v0.1.2 binaries are attached to the v0.1.2 release. The v0.1.3 binaries are not published yet.
+You can also download and use prebuilt binaries from the [releases](https://github.com/haumanto/ovpn-admin/releases/latest) page — just choose a relevant tar.gz file (`linux-amd64` or `linux-arm64`). The v0.1.2 binaries are attached to the v0.1.2 release. The v0.1.3 binaries are attached to the v0.1.3 release.
 
 
 ## Secure deployment
