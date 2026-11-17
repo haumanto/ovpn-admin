@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Upgrade a docker compose deployment of ovpn-admin (upstream ./start.sh or registry images)
-# to v0.1.0 of this fork. See UPGRADING-v0.1.0.md.
+# Upgrade a docker compose deployment of ovpn-admin (upstream ./start.sh, v0.1.0 or registry images)
+# to a release of this fork (default: v0.1.1). One script for every version, see UPGRADING.md.
 #
-# What it does: preflight, backup of the bind-mounted data (easyrsa_master, ccd_master),
-# build --pull or pull, up -d, wait for /ping. It never runs "down", never touches volumes,
-# never deletes anything and never rolls back by itself: on a failure it prints the rollback steps.
+# What it does: preflight, backup of the bind-mounted data (easyrsa_master, ccd_master and, when the
+# compose file mounts it, audit_master), build --pull or pull, up -d, wait for /ping. It never runs
+# "down", never touches volumes, never deletes anything and never rolls back by itself: on a failure
+# it prints the rollback steps.
 set -euo pipefail
 
 PROG=$(basename "$0")
-TARGET_VERSION="v0.1.0"
+# only used in messages, the backup file name and the rollback text; it does not select any code
+TARGET_VERSION="v0.1.1"
 
 PROJECT_DIR=""
 COMPOSE_FILE="docker-compose.yaml"
@@ -23,6 +25,9 @@ BACKUP_ONLY=0
 
 # bind-mount sources (relative to the project dir) that are backed up; detected from the compose file
 SOURCES=()
+# audit mount: AUDIT_SRC is the (relative) source of the shared audit directory, created 0755 when missing
+AUDIT_SRC=""
+AUDIT_MISSING_DIR=0
 HAS_BUILD=0
 BACKUP_FILE=""
 BACKUP_DONE=0
@@ -36,8 +41,10 @@ Usage: $PROG --project-dir DIR [options]
 Upgrade a docker compose deployment of ovpn-admin to ${TARGET_VERSION}.
 
 Options:
-  --project-dir DIR       directory with the compose file and the easyrsa_master/ and ccd_master/
-                          bind mounts (required)
+  --project-dir DIR       directory with the compose file and the easyrsa_master/, ccd_master/ and
+                          audit_master/ bind mounts (required)
+  --target-version VER    version you are upgrading to, used only in messages, the backup file name
+                          and the rollback text (default: $TARGET_VERSION)
   --compose-file NAME     compose file inside the project dir (default: docker-compose.yaml)
   --project-name NAME     compose project name (default: openvpn-master, as in start.sh)
   --backup-dir DIR        where the backup archive is written (default: <project-dir>/backups)
@@ -100,6 +107,8 @@ EOF
   cat >&2 <<EOF
   # 5. check that it answers
   curl -fsS ${HEALTH_URL}
+Rolling back from ${TARGET_VERSION}. The *.failed-upgrade directories (login history in audit_master included)
+are kept: delete them by hand, only once the previous version runs.
 ===================================================================================
 EOF
 }
@@ -125,6 +134,7 @@ while [[ $# -gt 0 ]]; do
     --project-dir)    need_value "$@"; PROJECT_DIR=$2; shift 2 ;;
     --compose-file)   need_value "$@"; COMPOSE_FILE=$2; shift 2 ;;
     --project-name)   need_value "$@"; PROJECT_NAME=$2; shift 2 ;;
+    --target-version) need_value "$@"; TARGET_VERSION=$2; shift 2 ;;
     --backup-dir)     need_value "$@"; BACKUP_DIR=$2; shift 2 ;;
     --health-url)     need_value "$@"; HEALTH_URL=$2; shift 2 ;;
     --health-timeout) need_value "$@"; HEALTH_TIMEOUT=$2; shift 2 ;;
@@ -139,6 +149,7 @@ done
 
 [[ -n "$PROJECT_DIR" ]] || { usage >&2; die "--project-dir is required"; }
 [[ "$HEALTH_TIMEOUT" =~ ^[0-9]+$ ]] || die "--health-timeout must be a number of seconds"
+[[ "$TARGET_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "--target-version may only contain letters, digits, . _ and -"
 [[ "$PROJECT_NAME" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die "--project-name must be lowercase letters, digits, - or _"
 [[ "$COMPOSE_FILE" != */* ]] || die "--compose-file is a file name inside the project dir, not a path"
 
@@ -161,7 +172,7 @@ preflight() {
 
   # the upstream registry images would be pulled again and nothing would be upgraded
   if grep -Eq 'ghcr\.io/palark/' "$COMPOSE_FILE"; then
-    die "$COMPOSE_FILE still references the upstream images ghcr.io/palark/...; replace it with the docker-compose.yaml of ${TARGET_VERSION} first (see UPGRADING-${TARGET_VERSION}.md)"
+    die "$COMPOSE_FILE still references the upstream images ghcr.io/palark/...; replace it with the docker-compose.yaml of ${TARGET_VERSION} first (see UPGRADING.md)"
   fi
 
   if grep -Eq '^[[:space:]]+build:' "$COMPOSE_FILE"; then
@@ -186,7 +197,7 @@ preflight() {
 
 # bind-mount sources of the easyrsa and ccd directories, from "- ./src:/target" lines of the compose file
 detect_sources() {
-  local line src tgt have_easyrsa=0 have_ccd=0 s seen
+  local line src tgt have_easyrsa=0 have_ccd=0 s seen audit_raw=""
   local re='^[[:space:]]*-[[:space:]]*["'"'"']?([^:"'"'"'[:space:]]+):(/[^:"'"'"'[:space:]]+)'
   while IFS= read -r line; do
     [[ "$line" =~ $re ]] || continue
@@ -196,6 +207,7 @@ detect_sources() {
     case "$tgt" in
       /etc/openvpn/easyrsa|/mnt/easyrsa) have_easyrsa=1 ;;
       /etc/openvpn/ccd|/mnt/ccd)         have_ccd=1 ;;
+      /etc/openvpn/audit|/mnt/audit)     audit_raw=$src ;;
       *) continue ;;
     esac
     [[ "$src" != *'$'* ]] || die "bind-mount source '$src' contains a variable; cannot decide what to back up"
@@ -206,13 +218,35 @@ detect_sources() {
   [[ $have_easyrsa -eq 1 ]] || { warn "no easyrsa bind mount found in $COMPOSE_FILE, assuming ./easyrsa_master"; SOURCES+=("./easyrsa_master"); }
   [[ $have_ccd -eq 1 ]] || { warn "no ccd bind mount found in $COMPOSE_FILE, assuming ./ccd_master"; SOURCES+=("./ccd_master"); }
 
+  # the audit directory (v0.1.1+) is optional: a v0.1.0 or upstream compose file has no such mount
+  if [[ -n "$audit_raw" ]]; then
+    seen=0
+    for s in "${SOURCES[@]}"; do [[ "$s" == "$audit_raw" ]] && seen=1; done
+    [[ $seen -eq 1 ]] || SOURCES+=("$audit_raw")
+  elif grep -Eq '^[[:space:]]*[^#[:space:]].*OVPN_AUDIT_PATH' "$COMPOSE_FILE"; then
+    warn "$COMPOSE_FILE sets OVPN_AUDIT_PATH but the audit directory is not a bind mount of /etc/openvpn/audit or /mnt/audit; it is NOT part of the backup, back it up yourself"
+  else
+    warn "$COMPOSE_FILE has no audit mount (/etc/openvpn/audit or OVPN_AUDIT_PATH): login history will not persist until the ${TARGET_VERSION} docker-compose.yaml is used (see UPGRADING.md). The compose file is not edited."
+    # an audit directory left by an earlier v0.1.1 compose file is still worth keeping in the backup
+    if [[ -d "$PROJECT_DIR/audit_master" ]]; then
+      SOURCES+=("./audit_master")
+      log "found ./audit_master on disk: it is included in the backup"
+    fi
+  fi
+
   # normalise to paths relative to the project dir; refuse anything that leaves it
   local abs rel normalised=()
   for s in "${SOURCES[@]}"; do
     abs=$(realpath -m "$PROJECT_DIR/$s")
     [[ "$abs" == "$PROJECT_DIR"/* ]] || die "bind-mount source '$s' is outside the project dir; this script only touches the project dir and the backup dir"
     rel=${abs#"$PROJECT_DIR"/}
-    [[ -d "$abs" ]] || die "bind-mount source directory does not exist: $abs (wrong --project-dir?)"
+    if [[ -n "$audit_raw" && "$(realpath -m "$PROJECT_DIR/$audit_raw")" == "$abs" ]]; then
+      # created by backup() with mode 0755 so the first start does not leave a root-owned surprise
+      AUDIT_SRC=$rel
+      [[ -d "$abs" ]] || AUDIT_MISSING_DIR=1
+    else
+      [[ -d "$abs" ]] || die "bind-mount source directory does not exist: $abs (wrong --project-dir?)"
+    fi
     normalised+=("$rel")
   done
   SOURCES=("${normalised[@]}")
@@ -229,7 +263,7 @@ check_required_variables() {
     missing+=("$name")
   done < <(grep -Eo '\$\{[A-Za-z_][A-Za-z0-9_]*:\?' "$COMPOSE_FILE" | sed -E 's/^\$\{//; s/:\?$//' | sort -u)
   if [[ ${#missing[@]} -gt 0 ]]; then
-    die "the compose file requires these variables and they are not set in the environment or in $PROJECT_DIR/.env: ${missing[*]} (see UPGRADING-${TARGET_VERSION}.md)"
+    die "the compose file requires these variables and they are not set in the environment or in $PROJECT_DIR/.env: ${missing[*]} (see UPGRADING.md)"
   fi
 }
 
@@ -241,6 +275,10 @@ print_plan() {
   log "project dir:   $PROJECT_DIR"
   log "compose file:  $COMPOSE_FILE"
   log "project name:  $PROJECT_NAME"
+  log "target:        ${TARGET_VERSION}"
+  if [[ $AUDIT_MISSING_DIR -eq 1 ]]; then
+    log "audit dir:     $AUDIT_SRC does not exist and will be created with mode 0755 before the backup"
+  fi
   log "backup:        $BACKUP_DIR/pre-${TARGET_VERSION}-${TS}.tar.gz  (${SOURCES[*]})"
   if [[ $BACKUP_ONLY -eq 1 ]]; then
     log "stop after the backup (--backup-only)"
@@ -272,6 +310,7 @@ backup() {
   BACKUP_FILE="$BACKUP_DIR/pre-${TARGET_VERSION}-${TS}.tar.gz"
 
   if [[ $DRY_RUN -eq 1 ]]; then
+    [[ $AUDIT_MISSING_DIR -eq 0 ]] || printf '+ mkdir -p %s && chmod 0755 %s\n' "$PROJECT_DIR/$AUDIT_SRC" "$PROJECT_DIR/$AUDIT_SRC"
     printf '+ mkdir -p %s\n' "$BACKUP_DIR"
     printf '+ tar -czf %s -C %s %s\n' "$BACKUP_FILE" "$PROJECT_DIR" "${SOURCES[*]}"
     log "(dry run) no archive written; a real run prints its path, size and sha256 here"
@@ -279,6 +318,10 @@ backup() {
   fi
 
   [[ ! -e "$BACKUP_FILE" ]] || die "backup file already exists: $BACKUP_FILE"
+  if [[ $AUDIT_MISSING_DIR -eq 1 ]]; then
+    printf '+ mkdir -p %s && chmod 0755 %s\n' "$PROJECT_DIR/$AUDIT_SRC" "$PROJECT_DIR/$AUDIT_SRC"
+    { mkdir -p "$PROJECT_DIR/$AUDIT_SRC" && chmod 0755 "$PROJECT_DIR/$AUDIT_SRC"; } || die "could not create $PROJECT_DIR/$AUDIT_SRC. Nothing was changed."
+  fi
   # the archive holds the CA private key: owner-only
   (umask 077 && mkdir -p "$BACKUP_DIR")
   printf '+ tar -czf %s -C %s %s\n' "$BACKUP_FILE" "$PROJECT_DIR" "${SOURCES[*]}"
