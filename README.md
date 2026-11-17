@@ -27,6 +27,8 @@ An example of dashboard made using ovpn-admin metrics:
 
 ## Installation
 
+Release notes for this version: [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md). Upgrading from v0.1.0: [UPGRADING.md](UPGRADING.md).
+
 ### 1. Docker
 
 There is a ready-to-use [docker-compose.yaml](https://github.com/haumanto/ovpn-admin/blob/master/docker-compose.yaml), so you can just change/add values you need and start it with [start.sh](https://github.com/haumanto/ovpn-admin/blob/master/start.sh).
@@ -48,7 +50,7 @@ export OVPN_MASTER_TOKEN="$(openssl rand -hex 32)"
 ./start.sh
 ```
 #### 1.1
-Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.0`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`. The v0.1.0 images are published with the v0.1.0 release; until then, build from source.
+Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.1`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`. The v0.1.1 images are published with the v0.1.1 release; until that release is published, build from source.
 
 ### 2. Building from source
 
@@ -72,7 +74,7 @@ cd ovpn-admin
 
 ### 3. Prebuilt binary
 
-You can also download and use prebuilt binaries from the [releases](https://github.com/haumanto/ovpn-admin/releases/latest) page — just choose a relevant tar.gz file (`linux-amd64` or `linux-arm64`). The v0.1.0 binaries appear with the v0.1.0 release.
+You can also download and use prebuilt binaries from the [releases](https://github.com/haumanto/ovpn-admin/releases/latest) page — just choose a relevant tar.gz file (`linux-amd64` or `linux-arm64`). The v0.1.1 binaries appear with the v0.1.1 release; until that release is published, build from source.
 
 
 ## Secure deployment
@@ -87,7 +89,7 @@ Step-by-step guide with a ready nginx config and fail2ban jails: [docs/hardening
 * **Compose binds the admin port to loopback** (`127.0.0.1:8080`); the VPN port 7777 stays on all interfaces. Publish the admin UI only through the proxy.
 * **Cross-host master/slave sync only over HTTPS** (`--master.host=https://...`, plus `--master.basic-auth.user/password`).
 * **Sync token.** Generate it with `openssl rand -hex 32`. The example values `TOKEN` and `VerySecureToken` and the former built-in default are refused at startup.
-* **Slave compose file (known issue).** `docker-compose-slave.yaml` still targets `http://172.20.0.1:8080`, which the loopback binding no longer serves: put the proxy in between. It also has a literal sync token and no Basic Auth, so it does not start as shipped. See `RELEASE-v0.1.0.md`.
+* **Slave compose file (known issue).** `docker-compose-slave.yaml` refuses to start unless Basic Auth, the sync token and the master credentials are set in the environment, and it publishes its admin port on `127.0.0.1:8081`. It still targets `http://172.20.0.1:8080`, which the loopback binding of the master no longer serves: put a TLS reverse proxy in between. The slave runtime is not verified yet. See `RELEASE-v0.1.1.md`.
 * **Chart upgrade notes:** `ovpnAdmin.tag` and `openvpn.tag` are new and default to the chart `appVersion` (the images were `:master`); no value was renamed. The Role is narrowed to `secrets` (get, list, create, update) and `services` (get) in the release namespace.
 
 ## Notes

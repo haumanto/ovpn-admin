@@ -60,7 +60,7 @@ No database migration. `easyrsa_master/`, `ccd_master/` and `users.db` are untou
    BASIC_PASSWORD=<a long random password>
    OVPN_MASTER_TOKEN=<output of: openssl rand -hex 32>
    ```
-   If you run a slave (`docker-compose-slave.yaml`), it needs the same `OVPN_MASTER_TOKEN`, and it needs `BASIC_*` too.
+   If you run a slave (`docker-compose-slave.yaml`), it needs the same `OVPN_MASTER_TOKEN`, its own `BASIC_USERNAME` and `BASIC_PASSWORD`, and `OVPN_MASTER_USER` and `OVPN_MASTER_PASSWORD` (the master's Basic Auth user and password). The slave compose file refuses to start unless all five are set.
 4. **Preview, then upgrade**:
    ```bash
    scripts/upgrade.sh --project-dir . --dry-run
@@ -128,7 +128,7 @@ Never use `down -v` and never delete `easyrsa_master/` (it holds your CA) or `au
 * 64-bit only: images are `linux/amd64` and `linux/arm64`, no 32-bit ARM.
 * `GET api/user/ccd` answers `400` (invalid name) and `404` (unknown user) instead of `200` with an empty CCD; an invalid body of `POST api/user/ccd/apply` answers `422`.
 * Rotate and delete revoke the certificate first. Deleting a user also removes its ccd file.
-* The admin port is published as `127.0.0.1:8080`, no longer on all interfaces. Put a TLS reverse proxy in front for remote access. A slave that reaches the master on `172.20.0.1:8080` (`docker-compose-slave.yaml`) cannot use that path any more and needs the master token.
+* The admin port is published as `127.0.0.1:8080`, no longer on all interfaces. Put a TLS reverse proxy in front for remote access. A slave that reaches the master on `172.20.0.1:8080` (`docker-compose-slave.yaml`) cannot use that path any more: put a TLS reverse proxy between them and give the slave the master token.
 * The web UI and API need Basic Auth (`/ping` stays open).
 
 ## Rollback
