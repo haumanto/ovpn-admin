@@ -271,18 +271,23 @@ EOF
 
   # only these two OpenVPN log lines count. After the timestamp (which fail2ban strips) OpenVPN 2.7 starts the line with the
   # listener's --proto name and the source, "<proto>:IP:port": tcp-server, tcp4-server, tcp6-server for TCP and udp, udp4,
-  # udp6 for UDP (not udp-server). An IPv6 source is written in brackets, "<proto>:[IPv6]:port". Old-style lines have no
-  # proto name and may carry [AF_INET] or [AF_INET6] in front of the address. Real lines of OpenVPN 2.7.7, default image:
+  # udp6 for UDP (not udp-server; the AUTH_FAILED pattern accepts it anyway). An IPv6 source is written in brackets,
+  # "<proto>:[IPv6]:port". Old-style lines have no proto name and may carry [AF_INET] or [AF_INET6] in front of the address.
+  # Real lines of OpenVPN 2.7.7, default image:
   #   2026-11-17 19:11:47 tcp6-server:172.20.0.50:54768 VERIFY ERROR: depth=0, error=certificate revoked: CN=x, serial=N
-  #   2026-11-17 19:07:57 tcp6-server:172.20.0.41:33392 SENT CONTROL [user]: 'AUTH_FAILED' (status=1)
-  #   2026-11-17 19:48:29 udp6:[fd00:172:20::61]:49031 SENT CONTROL [user]: 'AUTH_FAILED' (status=1)
-  # The proto name is optional and "IP:port" must follow it directly (an unknown prefix makes the line a miss). One failed
-  # login writes two AUTH_FAILED lines ([UNDEF] and [user]), so it counts twice. TLS handshake failures, expired
+  #   2026-11-17 20:07:41 tcp6-server:172.30.14.50:54826 SENT CONTROL [UNDEF]: 'AUTH_FAILED' (status=1)
+  #   2026-11-17 20:07:41 tcp6-server:172.30.14.50:54826 SENT CONTROL [user]: 'AUTH_FAILED' (status=1)
+  #   2026-11-17 19:48:29 udp6:[fd00:172:20::61]:49031 SENT CONTROL [UNDEF]: 'AUTH_FAILED' (status=1)
+  # The proto name is optional and "IP:port" must follow it directly (an unknown prefix makes the line a miss).
+  # One wrong password writes TWO AUTH_FAILED lines with the same source and port, one right after the other: "[UNDEF]"
+  # (sent before the common name is known) and "[<common name>]". They have the same shape, so a pattern for the shape
+  # counts every attempt twice and the ban (OVPN_BAN_MAXRETRY=3) lands on the second attempt. Only the "[UNDEF]" line is
+  # counted: it is written first, for every failed login, whatever the common name. TLS handshake failures, expired
   # certificates and network errors do not match. <HOST> matches IPv4 and IPv6 sources.
   cat > /etc/fail2ban/filter.d/ovpn-admin.conf <<'EOF' || return 1
 [Definition]
 failregex = ^\s*(?:(?:tcp[46]?-server|udp[46]?):)?(?:\[AF_INET6?\])?\[?<HOST>\]?:\d+ VERIFY ERROR: .*certificate revoked
-            ^\s*(?:(?:tcp[46]?-server|udp[46]?):)?(?:\[AF_INET6?\])?\[?<HOST>\]?:\d+ (?:SENT CONTROL \[[^]]*\]: ')?AUTH_FAILED
+            ^\s*(?:(?:tcp[46]?-server|udp[46]?(?:-server)?):)?(?:\[AF_INET6?\])?\[?<HOST>\]?:\d+ SENT CONTROL \[UNDEF\]: 'AUTH_FAILED'
 ignoreregex =
 EOF
 
