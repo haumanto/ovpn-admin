@@ -21,7 +21,7 @@ services:
       - ovpn
     ports:
       - 7778:1194 # for openvpn
-      - 8081:8080 # for ovpn-admin because of network_mode
+      - 127.0.0.1:8081:8080 # for ovpn-admin because of network_mode; loopback only, publish it through a TLS reverse proxy
     volumes:
       - ./easyrsa_slave:/etc/openvpn/easyrsa
       - ./ccd_slave:/etc/openvpn/ccd
@@ -30,9 +30,18 @@ services:
       context: .
       dockerfile: Dockerfile.ovpn-admin
     image: ovpn-admin:local
-    command: /app/ovpn-admin --log.level="debug" --ovpn.network="192.168.100.0/24" --ovpn.network.ipv6="fd00:192:168:100::/64" --master.sync-token="TOKEN" --master.host="http://172.20.0.1:8080" --role="slave" --ovpn.server="127.0.0.1:7777:tcp" --ovpn.server="127.0.0.1:7778:tcp" --easyrsa.path="/mnt/easyrsa" --easyrsa.index-path="/mnt/easyrsa/pki/index.txt" --ccd.path="/mnt/ccd"
+    command: /app/ovpn-admin --log.level="debug" --ovpn.network="192.168.100.0/24" --ovpn.network.ipv6="fd00:192:168:100::/64" --master.host="http://172.20.0.1:8080" --role="slave" --ovpn.server="127.0.0.1:7777:tcp" --ovpn.server="127.0.0.1:7778:tcp" --easyrsa.path="/mnt/easyrsa" --easyrsa.index-path="/mnt/easyrsa/pki/index.txt" --ccd.path="/mnt/ccd"
     environment:
-      - OVPN_SLAVE=1
+      # Generate the sync token with: openssl rand -hex 32 (same value as OVPN_MASTER_TOKEN of docker-compose.yaml).
+      # The slave panel serves every user's private key and the tls-auth key: keep it behind a TLS reverse proxy.
+      OVPN_SLAVE: "1"
+      # HTTP Basic Auth of this slave's web UI and API (/ping stays open), compose refuses to start if they are unset
+      BASIC_USERNAME: "${BASIC_USERNAME:?set BASIC_USERNAME}"
+      BASIC_PASSWORD: "${BASIC_PASSWORD:?set BASIC_PASSWORD}"
+      OVPN_MASTER_TOKEN: "${OVPN_MASTER_TOKEN:?set OVPN_MASTER_TOKEN}"
+      # Basic Auth credentials of the master, used by the slave to sync from it
+      OVPN_MASTER_USER: "${OVPN_MASTER_USER:?set OVPN_MASTER_USER}"
+      OVPN_MASTER_PASSWORD: "${OVPN_MASTER_PASSWORD:?set OVPN_MASTER_PASSWORD}"
     network_mode: service:openvpn
     volumes:
       - ./easyrsa_slave:/mnt/easyrsa
