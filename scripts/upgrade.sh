@@ -31,6 +31,10 @@ SOURCES=()
 AUDIT_SRC=""
 AUDIT_MISSING_DIR=0
 HAS_BUILD=0
+# compose command, set by detect_compose(): (docker compose) for V2, (docker-compose) for V1 >= 1.25
+COMPOSE_CMD=(docker compose)
+COMPOSE_STR="docker compose"
+COMPOSE_V1=0
 BACKUP_FILE=""
 BACKUP_DONE=0
 TS=$(date -u +%Y%m%dT%H%M%SZ)
@@ -76,7 +80,40 @@ run() {
 }
 
 compose() {
-  docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" "$@"
+  "${COMPOSE_CMD[@]}" -p "$PROJECT_NAME" -f "$COMPOSE_FILE" "$@"
+}
+
+# V1 (docker-compose) lists stopped containers in "ps" by default and only got "ps -a" later; V2 needs -a
+compose_ps_all() {
+  if [[ $COMPOSE_V1 -eq 1 ]]; then compose ps; else compose ps -a; fi
+}
+
+# V2 plugin ("docker compose") first, else the standalone V1 "docker-compose" (>= 1.25), else a clear error
+detect_compose() {
+  local out first major minor
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE_CMD=(docker compose)
+    COMPOSE_STR="docker compose"
+    COMPOSE_V1=0
+    docker compose version
+    return 0
+  fi
+  if command -v docker-compose >/dev/null 2>&1 && out=$(docker-compose version 2>&1); then
+    first=$(head -n 1 <<<"$out")
+    [[ "$first" =~ ([0-9]+)\.([0-9]+) ]] || die "could not read the version of docker-compose from: $first"
+    major=$((10#${BASH_REMATCH[1]}))
+    minor=$((10#${BASH_REMATCH[2]}))
+    if [[ $major -lt 1 || ( $major -eq 1 && $minor -lt 25 ) ]]; then
+      die "docker-compose ${major}.${minor} is too old: this script needs docker-compose >= 1.25 (V1) or the 'docker compose' plugin (V2). Upgrade Compose and re-run."
+    fi
+    COMPOSE_CMD=(docker-compose)
+    COMPOSE_STR="docker-compose"
+    COMPOSE_V1=0
+    [[ $major -ge 2 ]] || COMPOSE_V1=1
+    log "using standalone docker-compose: $first"
+    return 0
+  fi
+  die "neither 'docker compose' (the Compose V2 plugin) nor 'docker-compose' (V1 >= 1.25) is available; install one of them"
 }
 
 print_rollback() {
@@ -89,11 +126,12 @@ Run these steps by hand, in the project dir:
 
   cd ${PROJECT_DIR}
   # 1. stop the stack (no "down -v", volumes stay)
-  docker compose -p ${PROJECT_NAME} -f ${COMPOSE_FILE} stop
+  ${COMPOSE_STR} -p ${PROJECT_NAME} -f ${COMPOSE_FILE} stop
   # 2. restore the data: move the current directories aside, then unpack the backup
 EOF
   local s
-  for s in "${SOURCES[@]}"; do
+  # the +"${arr[@]}" form keeps empty arrays safe under set -u on Bash < 4.4
+  for s in "${SOURCES[@]+"${SOURCES[@]}"}"; do
     printf '  mv %s %s.failed-upgrade\n' "$s" "$s" >&2
   done
   cat >&2 <<EOF
@@ -103,10 +141,10 @@ EOF
   # 4. start the previous version
 EOF
   if [[ $HAS_BUILD -eq 1 ]]; then
-    printf '  docker compose -p %s -f %s up -d --build\n' "$PROJECT_NAME" "$COMPOSE_FILE" >&2
+    printf '  %s -p %s -f %s up -d --build\n' "$COMPOSE_STR" "$PROJECT_NAME" "$COMPOSE_FILE" >&2
   else
-    printf '  docker compose -p %s -f %s pull\n  docker compose -p %s -f %s up -d\n' \
-      "$PROJECT_NAME" "$COMPOSE_FILE" "$PROJECT_NAME" "$COMPOSE_FILE" >&2
+    printf '  %s -p %s -f %s pull\n  %s -p %s -f %s up -d\n' \
+      "$COMPOSE_STR" "$PROJECT_NAME" "$COMPOSE_FILE" "$COMPOSE_STR" "$PROJECT_NAME" "$COMPOSE_FILE" >&2
   fi
   cat >&2 <<EOF
   # 5. check that it answers
@@ -168,7 +206,7 @@ BACKUP_DIR=$(realpath -m "$BACKUP_DIR")
 preflight() {
   log "== Preflight"
   command -v docker >/dev/null 2>&1 || die "docker is not installed or not in PATH"
-  docker compose version || die "'docker compose' (the compose plugin) is not available"
+  detect_compose
   command -v tar >/dev/null 2>&1 || die "tar is not installed"
   command -v sha256sum >/dev/null 2>&1 || die "sha256sum is not installed"
   command -v curl >/dev/null 2>&1 || die "curl is not installed (needed for the health check)"
@@ -192,11 +230,11 @@ preflight() {
   check_required_variables
 
   # compose validates the file; -q prints nothing, so no interpolated secret reaches the terminal
-  compose config -q || die "docker compose config failed for $COMPOSE_FILE, see the message above"
+  compose config -q || die "$COMPOSE_STR config failed for $COMPOSE_FILE, see the message above"
 
   # the ordered start names both services; a compose file without them (the slave file, for one) is not for this script
   local svc
-  svc=$(compose config --services) || die "docker compose config --services failed for $COMPOSE_FILE"
+  svc=$(compose config --services) || die "$COMPOSE_STR config --services failed for $COMPOSE_FILE"
   if ! { grep -qx 'openvpn' <<<"$svc" && grep -qx 'ovpn-admin' <<<"$svc"; }; then
     die "$COMPOSE_FILE has no 'openvpn' and 'ovpn-admin' services (found: $(tr '\n' ' ' <<<"$svc")). This script upgrades the master stack; a slave is upgraded by hand, see UPGRADING.md"
   fi
@@ -225,7 +263,8 @@ detect_sources() {
     esac
     [[ "$src" != *'$'* ]] || die "bind-mount source '$src' contains a variable; cannot decide what to back up"
     seen=0
-    for s in "${SOURCES[@]}"; do [[ "$s" == "$src" ]] && seen=1; done
+    # the +"${arr[@]}" form keeps empty arrays safe under set -u on Bash < 4.4
+    for s in "${SOURCES[@]+"${SOURCES[@]}"}"; do [[ "$s" == "$src" ]] && seen=1; done
     [[ $seen -eq 1 ]] || SOURCES+=("$src")
   done < "$COMPOSE_FILE"
   [[ $have_easyrsa -eq 1 ]] || { warn "no easyrsa bind mount found in $COMPOSE_FILE, assuming ./easyrsa_master"; SOURCES+=("./easyrsa_master"); }
@@ -234,7 +273,8 @@ detect_sources() {
   # the audit directory (v0.1.1+) is optional: a v0.1.0 or upstream compose file has no such mount
   if [[ -n "$audit_raw" ]]; then
     seen=0
-    for s in "${SOURCES[@]}"; do [[ "$s" == "$audit_raw" ]] && seen=1; done
+    # the +"${arr[@]}" form keeps empty arrays safe under set -u on Bash < 4.4
+    for s in "${SOURCES[@]+"${SOURCES[@]}"}"; do [[ "$s" == "$audit_raw" ]] && seen=1; done
     [[ $seen -eq 1 ]] || SOURCES+=("$audit_raw")
   elif grep -Eq '^[[:space:]]*[^#[:space:]].*OVPN_AUDIT_PATH' "$COMPOSE_FILE"; then
     warn "$COMPOSE_FILE sets OVPN_AUDIT_PATH but the audit directory is not a bind mount of /etc/openvpn/audit or /mnt/audit; it is NOT part of the backup, back it up yourself"
@@ -249,7 +289,8 @@ detect_sources() {
 
   # normalise to paths relative to the project dir; refuse anything that leaves it
   local abs rel normalised=()
-  for s in "${SOURCES[@]}"; do
+  # the +"${arr[@]}" form keeps empty arrays safe under set -u on Bash < 4.4
+  for s in "${SOURCES[@]+"${SOURCES[@]}"}"; do
     abs=$(realpath -m "$PROJECT_DIR/$s")
     [[ "$abs" == "$PROJECT_DIR"/* ]] || die "bind-mount source '$s' is outside the project dir; this script only touches the project dir and the backup dir"
     rel=${abs#"$PROJECT_DIR"/}
@@ -275,7 +316,7 @@ check_required_variables() {
     if [[ -f .env ]] && grep -Eq "^[[:space:]]*(export[[:space:]]+)?${name}=.+" .env; then continue; fi
     missing+=("$name")
   done < <(grep -Eo '\$\{[A-Za-z_][A-Za-z0-9_]*:\?' "$COMPOSE_FILE" | sed -E 's/^\$\{//; s/:\?$//' | sort -u)
-  if [[ ${#missing[@]} -gt 0 ]]; then
+  if [[ -n "${missing[*]-}" ]]; then
     die "the compose file requires these variables and they are not set in the environment or in $PROJECT_DIR/.env: ${missing[*]} (see UPGRADING.md)"
   fi
 }
@@ -297,13 +338,13 @@ print_plan() {
     log "stop after the backup (--backup-only)"
   else
     if [[ $HAS_BUILD -eq 1 ]]; then
-      log "upgrade:       docker compose -p $PROJECT_NAME -f $COMPOSE_FILE build --pull"
+      log "upgrade:       $COMPOSE_STR -p $PROJECT_NAME -f $COMPOSE_FILE build --pull"
     else
-      log "upgrade:       docker compose -p $PROJECT_NAME -f $COMPOSE_FILE pull"
+      log "upgrade:       $COMPOSE_STR -p $PROJECT_NAME -f $COMPOSE_FILE pull"
     fi
-    log "start:         docker compose -p $PROJECT_NAME -f $COMPOSE_FILE up -d --no-deps openvpn"
+    log "start:         $COMPOSE_STR -p $PROJECT_NAME -f $COMPOSE_FILE up -d --no-deps openvpn"
     log "               wait for the management interface for up to ${MGMT_TIMEOUT}s (probe below)"
-    log "               docker compose -p $PROJECT_NAME -f $COMPOSE_FILE up -d --no-deps ovpn-admin"
+    log "               $COMPOSE_STR -p $PROJECT_NAME -f $COMPOSE_FILE up -d --no-deps ovpn-admin"
     log "health:        GET $HEALTH_URL for up to ${HEALTH_TIMEOUT}s"
   fi
   log "never run:     down, down -v, volume removal, rm"
@@ -363,17 +404,17 @@ upgrade() {
   log ""
   log "== Upgrade"
   if [[ $HAS_BUILD -eq 1 ]]; then
-    run docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" build --pull
+    run "${COMPOSE_CMD[@]}" -p "$PROJECT_NAME" -f "$COMPOSE_FILE" build --pull
   else
-    run docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" pull
+    run "${COMPOSE_CMD[@]}" -p "$PROJECT_NAME" -f "$COMPOSE_FILE" pull
   fi
   # ordered start: ovpn-admin connects to the management interface of openvpn, which is not listening
   # until openvpn has finished its first-start work (DH parameters take ~20s), so openvpn goes first
   STAGE="start openvpn"
-  run docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" up -d --no-deps openvpn
+  run "${COMPOSE_CMD[@]}" -p "$PROJECT_NAME" -f "$COMPOSE_FILE" up -d --no-deps openvpn
   wait_management
   STAGE="start ovpn-admin"
-  run docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" up -d --no-deps ovpn-admin
+  run "${COMPOSE_CMD[@]}" -p "$PROJECT_NAME" -f "$COMPOSE_FILE" up -d --no-deps ovpn-admin
 }
 
 # the management interface listens on 127.0.0.1:8989 inside the openvpn container (setup/configure.sh).
@@ -384,8 +425,8 @@ MGMT_PROBE="(printf 'version\\n'; sleep 1; printf 'quit\\n') | nc -w 2 127.0.0.1
 wait_management() {
   STAGE="wait for management interface"
   if [[ $DRY_RUN -eq 1 ]]; then
-    printf '+ docker compose -p %s -f %s exec -T openvpn sh -c "%s" | grep -q %s   (every 2s, up to %ss; ovpn-admin is started only after it passes)\n' \
-      "$PROJECT_NAME" "$COMPOSE_FILE" "$MGMT_PROBE" "'OpenVPN Version'" "$MGMT_TIMEOUT"
+    printf '+ %s -p %s -f %s exec -T openvpn sh -c "%s" | grep -q %s   (every 2s, up to %ss; ovpn-admin is started only after it passes)\n' \
+      "$COMPOSE_STR" "$PROJECT_NAME" "$COMPOSE_FILE" "$MGMT_PROBE" "'OpenVPN Version'" "$MGMT_TIMEOUT"
     return 0
   fi
   log "waiting up to ${MGMT_TIMEOUT}s for the OpenVPN management interface (127.0.0.1:8989 in the openvpn container)"
@@ -421,9 +462,9 @@ wait_management() {
     log "last probe output (passwords and tokens redacted): ${out:-<none>}" | redact
     log "ovpn-admin was NOT started or recreated."
     log "-- container status"
-    compose ps -a || true
+    compose_ps_all || true
     log "-- last 40 openvpn log lines (passwords and tokens redacted)"
-    compose logs --no-color --tail 40 openvpn 2>&1 | redact || true
+    compose logs --no-color --tail=40 openvpn 2>&1 | redact || true
   } >&2
   return 1
 }
@@ -451,9 +492,9 @@ health() {
   {
     log "NOT healthy: $HEALTH_URL did not answer 2xx within ${HEALTH_TIMEOUT}s"
     log "-- container status"
-    compose ps -a || true
+    compose_ps_all || true
     log "-- last 20 log lines (passwords and tokens redacted)"
-    compose logs --no-color --tail 20 2>&1 | redact || true
+    compose logs --no-color --tail=20 2>&1 | redact || true
   } >&2
   return 1
 }

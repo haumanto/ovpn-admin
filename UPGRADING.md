@@ -12,6 +12,7 @@ Kubernetes/Helm deployments: see `charts/openvpn-admin/README.md`. The historica
 ## What the script does and never does
 
 * Preflight: docker compose, the compose file, required variables, bind-mount sources, a warning when there is no audit mount.
+* Requirements: Bash 4.2 or newer; both `docker compose` (V2 plugin, tried first) and `docker-compose` (V1, at least 1.25, refused when older) are supported, and the manual commands below work with either (write `docker-compose` for V1).
 * Backup (tar.gz, mode 600, in a mode 700 directory) of `easyrsa_master/`, `ccd_master/` and, when the compose file mounts it, `audit_master/`. It prints path, size, entries and sha256.
 * `build --pull` (compose file with `build:`) or `pull` (registry images), then the ordered start (next paragraph), then `GET /ping`.
 * It never runs `down`, `down -v`, a volume removal or a delete, and it never rolls back by itself. On a failure it prints the rollback steps with your paths filled in.
