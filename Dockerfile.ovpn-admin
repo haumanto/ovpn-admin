@@ -21,6 +21,13 @@ ARG TARGETARCH
 # sqlite: ovpn-admin fixes users.db rows migrated from openvpn-user <= 1.0.4 (secret IS NULL) at startup
 RUN apk add --update bash easy-rsa openssl openvpn coreutils sqlite && \
     ln -s /usr/share/easy-rsa/easyrsa /usr/local/bin && \
-    wget https://github.com/pashcovich/openvpn-user/releases/download/v1.0.9/openvpn-user-linux-${TARGETARCH}.tar.gz -O - | tar xz -C /usr/local/bin && \
+    case "${TARGETARCH}" in \
+      amd64) OPENVPN_USER_SHA256=aa121e391ec206f48256b7b9828b72c010f6f2402c3a6d0205084a3c5803bb82 ;; \
+      arm64) OPENVPN_USER_SHA256=2e03e8b81acc953ef00b770fa7ce16b8774e302a3f5c7fb0d445e12d18af3793 ;; \
+      *) echo "no pinned openvpn-user v1.0.9 checksum for TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac && \
+    wget -q https://github.com/pashcovich/openvpn-user/releases/download/v1.0.9/openvpn-user-linux-${TARGETARCH}.tar.gz -O /tmp/openvpn-user.tar.gz && \
+    echo "${OPENVPN_USER_SHA256}  /tmp/openvpn-user.tar.gz" | sha256sum -c - && \
+    tar xzf /tmp/openvpn-user.tar.gz -C /usr/local/bin && \
     rm -rf /tmp/* /var/tmp/* /var/cache/apk/* /var/cache/distfiles/*
 RUN if [ -f "/usr/local/bin/openvpn-user-${TARGETARCH}" ]; then ln -s /usr/local/bin/openvpn-user-${TARGETARCH} /usr/local/bin/openvpn-user; fi
