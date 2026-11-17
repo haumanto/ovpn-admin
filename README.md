@@ -70,6 +70,15 @@ cd ovpn-admin
 You can also download and use prebuilt binaries from the [releases](https://github.com/haumanto/ovpn-admin/releases/latest) page — just choose a relevant tar.gz file (`linux-amd64` or `linux-arm64`).
 
 
+## Secure deployment
+
+* **Basic Auth is mandatory.** `docker-compose.yaml` and the Helm chart refuse to start without credentials: compose needs `BASIC_USERNAME`, `BASIC_PASSWORD` and `OVPN_MASTER_TOKEN` (generate the token with `openssl rand -hex 32`), `start.sh` passes your environment through; the chart fails to render until `ingress.basicAuth.user` and `ingress.basicAuth.password` are set (the old `admin`/`changeme` defaults are rejected).
+* **Terminate TLS in a reverse proxy** in front of the admin UI. Basic Auth over plain HTTP exposes the credentials.
+* **Block direct access to the backend** (port 8080 / 8000) with a firewall or NetworkPolicy, only the proxy may reach it.
+* **Compose binds the admin port to loopback** (`127.0.0.1:8080`); the VPN port 7777 stays on all interfaces. Publish the admin UI only through the proxy.
+* **Cross-host master/slave sync only over HTTPS** (`--master.host=https://...`, plus `--master.basic-auth.user/password`) with a unique random sync token. The slave compose file still targets `http://172.20.0.1:8080`, which the loopback binding no longer serves: put the proxy in between.
+* **Chart upgrade notes:** `ovpnAdmin.tag` and `openvpn.tag` are new and default to the chart `appVersion` (the images were `:master`); no value was renamed. The Role is narrowed to `secrets` (get, list, create, update) and `services` (get) in the release namespace.
+
 ## Notes
 * This tool uses external calls for `bash`, `coreutils` and `easy-rsa`, thus **Linux systems only are supported** at the moment.
 * To enable additional password authentication, provide `--auth.password` and `--auth.db="/etc/easyrsa/pki/users.db"` flags and install [openvpn-user](https://github.com/pashcovich/openvpn-user/releases/tag/v1.0.9) v1.0.9 and `sqlite3` (needed to upgrade a `users.db` created by openvpn-user v1.0.4 or older, see [Upgrade notes](#upgrade-notes)). Both should be available in your `$PATH` and be executable (`+x`). Two-factor authentication (TOTP) of openvpn-user is not supported by ovpn-admin.

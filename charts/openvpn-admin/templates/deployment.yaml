@@ -37,7 +37,7 @@ spec:
       serviceAccountName: openvpn
       containers:
       - name: ovpn-admin
-        image: {{ .Values.ovpnAdmin.repo }}:master
+        image: {{ .Values.ovpnAdmin.repo }}:{{ include "openvpn-admin.imageTag" (dict "tag" .Values.ovpnAdmin.tag "appVersion" .Chart.AppVersion) }}
         command:
         - /bin/sh
         - -c
@@ -60,17 +60,44 @@ spec:
             {{- $host := trimPrefix "[" . | trimSuffix "]" }}
             --ovpn.server="{{ if contains ":" $host }}[{{ $host }}]{{ else }}{{ $host }}{{ end }}:{{ $externalPort }}:tcp"
             {{- end }}
+        env:
+        - name: BASIC_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: basic-auth
+              key: username
+        - name: BASIC_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: basic-auth
+              key: password
         ports:
         - name: ovpn-admin
           protocol: TCP
           containerPort: 8000
+        readinessProbe:
+          httpGet:
+            path: /ping
+            port: ovpn-admin
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /ping
+            port: ovpn-admin
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          timeoutSeconds: 3
+          failureThreshold: 6
         volumeMounts:
           - name: certs
             mountPath: /mnt/certs
           - name: ccd
             mountPath: /mnt/ccd
       - name: openvpn
-        image: {{ .Values.openvpn.repo }}:master
+        image: {{ .Values.openvpn.repo }}:{{ include "openvpn-admin.imageTag" (dict "tag" .Values.openvpn.tag "appVersion" .Chart.AppVersion) }}
         command: [ '/entrypoint.sh' ]
         # imagePullPolicy: Always
         securityContext:

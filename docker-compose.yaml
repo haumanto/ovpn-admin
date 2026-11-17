@@ -22,7 +22,7 @@ services:
       - ovpn
     ports:
       - 7777:1194 # for openvpn
-      - 8080:8080 # for ovpn-admin because of network_mode
+      - 127.0.0.1:8080:8080 # for ovpn-admin because of network_mode; loopback only, publish it through a TLS reverse proxy
     volumes:
       - ./easyrsa_master:/etc/openvpn/easyrsa
       - ./ccd_master:/etc/openvpn/ccd
@@ -33,6 +33,9 @@ services:
     image: ovpn-admin:local
     command: /app/ovpn-admin
     environment:
+      # HTTP Basic Auth of the web UI and API (/ping stays open), compose refuses to start if they are unset
+      BASIC_USERNAME: "${BASIC_USERNAME:?set BASIC_USERNAME}"
+      BASIC_PASSWORD: "${BASIC_PASSWORD:?set BASIC_PASSWORD}"
       OVPN_DEBUG: "true"
       OVPN_VERBOSE: "true"
       OVPN_NETWORK: "192.168.100.0/24"
@@ -45,8 +48,8 @@ services:
       OVPN_INDEX_PATH: "/mnt/easyrsa/pki/index.txt"
       OVPN_AUTH: "true"
       OVPN_AUTH_DB_PATH: "/mnt/easyrsa/pki/users.db"
-      # shared with the slave (docker-compose-slave.yaml)
-      OVPN_MASTER_TOKEN: "TOKEN"
+      # master/slave sync token, shared with the slave (docker-compose-slave.yaml); generate it with: openssl rand -hex 32
+      OVPN_MASTER_TOKEN: "${OVPN_MASTER_TOKEN:?set OVPN_MASTER_TOKEN}"
       LOG_LEVEL: "debug"
     network_mode: service:openvpn
     volumes:

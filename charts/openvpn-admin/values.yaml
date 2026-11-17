@@ -1,8 +1,12 @@
 ovpnAdmin:
   repo: ghcr.io/haumanto/ovpn-admin/ovpn-admin
+  # -- Image tag, defaults to the `appVersion` of the chart. Never use `master`.
+  tag: ""
 
 openvpn:
   repo: ghcr.io/haumanto/ovpn-admin/openvpn
+  # -- Image tag, defaults to the `appVersion` of the chart. Never use `master`.
+  tag: ""
   # -- IPv4 pool for VPN clients in the `address/netmask` format (OpenVPN `server`).
   subnet: 172.16.200.0/255.255.255.0
   # -- IPv6 pool for VPN clients in the CIDR format (OpenVPN `server-ipv6`), e.g. `fd00:16:200::/64`. Empty disables IPv6 inside the tunnel. The pod needs IPv6 forwarding, see `podSecurityContext`.
@@ -54,6 +58,7 @@ ingress:
 
   domain: changeme
 
+  # -- Credentials of the admin UI (ingress Basic Auth and the Basic Auth of ovpn-admin itself). Required: rendering fails if they are empty or the old defaults `admin`/`changeme`.
   basicAuth:
-    user: admin
-    password: changeme
+    user: ""
+    password: ""
