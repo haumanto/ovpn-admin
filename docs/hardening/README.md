@@ -151,6 +151,46 @@ Nothing rotates the audit file. A `copytruncate` rule keeps it small; fail2ban f
 
 (save as `/etc/logrotate.d/ovpn-admin-audit`). Debian and Ubuntu already rotate `/var/log/nginx/*.log`.
 
+## The ban engine inside the OpenVPN container
+
+The openvpn container runs its own fail2ban (jail `ovpn-admin`). It reads `openvpn.log`, bans a source address after `OVPN_BAN_MAXRETRY` failed logins (`AUTH_FAILED`) or revoked-certificate attempts within `OVPN_BAN_FINDTIME` seconds for `OVPN_BAN_BANTIME` seconds, and lists active bans in `bans.tsv` in the audit directory. Bans live in the `OVPN_BAN` (iptables, IPv4) and `OVPN_BAN6` (ip6tables, IPv6) chains and are not kept across a container restart. It is independent of the host-level jails above. All variables are set in `docker-compose.yaml` and `docker-compose-slave.yaml`; every value is validated at start, and a bad value stops the container with a message instead of running half-configured.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `OVPN_BAN_ENABLED` | `true` | `false` switches the engine off (and the checks below with it) |
+| `OVPN_BAN_REQUIRED` | `false` | `true`: the container stops when fail2ban cannot start. `false`: OpenVPN runs without bans and logs an error |
+| `OVPN_BAN_IPV6_REQUIRED` | `true` | see "IPv6 fails closed" |
+| `OVPN_SERVER_PORT` | `1194` | OpenVPN listener port inside the container; the single source for `openvpn --port`, the ban jumps and the right side of the compose `ports` mapping |
+| `OVPN_PROTO` | `tcp` | OpenVPN `--proto`; decides the transport of the ban jumps and whether IPv6 is on |
+| `OVPN_BAN_PORT` | unset | optional assertion only, see "The enforced port is derived" |
+| `OVPN_LOG_MAX_BYTES`, `OVPN_LOG_KEEP`, `OVPN_LOG_ROTATE_INTERVAL` | `10485760`, `3`, `60` | log rotation, see "Log rotation" |
+
+### IPv6 fails closed
+
+IPv6 is on when `OVPN_PROTO` is `tcp6` or `udp6`, or when `OVPN_SERVER_NET6` is set. In that case the container must be able to create the `OVPN_BAN6` chain and its jump with `ip6tables`. If it cannot (no IPv6 support in the kernel namespace, missing binary, wrong backend), the container prints an `ERROR` line and exits with a non-zero status, whatever `OVPN_BAN_REQUIRED` says. Otherwise the host would look ban-protected while IPv6 sources could never be banned. The check runs again after the jail starts, so a missing jump is caught too.
+
+The one opt-out is `OVPN_BAN_IPV6_REQUIRED=false`. With it the container still starts and prints a loud `WARNING` line (`IPv6 sources are NOT banned`); IPv4 bans keep working. Use it only when you accept unbanned IPv6 attackers, for example while you fix the IPv6 firewall backend (`OVPN_IP6TABLES_BIN=ip6tables-legacy` goes together with `OVPN_IPTABLES_BIN=iptables-legacy`). With IPv6 off (`OVPN_PROTO` `tcp`/`udp`/`tcp4`/`udp4`, no `OVPN_SERVER_NET6`) the IPv6 chain is not needed and not checked.
+
+### The enforced port is derived
+
+The ban jumps are not configured separately. `configure.sh` takes the listener port from `OVPN_SERVER_PORT` and the transport from `OVPN_PROTO` (`tcp*` gives a `tcp` jump, `udp*` a `udp` jump; the IPv4 and the IPv6 chain get the same jumps), the same values it puts on the `openvpn` command line. Consequences:
+
+* A jump exists only for the listener's own port and transport; nothing else in the shared network namespace is behind a ban.
+* The ovpn-admin port (`OVPN_LISTEN_PORT`, 8080) and the OpenVPN management port (8989) can never be the listener port: the container stops with an error if `OVPN_SERVER_PORT` is one of them, and `ovpn-ban.sh` refuses to build a jump for them.
+* `OVPN_BAN_PORT` is kept only as an assertion. If it is set and differs from `OVPN_SERVER_PORT`, the container exits non-zero. Leave it unset unless you want that cross-check.
+* If you change `OVPN_SERVER_PORT`, the published port in the compose file follows (`7777:${OVPN_SERVER_PORT:-1194}`); the host side stays as it is.
+* `OVPN_PROTO` is limited to `tcp`, `tcp4`, `tcp6`, `tcp-server`, `tcp4-server`, `tcp6-server`, `udp`, `udp4`, `udp6`. An OpenVPN instance that listens on several ports or protocols at once is not supported by this container, and so not by the ban scope either.
+
+### Log rotation
+
+The two logs the engine depends on, `openvpn.log` (audit directory) and `/var/log/fail2ban.log`, are bounded for the whole life of the container, not only at start. At start and every `OVPN_LOG_ROTATE_INTERVAL` seconds a background loop checks both; a file larger than `OVPN_LOG_MAX_BYTES` is rotated in place: `.N-1` becomes `.N` (the oldest, `.OVPN_LOG_KEEP`, is deleted), the file is copied to `.1`, and the original is then emptied (`copytruncate`). OpenVPN (`--log-append`) and fail2ban write in append mode, so they keep writing at the new end, and fail2ban reads from the start of the emptied file. Nothing has to be signalled or restarted.
+
+* Worst case on disk per log: `(OVPN_LOG_KEEP + 1) x OVPN_LOG_MAX_BYTES` plus what is written between two checks. With the defaults that is 40 MiB plus one minute of log per file.
+* Lines written between the copy and the emptying (milliseconds) are lost from the live file; they stay in `.1`. A failed login in that window is not counted.
+* Rotated files are `<name>.1` to `<name>.N` next to the original, with the same owner and mode. They are not compressed.
+* The container's own stdout (what `docker logs` shows) is bounded by the compose `logging` block: `json-file`, `max-size: 10m`, `max-file: 3`, on both services in both compose files.
+* The audit log `audit.tsv` of ovpn-admin is not touched by this loop; see step 5.
+
 ## Limits you should know
 
 * **The audit log only sees password failures.** A client without a valid certificate fails the TLS handshake and writes no `auth_fail` line, so the VPN jail does not react to port scans or to certificate-less connection attempts. That traffic is rejected by OpenVPN itself. If you need to react to it, add OpenVPN's own log as a third source.

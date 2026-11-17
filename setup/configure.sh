@@ -11,6 +11,9 @@ OVPN_SRV_MASK="${OVPN_SERVER_MASK:-255.255.255.0}"
 OVPN_SRV_NET6="${OVPN_SERVER_NET6:-}"
 # Listener transport (OpenVPN --proto): tcp = IPv4 only, tcp6 = dual-stack (IPv4 and IPv6 clients)
 OVPN_SRV_PROTO="${OVPN_PROTO:-tcp}"
+# OpenVPN listener port inside the container (--port at the end of this script). One value feeds the openvpn command line
+# and the ban jumps; the published host port (right side of the compose "ports" mapping) must point at it
+OVPN_SRV_PORT="${OVPN_SERVER_PORT:-1194}"
 
 # Ban engine (fail2ban, see start_fail2ban below). Every value is validated here, before anything is changed:
 # a bad value stops the container at startup instead of producing a broken fail2ban config.
@@ -19,28 +22,65 @@ BAN_REQUIRED="${OVPN_BAN_REQUIRED:-false}"
 BAN_MAXRETRY="${OVPN_BAN_MAXRETRY:-3}"
 BAN_FINDTIME="${OVPN_BAN_FINDTIME:-600}"
 BAN_BANTIME="${OVPN_BAN_BANTIME:-3600}"
-# OpenVPN listener port inside the container (--port below): the ban chains are only reachable through jumps for this port
-BAN_PORT="${OVPN_BAN_PORT:-1194}"
-# size limit of openvpn.log and fail2ban.log, checked once at container start (see rotate_log)
+# The enforced port and transport are derived below from OVPN_SERVER_PORT and OVPN_PROTO, the values of the openvpn command
+# line. OVPN_BAN_PORT is only an optional assertion: when set it must equal the derived listener port or the container stops.
+BAN_PORT_ASSERT="${OVPN_BAN_PORT:-}"
+# true (default): with IPv6 on (OVPN_PROTO tcp6/udp6 or OVPN_SERVER_NET6) the container stops when the IPv6 ban chain cannot be
+# created. false is the single opt-out: loud warning, IPv6 sources are then not banned
+BAN_IPV6_REQUIRED="${OVPN_BAN_IPV6_REQUIRED:-true}"
+# openvpn.log and fail2ban.log are rotated (copy, then empty the original in place, so OpenVPN, fail2ban and tail keep following
+# the same file) when they exceed LOG_MAX_BYTES; checked every LOG_ROTATE_INTERVAL seconds and at start; LOG_KEEP rotated copies
 LOG_MAX_BYTES="${OVPN_LOG_MAX_BYTES:-10485760}"
+LOG_KEEP="${OVPN_LOG_KEEP:-3}"
+LOG_ROTATE_INTERVAL="${OVPN_LOG_ROTATE_INTERVAL:-60}"
 # hosts and networks that are never banned (Docker bridge and private source addresses by default)
 BAN_IGNOREIP="${OVPN_BAN_IGNOREIP:-127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fe80::/10}"
-for ban_bool in OVPN_BAN_ENABLED:"${BAN_ENABLED}" OVPN_BAN_REQUIRED:"${BAN_REQUIRED}"; do
+for ban_bool in OVPN_BAN_ENABLED:"${BAN_ENABLED}" OVPN_BAN_REQUIRED:"${BAN_REQUIRED}" OVPN_BAN_IPV6_REQUIRED:"${BAN_IPV6_REQUIRED}"; do
   if [ "${ban_bool#*:}" != "true" ] && [ "${ban_bool#*:}" != "false" ]; then
     echo "ERROR: ${ban_bool%%:*} must be true or false, got \"${ban_bool#*:}\"" >&2
     exit 1
   fi
 done
-for ban_num in OVPN_BAN_MAXRETRY:"${BAN_MAXRETRY}" OVPN_BAN_FINDTIME:"${BAN_FINDTIME}" OVPN_BAN_BANTIME:"${BAN_BANTIME}" OVPN_LOG_MAX_BYTES:"${LOG_MAX_BYTES}"; do
+for ban_num in OVPN_BAN_MAXRETRY:"${BAN_MAXRETRY}" OVPN_BAN_FINDTIME:"${BAN_FINDTIME}" OVPN_BAN_BANTIME:"${BAN_BANTIME}" OVPN_LOG_MAX_BYTES:"${LOG_MAX_BYTES}" OVPN_LOG_KEEP:"${LOG_KEEP}" OVPN_LOG_ROTATE_INTERVAL:"${LOG_ROTATE_INTERVAL}"; do
   if ! [[ "${ban_num#*:}" =~ ^[1-9][0-9]{0,9}$ ]]; then
     echo "ERROR: ${ban_num%%:*} must be a positive integer, got \"${ban_num#*:}\"" >&2
     exit 1
   fi
 done
-if ! [[ "${BAN_PORT}" =~ ^[1-9][0-9]{0,4}$ ]] || [ "${BAN_PORT}" -gt 65535 ]; then
-  echo "ERROR: OVPN_BAN_PORT must be a port number from 1 to 65535, got \"${BAN_PORT}\"" >&2
+if [ "${LOG_KEEP}" -gt 99 ]; then
+  echo "ERROR: OVPN_LOG_KEEP must be 1 to 99, got \"${LOG_KEEP}\"" >&2
   exit 1
 fi
+# listener port: a valid port that is not the ovpn-admin port (shared network namespace) or the management port
+ADMIN_PORT="${OVPN_LISTEN_PORT:-8080}"
+if ! [[ "${OVPN_SRV_PORT}" =~ ^[1-9][0-9]{0,4}$ ]] || [ "${OVPN_SRV_PORT}" -gt 65535 ]; then
+  echo "ERROR: OVPN_SERVER_PORT must be a port number from 1 to 65535, got \"${OVPN_SRV_PORT}\"" >&2
+  exit 1
+fi
+if [ "${OVPN_SRV_PORT}" = "${ADMIN_PORT}" ] || [ "${OVPN_SRV_PORT}" = "8989" ]; then
+  echo "ERROR: OVPN_SERVER_PORT ${OVPN_SRV_PORT} is the ovpn-admin or OpenVPN management port; the OpenVPN listener needs its own port" >&2
+  exit 1
+fi
+# transport and family of the listener, from OVPN_PROTO (the openvpn --proto value): the ban jumps cover exactly these
+case "${OVPN_SRV_PROTO}" in
+  tcp | tcp4 | tcp6 | tcp-server | tcp4-server | tcp6-server) BAN_PROTOS="tcp" ;;
+  udp | udp4 | udp6) BAN_PROTOS="udp" ;;
+  *)
+    echo "ERROR: OVPN_PROTO must be one of tcp, tcp4, tcp6, tcp-server, tcp4-server, tcp6-server, udp, udp4, udp6, got \"${OVPN_SRV_PROTO}\"" >&2
+    exit 1
+    ;;
+esac
+# IPv6 is on when the listener is IPv6 capable (tcp6/udp6) or the tunnel has an IPv6 pool
+BAN_IPV6="false"
+if [ -n "${OVPN_SRV_NET6}" ] || [[ "${OVPN_SRV_PROTO}" == *6* ]]; then
+  BAN_IPV6="true"
+fi
+# the optional OVPN_BAN_PORT assertion must agree with the listener; it can never choose the port
+if [ -n "${BAN_PORT_ASSERT}" ] && [ "${BAN_PORT_ASSERT}" != "${OVPN_SRV_PORT}" ]; then
+  echo "ERROR: OVPN_BAN_PORT=\"${BAN_PORT_ASSERT}\" does not match the OpenVPN listener port ${OVPN_SRV_PORT} (OVPN_SERVER_PORT): refusing to start with bans scoped to another port. Unset OVPN_BAN_PORT or make both agree." >&2
+  exit 1
+fi
+BAN_PORT="${OVPN_SRV_PORT}"
 # one line of IPv4/IPv6 addresses or CIDR networks separated by single spaces; no host names, no other characters
 if ! [[ "${BAN_IGNOREIP}" =~ ^[0-9A-Fa-f:./]+( [0-9A-Fa-f:./]+)*$ ]]; then
   echo "ERROR: OVPN_BAN_IGNOREIP must be IP addresses or CIDR networks separated by single spaces" >&2
@@ -65,7 +105,7 @@ else
       WGET_AUTH_ARGS=(--header "Authorization: Basic $(printf '%s:%s' "${BASIC_USERNAME}" "${BASIC_PASSWORD}" | base64 | tr -d '\n')")
     fi
     while :; do
-      last_sync="$(wget -q "${WGET_AUTH_ARGS[@]}" http://127.0.0.1:${OVPN_LISTEN_PORT:-8080}/api/sync/last/successful -O - || true)"
+      last_sync="$(wget -q "${WGET_AUTH_ARGS[@]}" http://127.0.0.1:"${OVPN_LISTEN_PORT:-8080}"/api/sync/last/successful -O - || true)"
       if [ -n "${last_sync}" ] && [ "${last_sync}" != "unknown" ]; then
         break
       fi
@@ -178,19 +218,26 @@ mkdir -p /etc/openvpn/ccd
 OPENVPN_LOG="${AUDIT_LOG_DIR}/openvpn.log"
 FAIL2BAN_LOG="/var/log/fail2ban.log"
 
-# rotate_log FILE: at container start, a log larger than OVPN_LOG_MAX_BYTES becomes FILE.1 (one previous file is kept,
-# an older FILE.1 is replaced) and the caller creates a fresh FILE. Logs that grow during a run are bounded at the next start.
+# rotate_log FILE: when FILE is larger than OVPN_LOG_MAX_BYTES, FILE.(N-1) becomes FILE.N (N = OVPN_LOG_KEEP, the oldest is
+# dropped), FILE is copied to FILE.1 and FILE itself is emptied in place (same inode). OpenVPN (--log-append) and fail2ban
+# write in append mode, so they keep writing at the new end; "tail -F" and the fail2ban polling backend notice the file shrank
+# and read from the start. Lines written between the copy and the emptying are lost (milliseconds); that is the price of not
+# having to signal the writers. Runs at start and every OVPN_LOG_ROTATE_INTERVAL seconds (rotate_loop below).
 rotate_log() {
-  local size
-  [ -f "$1" ] || return 0
-  size="$(stat -c %s "$1" 2>/dev/null || echo 0)"
-  if [ "${size}" -gt "${LOG_MAX_BYTES}" ]; then
-    echo "log rotation: $1 is ${size} bytes (limit ${LOG_MAX_BYTES}), moved to $1.1"
-    mv -f "$1" "$1.1"
-  fi
+  local f="$1" size i
+  [ -f "$f" ] || return 0
+  size="$(stat -c %s "$f")" || { echo "log rotation: cannot read the size of $f" >&2; return 1; }
+  [ "${size}" -gt "${LOG_MAX_BYTES}" ] || return 0
+  echo "log rotation: $f is ${size} bytes (limit ${LOG_MAX_BYTES}), rotated to $f.1 (keeping ${LOG_KEEP})"
+  rm -f "$f.${LOG_KEEP}" || return 1
+  for ((i = LOG_KEEP - 1; i >= 1; i--)); do
+    if [ -e "$f.$i" ]; then mv -f "$f.$i" "$f.$((i + 1))" || return 1; fi
+  done
+  cp -p "$f" "$f.1" || return 1
+  : > "$f" || return 1
 }
-rotate_log "${OPENVPN_LOG}"
-rotate_log "${FAIL2BAN_LOG}"
+rotate_log "${OPENVPN_LOG}" || true
+rotate_log "${FAIL2BAN_LOG}" || true
 touch "${OPENVPN_LOG}"
 chown nobody:nogroup "${OPENVPN_LOG}"
 chmod 600 "${OPENVPN_LOG}"
@@ -198,7 +245,9 @@ tail -n 0 -F "${OPENVPN_LOG}" &
 
 # ban list and enforcement, see ovpn-ban.sh (installed fresh at every start)
 BAN_STATE_FILE="${AUDIT_LOG_DIR}/bans.tsv"
-export OVPN_BAN_STATE="${BAN_STATE_FILE}" OVPN_BAN_LOG="${OPENVPN_LOG}" OVPN_BAN_BANTIME="${BAN_BANTIME}" OVPN_IPTABLES_BIN="${IPTABLES_BIN}" OVPN_IP6TABLES_BIN="${IP6TABLES_BIN}" OVPN_BAN_PORT="${BAN_PORT}"
+export OVPN_BAN_STATE="${BAN_STATE_FILE}" OVPN_BAN_LOG="${OPENVPN_LOG}" OVPN_BAN_BANTIME="${BAN_BANTIME}" OVPN_IPTABLES_BIN="${IPTABLES_BIN}" OVPN_IP6TABLES_BIN="${IP6TABLES_BIN}"
+# the enforced scope, derived above from the same variables as the openvpn command line (never taken from OVPN_BAN_PORT)
+export OVPN_BAN_PORT="${BAN_PORT}" OVPN_BAN_PROTOS="${BAN_PROTOS}" OVPN_BAN_IPV6="${BAN_IPV6}" OVPN_BAN_IPV6_REQUIRED="${BAN_IPV6_REQUIRED}" OVPN_LISTEN_PORT="${ADMIN_PORT}"
 BAN_TOOL="/usr/local/sbin/ovpn-ban.sh"
 install -D -m 0755 /etc/openvpn/setup/ovpn-ban.sh "${BAN_TOOL}"
 # clear the ban list once, before fail2ban starts: a fresh network namespace has no bans, so no stale rows
@@ -208,7 +257,6 @@ install -D -m 0755 /etc/openvpn/setup/ovpn-ban.sh "${BAN_TOOL}"
 # survives a restart), starts the server and checks that the jail is running. Returns non-zero on any failure;
 # no "set -e" inside, because the caller tests the result.
 start_fail2ban() {
-  local i
   # a container restart keeps the filesystem: remove the previous server's socket, pid file and ban database
   rm -f /run/fail2ban/fail2ban.sock /run/fail2ban/fail2ban.pid /var/lib/fail2ban/fail2ban.sqlite3 || return 1
   mkdir -p /etc/fail2ban/fail2ban.d /etc/fail2ban/filter.d /etc/fail2ban/action.d /etc/fail2ban/jail.d /run/fail2ban || return 1
@@ -241,7 +289,7 @@ EOF
 actionstart = ${BAN_TOOL} teardown || true
               ${BAN_TOOL} setup
 actionstop = ${BAN_TOOL} teardown
-actioncheck = ${IPTABLES_BIN} -w 5 -n -L OVPN_BAN
+actioncheck = ${BAN_TOOL} check
 actionban = ${BAN_TOOL} ban <ip> <failures>
 actionunban = ${BAN_TOOL} unban <ip>
 EOF
@@ -272,7 +320,7 @@ EOF
 
   # started in the background and polled: with a broken runtime directory the forking parent never returns on its own
   fail2ban-server -b -x >/dev/null 2>&1 &
-  for i in $(seq 1 30); do
+  for _ in $(seq 1 30); do
     fail2ban-client ping >/dev/null 2>&1 && break
     sleep 1
   done
@@ -285,9 +333,27 @@ EOF
 }
 
 if [ "${BAN_ENABLED}" = "true" ]; then
-  if start_fail2ban; then
+  # fail closed on IPv6 (before fail2ban): with IPv6 on and OVPN_BAN_IPV6_REQUIRED not false, an IPv6 ban chain that cannot be
+  # created stops the container (ovpn-ban.sh exit 3), whatever OVPN_BAN_REQUIRED says. Other setup failures (IPv4) go through
+  # start_fail2ban and OVPN_BAN_REQUIRED below. setup is idempotent; the jail start repeats it.
+  if "${BAN_TOOL}" setup; then
+    :
+  else
+    ban_rc=$?
+    if [ "${ban_rc}" -eq 3 ]; then
+      echo "ERROR: IPv6 is enabled (OVPN_PROTO=${OVPN_SRV_PROTO} OVPN_SERVER_NET6=${OVPN_SRV_NET6:-<empty>}) but IPv6 bans cannot be enforced; stopping the container. Fix ip6tables or set OVPN_BAN_IPV6_REQUIRED=false to accept running without IPv6 bans." >&2
+      "${BAN_TOOL}" teardown || true
+      exit 1
+    fi
+  fi
+  if start_fail2ban && "${BAN_TOOL}" check; then
     echo "fail2ban: jail ovpn-admin running (maxretry=${BAN_MAXRETRY} findtime=${BAN_FINDTIME}s bantime=${BAN_BANTIME}s)"
   else
+    ban_rc=$?
+    if [ "${ban_rc}" -eq 3 ]; then
+      echo "ERROR: required IPv6 ban enforcement is missing after the jail start; stopping the container" >&2
+      exit 1
+    fi
     echo "################################################################################" >&2
     echo "ERROR: fail2ban did not start: failed OpenVPN logins and revoked certificates are NOT banned." >&2
     echo "################################################################################" >&2
@@ -307,4 +373,15 @@ else
   "${BAN_TOOL}" teardown || true
 fi
 
-exec openvpn --config /etc/openvpn/openvpn.conf --client-config-dir /etc/openvpn/ccd --port 1194 --proto "${OVPN_SRV_PROTO}" --management 127.0.0.1 8989 --dev tun0 --server "${OVPN_SRV_NET}" "${OVPN_SRV_MASK}" "${OVPN_IPV6_ARGS[@]}" --log-append "${OPENVPN_LOG}"
+# ongoing log bound: check the size of both logs every OVPN_LOG_ROTATE_INTERVAL seconds for the life of the container
+# (a background loop like the tail processes above; no cron). Tracing is off in the loop so that it does not write a line per check.
+(
+  set +ex
+  while :; do
+    sleep "${LOG_ROTATE_INTERVAL}"
+    rotate_log "${OPENVPN_LOG}" || echo "log rotation of ${OPENVPN_LOG} failed" >&2
+    rotate_log "${FAIL2BAN_LOG}" || echo "log rotation of ${FAIL2BAN_LOG} failed" >&2
+  done
+) &
+
+exec openvpn --config /etc/openvpn/openvpn.conf --client-config-dir /etc/openvpn/ccd --port "${OVPN_SRV_PORT}" --proto "${OVPN_SRV_PROTO}" --management 127.0.0.1 8989 --dev tun0 --server "${OVPN_SRV_NET}" "${OVPN_SRV_MASK}" "${OVPN_IPV6_ARGS[@]}" --log-append "${OPENVPN_LOG}"

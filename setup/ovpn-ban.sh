@@ -2,7 +2,9 @@
 # Ban enforcement and ban list for the fail2ban jail "ovpn-admin" (called from the fail2ban action, see configure.sh).
 #
 #   ovpn-ban.sh init             clear the ban list and every DROP rule of both families (container start, before fail2ban starts)
-#   ovpn-ban.sh setup            create the OVPN_BAN (IPv4) and OVPN_BAN6 (IPv6) chains and their INPUT jumps (jail start)
+#   ovpn-ban.sh setup            create the OVPN_BAN (IPv4) and OVPN_BAN6 (IPv6) chains and their INPUT jumps (jail start);
+#                                exit 3 when IPv6 is enabled, the IPv6 chain cannot be created and OVPN_BAN_IPV6_REQUIRED is not false
+#   ovpn-ban.sh check            verify the chains and jumps of every enforced family; exit 3 = required IPv6 enforcement missing
 #   ovpn-ban.sh ban IP FAILURES  DROP IP in OVPN_BAN (IPv4) or OVPN_BAN6 (IPv6) and add (or replace) its row in the ban list
 #   ovpn-ban.sh unban IP         remove the DROP rule and the row; succeeds when neither exists
 #   ovpn-ban.sh flush            remove every DROP rule of both chains and clear the ban list
@@ -13,13 +15,18 @@
 # the ip column holds the canonical text form of the address.
 # The file is replaced atomically (temp file in the same directory + rename) while holding an flock.
 #
-# Scope: the INPUT chain jumps to the ban chains only for the OpenVPN listener (tcp and udp, destination port
-# OVPN_BAN_PORT). Other listeners in the same network namespace, such as the ovpn-admin port 8080, are never behind a ban.
+# Scope: the INPUT chain jumps to the ban chains only for the OpenVPN listener: the port and transport that configure.sh
+# derives from the same variables as the openvpn command line. Other listeners in the same network namespace, such as the
+# ovpn-admin port (OVPN_LISTEN_PORT, 8080), are never behind a ban; a listener port equal to the admin port is refused.
 #
-# Environment:
+# Environment (OVPN_BAN_PORT, OVPN_BAN_PROTOS, OVPN_BAN_IPV6 are set by configure.sh, never by hand; there is no default):
 #   OVPN_IPTABLES_BIN   iptables binary for IPv4 (default iptables; iptables-legacy on older Docker hosts), same selector as configure.sh
 #   OVPN_IP6TABLES_BIN  ip6tables binary for IPv6 (default ip6tables; set ip6tables-legacy together with iptables-legacy)
-#   OVPN_BAN_PORT       OpenVPN listener port inside the container that the bans apply to (default 1194)
+#   OVPN_BAN_PORT       OpenVPN listener port inside the container that the bans apply to (derived from OVPN_SERVER_PORT)
+#   OVPN_BAN_PROTOS     transports of the listener, "tcp" or "udp" (derived from OVPN_PROTO)
+#   OVPN_BAN_IPV6       true when the listener or the tunnel has IPv6 (OVPN_PROTO tcp6/udp6 or OVPN_SERVER_NET6), default false
+#   OVPN_BAN_IPV6_REQUIRED  default true: with IPv6 on, a missing IPv6 ban chain stops setup (exit 3); false = loud warning, continue
+#   OVPN_LISTEN_PORT   ovpn-admin port of the shared network namespace (default 8080), never allowed as the ban port
 #   OVPN_BAN_STATE      ban list path
 #   OVPN_BAN_BANTIME    seconds a ban lasts, used for expires_at_unix (default 3600)
 #   OVPN_BAN_LOG        OpenVPN log, only read to name the reason of a ban (default /etc/openvpn/audit/openvpn.log)
@@ -34,7 +41,12 @@ CHAIN4="OVPN_BAN"
 CHAIN6="OVPN_BAN6"
 IPT4="${OVPN_IPTABLES_BIN:-iptables}"
 IPT6="${OVPN_IP6TABLES_BIN:-ip6tables}"
-PORT="${OVPN_BAN_PORT:-1194}"
+PORT="${OVPN_BAN_PORT:-}"
+PROTOS="${OVPN_BAN_PROTOS:-}"
+V6="${OVPN_BAN_IPV6:-false}"
+V6_REQUIRED="${OVPN_BAN_IPV6_REQUIRED:-true}"
+ADMIN_PORT="${OVPN_LISTEN_PORT:-8080}"
+MGMT_PORT="8989"
 STATE="${OVPN_BAN_STATE:-/etc/openvpn/audit/bans.tsv}"
 LOCK="${STATE}.lock"
 BANTIME="${OVPN_BAN_BANTIME:-3600}"
@@ -50,7 +62,23 @@ done
 case "$BANTIME" in
   *[!0-9]* | "" | 0*) die "invalid OVPN_BAN_BANTIME" ;;
 esac
-[[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$PORT" -le 65535 ] || die "invalid OVPN_BAN_PORT"
+for flag in "$V6" "$V6_REQUIRED"; do
+  case "$flag" in true | false) ;; *) die "OVPN_BAN_IPV6 and OVPN_BAN_IPV6_REQUIRED must be true or false" ;; esac
+done
+
+# need_listener: the ports of the jumps come from configure.sh only; refuse anything that is not a valid listener scope.
+# Commands that create or check jumps call this first, so a missing or wrong value fails instead of scoping a jump somewhere else.
+need_listener() {
+  local p
+  [[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$PORT" -le 65535 ] || die "OVPN_BAN_PORT is not a valid listener port (set by configure.sh from OVPN_SERVER_PORT): \"$PORT\""
+  if [ "$PORT" = "$ADMIN_PORT" ] || [ "$PORT" = "$MGMT_PORT" ]; then
+    die "refusing to scope the ban jump to port $PORT: it is the ovpn-admin or OpenVPN management port"
+  fi
+  [ -n "$PROTOS" ] || die "OVPN_BAN_PROTOS is empty (set by configure.sh from OVPN_PROTO)"
+  for p in $PROTOS; do
+    case "$p" in tcp | udp) ;; *) die "invalid transport in OVPN_BAN_PROTOS: $p" ;; esac
+  done
+}
 
 # ipt FAMILY ARGS: iptables (4) or ip6tables (6) with a lock wait
 ipt() {
@@ -84,31 +112,40 @@ print(a.version, a)
 
 valid_posint() { [[ "$1" =~ ^[1-9][0-9]{0,9}$ ]]; }
 
-# ensure_chain FAMILY: chain plus one jump per transport (tcp, udp), both limited to the OpenVPN listener port.
+# ensure_chain FAMILY: chain plus one jump per listener transport, limited to the OpenVPN listener port.
 # A concurrent ban may create the chain or a jump between the check and the create: re-check before failing.
 ensure_chain() {
   local fam="$1" chain proto
   chain="$(chain_of "$fam")"
   ipt "$fam" -n -L "$chain" >/dev/null 2>&1 || ipt "$fam" -N "$chain" 2>/dev/null || ipt "$fam" -n -L "$chain" >/dev/null 2>&1 || return 1
-  for proto in tcp udp; do
+  for proto in $PROTOS; do
     ipt "$fam" -C INPUT -p "$proto" --dport "$PORT" -j "$chain" >/dev/null 2>&1 \
       || ipt "$fam" -I INPUT 1 -p "$proto" --dport "$PORT" -j "$chain" 2>/dev/null \
       || ipt "$fam" -C INPUT -p "$proto" --dport "$PORT" -j "$chain" >/dev/null 2>&1 || return 1
   done
 }
 
-# drop_jumps FAMILY: remove the INPUT jumps, scoped ones and the unscoped one that earlier versions created
-drop_jumps() {
+# jumps_ok FAMILY: the chain exists and has its INPUT jump for every listener transport
+jumps_ok() {
   local fam="$1" chain proto
   chain="$(chain_of "$fam")"
-  for proto in tcp udp; do
-    while ipt "$fam" -C INPUT -p "$proto" --dport "$PORT" -j "$chain" >/dev/null 2>&1; do
-      ipt "$fam" -D INPUT -p "$proto" --dport "$PORT" -j "$chain" || return 1
-    done
+  ipt "$fam" -n -L "$chain" >/dev/null 2>&1 || return 1
+  for proto in $PROTOS; do
+    ipt "$fam" -C INPUT -p "$proto" --dport "$PORT" -j "$chain" >/dev/null 2>&1 || return 1
   done
-  while ipt "$fam" -C INPUT -j "$chain" >/dev/null 2>&1; do
-    ipt "$fam" -D INPUT -j "$chain" || return 1
+}
+
+# drop_jumps FAMILY: remove every INPUT jump to the ban chain, whatever its port or transport (also those of an earlier
+# configuration in a reused network namespace). The rule text comes from the firewall itself ("-S"), so the match is on the target only.
+drop_jumps() {
+  local fam="$1" chain rule
+  local -a args
+  chain="$(chain_of "$fam")"
+  while rule="$(ipt "$fam" -S INPUT 2>/dev/null | grep -m1 -E -- " -j ${chain}\$")" && [ -n "$rule" ]; do
+    read -r -a args <<< "${rule/#-A /-D }"
+    ipt "$fam" "${args[@]}" || return 1
   done
+  return 0
 }
 
 # with_state_lock CMD [ARGS]: runs CMD while holding the exclusive lock of the ban list
@@ -179,11 +216,36 @@ cmd_init() {
   with_state_lock do_clear_rows || die "cannot reset $STATE"
 }
 
-# setup: IPv4 is required; IPv6 is created when ip6tables works and otherwise reported (an IPv6 ban then fails loudly)
+# setup: IPv4 is always required. IPv6 is required whenever it is enabled (OVPN_BAN_IPV6=true): a missing IPv6 chain exits 3
+# unless OVPN_BAN_IPV6_REQUIRED=false, which is the single opt-out and warns loudly.
 cmd_setup() {
+  need_listener
   ensure_chain 4 || die "cannot create chain $CHAIN4 with $IPT4"
-  ensure_chain 6 || echo "ovpn-ban: WARNING: cannot create chain $CHAIN6 with $IPT6, IPv6 sources will not be banned" >&2
+  if [ "$V6" = "true" ]; then
+    if ! ensure_chain 6; then
+      if [ "$V6_REQUIRED" = "true" ]; then
+        echo "ovpn-ban: ERROR: IPv6 is enabled but the IPv6 ban chain $CHAIN6 cannot be created with $IPT6: IPv6 sources could not be banned. Fix ip6tables (or OVPN_IP6TABLES_BIN), or set OVPN_BAN_IPV6_REQUIRED=false to run without IPv6 bans." >&2
+        exit 3
+      fi
+      echo "ovpn-ban: WARNING: ################ OVPN_BAN_IPV6_REQUIRED=false: IPv6 is enabled but chain $CHAIN6 cannot be created with $IPT6; IPv6 sources are NOT banned ################" >&2
+    fi
+  fi
   return 0
+}
+
+# check: running state of the enforcement (chains and jumps present). Exit 3: required IPv6 enforcement missing; 1: IPv4 missing.
+cmd_check() {
+  need_listener
+  jumps_ok 4 || die "IPv4 ban chain $CHAIN4 or its jump for $PROTOS port $PORT is missing"
+  if [ "$V6" = "true" ] && [ "$V6_REQUIRED" = "true" ]; then
+    jumps_ok 6 || { echo "ovpn-ban: ERROR: IPv6 is enabled but chain $CHAIN6 or its jump for $PROTOS port $PORT is missing" >&2; exit 3; }
+    echo "ovpn-ban: check ok: IPv4 and IPv6 enforce $PROTOS port $PORT"
+  elif [ "$V6" = "true" ]; then
+    jumps_ok 6 && echo "ovpn-ban: check ok: IPv4 and IPv6 enforce $PROTOS port $PORT" \
+      || echo "ovpn-ban: check ok: IPv4 enforces $PROTOS port $PORT; IPv6 is NOT enforced (OVPN_BAN_IPV6_REQUIRED=false)"
+  else
+    echo "ovpn-ban: check ok: IPv4 enforces $PROTOS port $PORT (IPv6 off)"
+  fi
 }
 
 cmd_ban() {
@@ -191,6 +253,7 @@ cmd_ban() {
   classify_ip "$1" || die "refusing to ban: not a public-routable IPv4 or IPv6 address: $1"
   valid_posint "$2" || die "FAILURES must be a positive integer: $2"
   local chain
+  need_listener
   chain="$(chain_of "$FAM")"
   ensure_chain "$FAM" || die "cannot create chain $chain"
   ipt "$FAM" -C "$chain" -s "$IP" -j DROP >/dev/null 2>&1 || ipt "$FAM" -A "$chain" -s "$IP" -j DROP || die "cannot add DROP rule for $IP"
@@ -234,9 +297,10 @@ action="${1:-}"
 case "$action" in
   init) [ "$#" -eq 0 ] || die "usage: init"; cmd_init ;;
   setup) [ "$#" -eq 0 ] || die "usage: setup"; cmd_setup ;;
+  check) [ "$#" -eq 0 ] || die "usage: check"; cmd_check ;;
   ban) cmd_ban "$@" ;;
   unban) cmd_unban "$@" ;;
   flush) [ "$#" -eq 0 ] || die "usage: flush"; cmd_flush ;;
   teardown) [ "$#" -eq 0 ] || die "usage: teardown"; cmd_teardown ;;
-  *) die "usage: $0 init | setup | ban IP FAILURES | unban IP | flush | teardown" ;;
+  *) die "usage: $0 init | setup | check | ban IP FAILURES | unban IP | flush | teardown" ;;
 esac

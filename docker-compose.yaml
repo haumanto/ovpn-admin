@@ -20,14 +20,22 @@ services:
       # Ban engine (fail2ban inside this container, IPv4 and IPv6): bans a source address after OVPN_BAN_MAXRETRY failed
       # logins (AUTH_FAILED) or revoked-certificate attempts within OVPN_BAN_FINDTIME seconds, for OVPN_BAN_BANTIME seconds.
       # Ban rules live in the OVPN_BAN chain (iptables, IPv4) and the OVPN_BAN6 chain (ip6tables, IPv6); both are only
-      # reached for traffic to the OpenVPN listener port OVPN_BAN_PORT, never for the ovpn-admin port 8080.
+      # reached for traffic to the OpenVPN listener port OVPN_SERVER_PORT (derived with its transport from OVPN_PROTO), never for the ovpn-admin port 8080.
       # The active bans are listed in bans.tsv in the audit directory. Bans are not kept across container restarts.
       # IPv6 firewall backend; set ip6tables-legacy together with iptables-legacy
       OVPN_IP6TABLES_BIN: "${OVPN_IP6TABLES_BIN:-ip6tables}"
-      # OpenVPN listener port inside the container (the right side of the 1194 port mapping): bans apply to this port only
-      OVPN_BAN_PORT: "${OVPN_BAN_PORT:-1194}"
-      # openvpn.log and fail2ban.log larger than this many bytes are moved to <name>.1 when the container starts
+      # OpenVPN listener port inside the container. The same value is the --port of openvpn, the right side of the port
+      # mapping below and the only port the ban jumps are scoped to; it cannot be the ovpn-admin port 8080.
+      OVPN_SERVER_PORT: "${OVPN_SERVER_PORT:-1194}"
+      # IPv6 ban enforcement is required whenever IPv6 is on (OVPN_PROTO tcp6/udp6 or OVPN_SERVER_NET6): the container stops
+      # when the OVPN_BAN6 chain cannot be created. false = log a loud warning and run without IPv6 bans (the only opt-out).
+      OVPN_BAN_IPV6_REQUIRED: "${OVPN_BAN_IPV6_REQUIRED:-true}"
+      # openvpn.log and fail2ban.log are rotated in place (copy, then empty the file) once they pass OVPN_LOG_MAX_BYTES bytes,
+      # checked at start and every OVPN_LOG_ROTATE_INTERVAL seconds; OVPN_LOG_KEEP rotated copies (<name>.1 ... <name>.N) are kept.
+      # Worst case on disk per log: (OVPN_LOG_KEEP + 1) x OVPN_LOG_MAX_BYTES plus what is written between two checks.
       OVPN_LOG_MAX_BYTES: "${OVPN_LOG_MAX_BYTES:-10485760}"
+      OVPN_LOG_KEEP: "${OVPN_LOG_KEEP:-3}"
+      OVPN_LOG_ROTATE_INTERVAL: "${OVPN_LOG_ROTATE_INTERVAL:-60}"
       OVPN_BAN_ENABLED: "${OVPN_BAN_ENABLED:-true}"
       # true: the container stops if fail2ban cannot start; false: OpenVPN runs without bans and logs an error
       OVPN_BAN_REQUIRED: "${OVPN_BAN_REQUIRED:-false}"
@@ -47,7 +55,7 @@ services:
     networks:
       - ovpn
     ports:
-      - 7777:1194 # for openvpn
+      - 7777:${OVPN_SERVER_PORT:-1194} # for openvpn (right side = OVPN_SERVER_PORT)
       - 127.0.0.1:8080:8080 # for ovpn-admin because of network_mode; loopback only, publish it through a TLS reverse proxy
     volumes:
       - ./easyrsa_master:/etc/openvpn/easyrsa
