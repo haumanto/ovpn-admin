@@ -537,18 +537,25 @@ func main() {
 		ovpnAdmin.mgmtInterfaces[parts[0]] = parts[len(parts)-1]
 	}
 
+	// a slave needs the PKI and CCD from the master before anything reads them
+	// (management check, state, metrics); sync needs the master's basic-auth flag
+	if *masterBasicAuthPassword != "" && *masterBasicAuthUser != "" {
+		ovpnAdmin.masterHostBasicAuth = true
+	} else {
+		ovpnAdmin.masterHostBasicAuth = false
+	}
+
+	if ovpnAdmin.role == "slave" {
+		ovpnAdmin.syncDataFromMaster()
+		go ovpnAdmin.syncWithMaster()
+	}
+
 	ovpnAdmin.mgmtCheckVersions()
 
 	ovpnAdmin.registerMetrics()
 	ovpnAdmin.setState()
 
 	go ovpnAdmin.updateState()
-
-	if *masterBasicAuthPassword != "" && *masterBasicAuthUser != "" {
-		ovpnAdmin.masterHostBasicAuth = true
-	} else {
-		ovpnAdmin.masterHostBasicAuth = false
-	}
 
 	ovpnAdmin.modules = append(ovpnAdmin.modules, "core")
 
@@ -566,11 +573,6 @@ func main() {
 
 	if ovpnNetworkV6.IsValid() {
 		ovpnAdmin.modules = append(ovpnAdmin.modules, "ipv6")
-	}
-
-	if ovpnAdmin.role == "slave" {
-		ovpnAdmin.syncDataFromMaster()
-		go ovpnAdmin.syncWithMaster()
 	}
 
 	staticFS, _ := fs.Sub(staticFiles, "frontend/static")

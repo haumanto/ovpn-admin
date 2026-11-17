@@ -20,15 +20,23 @@ if [ -e "${SERVER_CERT}" ]; then
 else
   if [ "${OVPN_ROLE:-master}" = "slave" ]; then
     echo "Waiting for initial sync data from master"
-    # ovpn-admin shares the network namespace of this container and listens on port 8080;
+    # ovpn-admin shares the network namespace of this container and listens on port ${OVPN_LISTEN_PORT:-8080};
     # wait until it has completed the first successful sync with the master
+    # with BASIC_USERNAME/BASIC_PASSWORD set on ovpn-admin the endpoint needs the same credentials;
+    # tracing is off while they are handled so that they do not end up in the container log
+    set +x
+    WGET_AUTH_ARGS=()
+    if [ -n "${BASIC_USERNAME:-}" ] && [ -n "${BASIC_PASSWORD:-}" ]; then
+      WGET_AUTH_ARGS=(--header "Authorization: Basic $(printf '%s:%s' "${BASIC_USERNAME}" "${BASIC_PASSWORD}" | base64 | tr -d '\n')")
+    fi
     while :; do
-      last_sync="$(wget -q http://127.0.0.1:8080/api/sync/last/successful -O - || true)"
+      last_sync="$(wget -q "${WGET_AUTH_ARGS[@]}" http://127.0.0.1:${OVPN_LISTEN_PORT:-8080}/api/sync/last/successful -O - || true)"
       if [ -n "${last_sync}" ] && [ "${last_sync}" != "unknown" ]; then
         break
       fi
       sleep 5
     done
+    set -x
   else
     echo "Generating new certs"
     easyrsa --batch init-pki

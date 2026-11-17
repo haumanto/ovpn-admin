@@ -195,6 +195,14 @@ Flags:
                                 URL for the master server, IPv6 hosts
                                 in brackets: http://[fd00::1]:8080
                                 ($OVPN_MASTER_HOST)
+  --basic.username=""           username for HTTP Basic Auth on the web UI, API
+                                and metrics (except /ping); requires
+                                --basic.password, both empty disables it
+                                ($BASIC_USERNAME)
+  --basic.password=""           password for HTTP Basic Auth on the web UI, API
+                                and metrics (except /ping); requires
+                                --basic.username, both empty disables it
+                                ($BASIC_PASSWORD)
   --master.basic-auth.user=""   user for master server's Basic Auth
                                 ($OVPN_MASTER_USER)
   --master.basic-auth.password=""  
