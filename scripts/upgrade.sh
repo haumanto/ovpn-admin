@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Upgrade a docker compose deployment of ovpn-admin (upstream ./start.sh, v0.1.0 or registry images)
-# to a release of this fork (default: v0.1.1). One script for every version, see UPGRADING.md.
+# to a release of this fork (default: v0.1.2). One script for every version, see UPGRADING.md.
 #
 # What it does: preflight, backup of the bind-mounted data (easyrsa_master, ccd_master and, when the
 # compose file mounts it, audit_master), build --pull or pull, then an ordered start: openvpn first,
@@ -11,7 +11,7 @@ set -euo pipefail
 
 PROG=$(basename "$0")
 # only used in messages, the backup file name and the rollback text; it does not select any code
-TARGET_VERSION="v0.1.1"
+TARGET_VERSION="v0.1.2"
 
 PROJECT_DIR=""
 COMPOSE_FILE="docker-compose.yaml"

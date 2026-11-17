@@ -1,6 +1,6 @@
 # Upgrading ovpn-admin (docker compose)
 
-One script covers every version: `scripts/upgrade.sh`. It backs up the bind-mounted data, builds or pulls the images, starts `openvpn`, waits for its management interface, then starts `ovpn-admin` and waits for `/ping`. The version you upgrade to comes from the compose file and the checkout you are on; `--target-version` (default `v0.1.1`) only changes the text of the messages, the name of the backup archive and the rollback text.
+One script covers every version: `scripts/upgrade.sh`. It backs up the bind-mounted data, builds or pulls the images, starts `openvpn`, waits for its management interface, then starts `ovpn-admin` and waits for `/ping`. The version you upgrade to comes from the compose file and the checkout you are on; `--target-version` (default `v0.1.2`) only changes the text of the messages, the name of the backup archive and the rollback text.
 
 Pick your section:
 
@@ -24,7 +24,7 @@ Options:
 --project-dir DIR       compose file and data directories (required)
 --compose-file NAME     default docker-compose.yaml
 --project-name NAME     default openvpn-master, as in start.sh; it must match your running stack
---target-version VER    default v0.1.1; messages, backup file name and rollback text only
+--target-version VER    default v0.1.2; messages, backup file name and rollback text only
 --backup-dir DIR        default <project-dir>/backups
 --health-url URL        default http://127.0.0.1:8080/ping
 --health-timeout SECS   default 180
@@ -74,8 +74,8 @@ Manual equivalent, no script:
 ```bash
 mkdir -p -m 700 backups
 mkdir -p audit_master && chmod 0755 audit_master   # only if it does not exist yet
-tar -czf backups/pre-v0.1.1-$(date -u +%Y%m%dT%H%M%SZ).tar.gz easyrsa_master ccd_master audit_master
-sha256sum backups/pre-v0.1.1-*.tar.gz
+tar -czf backups/pre-v0.1.2-$(date -u +%Y%m%dT%H%M%SZ).tar.gz easyrsa_master ccd_master audit_master
+sha256sum backups/pre-v0.1.2-*.tar.gz
 docker compose -p openvpn-master build --pull   # registry images: docker compose -p openvpn-master pull
 docker compose -p openvpn-master up -d --no-deps openvpn
 until docker compose -p openvpn-master exec -T openvpn sh -c "(printf 'version\n'; sleep 1; printf 'quit\n') | nc -w 2 127.0.0.1 8989" | grep -q 'OpenVPN Version'; do sleep 2; done   # wait for the management interface
@@ -90,10 +90,10 @@ Image rebuild, no database migration. The compose files and the volumes do not c
 1. **Note your current version**: `git describe --tags --always` (or write down the image tags). You need it for a rollback.
 2. **Keep your compose file.** `docker-compose.yaml` and `docker-compose-slave.yaml` are the same as in v0.1.1. Registry users: once the v0.1.2 images are published, change the two `image:` lines to `ghcr.io/haumanto/ovpn-admin/ovpn-admin:v0.1.2` and `ghcr.io/haumanto/ovpn-admin/openvpn:v0.1.2`.
 3. **Get the v0.1.2 code**: `git fetch --tags && git checkout v0.1.2` in the existing checkout.
-4. **Preview, then upgrade**. Pass `--target-version v0.1.2`. Without it the script still prints `v0.1.1` in its messages and names the backup `pre-v0.1.1-<time>.tar.gz`. Only the labels are affected; the images are built from the checkout.
+4. **Preview, then upgrade**. The default label is `v0.1.2`; pass `--target-version` only if you want a different label in the messages and the backup name.
    ```bash
-   scripts/upgrade.sh --project-dir . --target-version v0.1.2 --dry-run
-   scripts/upgrade.sh --project-dir . --target-version v0.1.2 --previous-ref <your v0.1.1 tag or commit>
+   scripts/upgrade.sh --project-dir . --dry-run
+   scripts/upgrade.sh --project-dir . --previous-ref <your v0.1.1 tag or commit>
    ```
    The script runs `build --pull` (or `pull` for registry images), so the Alpine 3.23 base image is fetched. The dry run prints the plan and starts nothing.
 5. **Verify**: `curl -fsS http://127.0.0.1:8080/ping`, log in to the UI with the Basic Auth user, and connect one VPN client. Its `connect` line then shows in the user's login history. `ls -l audit_master/` should list `audit.tsv`.
@@ -139,8 +139,8 @@ Manual equivalent, no script:
 ```bash
 mkdir -p -m 700 backups
 mkdir -p audit_master && chmod 0755 audit_master
-tar -czf backups/pre-v0.1.1-$(date -u +%Y%m%dT%H%M%SZ).tar.gz easyrsa_master ccd_master audit_master
-sha256sum backups/pre-v0.1.1-*.tar.gz
+tar -czf backups/pre-v0.1.2-$(date -u +%Y%m%dT%H%M%SZ).tar.gz easyrsa_master ccd_master audit_master
+sha256sum backups/pre-v0.1.2-*.tar.gz
 docker compose -p openvpn-master build --pull   # registry images: docker compose -p openvpn-master pull
 docker compose -p openvpn-master up -d --no-deps openvpn
 until docker compose -p openvpn-master exec -T openvpn sh -c "(printf 'version\n'; sleep 1; printf 'quit\n') | nc -w 2 127.0.0.1 8989" | grep -q 'OpenVPN Version'; do sleep 2; done   # wait for the management interface
@@ -167,7 +167,7 @@ Never use `down -v` and never delete `easyrsa_master/` (it holds your CA) or `au
 ```bash
 docker compose -p openvpn-master stop
 mv easyrsa_master easyrsa_master.failed-upgrade && mv ccd_master ccd_master.failed-upgrade && mv audit_master audit_master.failed-upgrade
-tar -xzf backups/pre-v0.1.1-<timestamp>.tar.gz -C .
+tar -xzf backups/pre-v0.1.2-<timestamp>.tar.gz -C .
 git checkout <previous tag or commit>
 docker compose -p openvpn-master up -d --build   # registry images: pull, then up -d
 curl -fsS http://127.0.0.1:8080/ping
