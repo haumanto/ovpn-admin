@@ -1,4 +1,4 @@
-FROM alpine:3.24
+FROM alpine:3.23
 ARG TARGETARCH
 # "iptables" (nft backend) also provides the ip6tables commands, "ip6tables" is listed to make the dependency explicit
 # sqlite: configure.sh fixes users.db rows migrated from openvpn-user <= 1.0.4 (secret IS NULL)

@@ -79,7 +79,7 @@ cp -f /etc/openvpn/setup/openvpn.conf /etc/openvpn/openvpn.conf
 mkdir -p /etc/openvpn/scripts/
 for script in audit.sh client-connect.sh client-disconnect.sh; do
   cp -f "/etc/openvpn/setup/${script}" "/etc/openvpn/scripts/${script}"
-  chmod +x "/etc/openvpn/scripts/${script}"
+  chmod 0755 "/etc/openvpn/scripts/${script}"
 done
 echo "script-security 2" | tee -a /etc/openvpn/openvpn.conf
 echo "client-connect /etc/openvpn/scripts/client-connect.sh" | tee -a /etc/openvpn/openvpn.conf
@@ -98,7 +98,7 @@ fi
 
 if [ "${OVPN_PASSWD_AUTH:-false}" = "true" ]; then
   cp -f /etc/openvpn/setup/auth.sh /etc/openvpn/scripts/auth.sh
-  chmod +x /etc/openvpn/scripts/auth.sh
+  chmod 0755 /etc/openvpn/scripts/auth.sh
   echo "auth-user-pass-verify /etc/openvpn/scripts/auth.sh via-file" | tee -a /etc/openvpn/openvpn.conf
   echo "verify-client-cert require" | tee -a /etc/openvpn/openvpn.conf
   # db-init also creates the "migrations" table that openvpn-user >= 1.0.5 needs for db-migrate on a database created by <= 1.0.4
