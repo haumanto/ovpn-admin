@@ -3,12 +3,16 @@
 /usr/local/sbin/ovpn-telegram-notify).
 
     ovpn-telegram-notify IP FAILURES REASON EXPIRES_AT_UNIX
+    ovpn-telegram-notify --check-api-base URL      validate OVPN_TELEGRAM_API_BASE (and OVPN_TELEGRAM_ALLOW_HTTP) only: exit 0 valid,
+                                                   2 invalid + reason on stderr
 
 Configuration comes from the environment only, never from argv, a file or the output:
     OVPN_TELEGRAM_BOT_TOKEN   bot token (secret: never printed, never part of an error message)
     OVPN_TELEGRAM_CHAT_ID     chat id (integer, or @channelname)
     OVPN_TELEGRAM_THREAD_ID   optional forum topic id (integer)
-    OVPN_TELEGRAM_API_BASE    default https://api.telegram.org; only http:// or https:// is accepted
+    OVPN_TELEGRAM_API_BASE    default https://api.telegram.org; https:// always; http:// only with OVPN_TELEGRAM_ALLOW_HTTP=true
+                              (see api_base for the rules on host, port, user info, query and fragment)
+    OVPN_TELEGRAM_ALLOW_HTTP  default false; exactly "true" allows an http:// API base (local mock tests only)
 
 The message is plain text (no parse_mode), at most 4000 characters:
     🚫 ovpn-admin: banned <ip>
@@ -50,6 +54,8 @@ CHAT_ID_RE = re.compile(r"^(-?[0-9]{1,20}|@[A-Za-z][A-Za-z0-9_]{3,63})$")
 THREAD_ID_RE = re.compile(r"^[1-9][0-9]{0,15}$")
 FAILURES_RE = re.compile(r"^[1-9][0-9]{0,9}$")
 EXPIRES_RE = re.compile(r"^[1-9][0-9]{0,11}$")
+HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
+BRACKET_RE = re.compile(r"^\[[0-9A-Fa-f:.]+\](:[0-9]+)?$")
 
 
 class Invalid(Exception):
@@ -67,13 +73,49 @@ def warn(msg):
     print(f"{PROG}: WARNING: {msg}", file=sys.stderr)
 
 
-def api_base(raw):
-    base = (raw or DEFAULT_API_BASE).strip()
-    parts = urllib.parse.urlsplit(base)
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        raise Invalid("OVPN_TELEGRAM_API_BASE must be an http:// or https:// URL")
-    if parts.username is not None or parts.password is not None or parts.query or parts.fragment:
-        raise Invalid("OVPN_TELEGRAM_API_BASE must not carry credentials, a query or a fragment")
+def api_base(raw, allow_http=False):
+    """The one validator for OVPN_TELEGRAM_API_BASE: used by the send path and, through "--check-api-base", by configure.sh.
+
+    Accepted: https://, or http:// only when allow_http (OVPN_TELEGRAM_ALLOW_HTTP is exactly "true"); a host name, an IPv4
+    address or a bracketed IPv6 address; an optional :port (digits, 1-65535); an optional path.
+    Rejected: other schemes, a missing host, user info, an empty/non-numeric/out-of-range port, a malformed bracket,
+    a query, a fragment, whitespace, control characters, a backslash. Returns the base without a trailing slash.
+    The error text never echoes the value.
+    """
+    base = raw or DEFAULT_API_BASE
+    if not base.isascii() or "\\" in base or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in base):
+        raise Invalid("OVPN_TELEGRAM_API_BASE must be plain ASCII without spaces, control characters or backslashes")
+    try:
+        parts = urllib.parse.urlsplit(base)
+        port = parts.port  # ValueError: not a number or outside 0-65535
+        host = parts.hostname
+    except ValueError:
+        raise Invalid("OVPN_TELEGRAM_API_BASE has a malformed host, bracket or port") from None
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise Invalid("OVPN_TELEGRAM_API_BASE must be an https:// URL (http:// only with OVPN_TELEGRAM_ALLOW_HTTP=true)")
+    if parts.scheme == "http" and not allow_http:
+        raise Invalid("OVPN_TELEGRAM_API_BASE uses http://: refused unless OVPN_TELEGRAM_ALLOW_HTTP=true (local mock tests only)")
+    if "?" in base or "#" in base or parts.query or parts.fragment:
+        raise Invalid("OVPN_TELEGRAM_API_BASE must not carry a query or a fragment")
+    if "@" in parts.netloc or parts.username is not None or parts.password is not None:
+        raise Invalid("OVPN_TELEGRAM_API_BASE must not carry user info (credentials)")
+    if not host:
+        raise Invalid("OVPN_TELEGRAM_API_BASE needs a host name")
+    if "[" in parts.netloc or "]" in parts.netloc:
+        if not BRACKET_RE.match(parts.netloc):
+            raise Invalid("OVPN_TELEGRAM_API_BASE has a malformed bracket")
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            raise Invalid("OVPN_TELEGRAM_API_BASE has a malformed bracket (not an IPv6 address)") from None
+    elif not HOST_RE.match(host) or len(host) > 253:
+        raise Invalid("OVPN_TELEGRAM_API_BASE needs a valid host name or IPv4 address")
+    if parts.netloc.endswith(":"):
+        raise Invalid("OVPN_TELEGRAM_API_BASE has an empty port (write host:PORT or leave the colon out)")
+    # the port text itself must be plain digits (older Python versions accept "+80" in .port)
+    port_text = parts.netloc[parts.netloc.rfind("]") + 1:].partition(":")[2]
+    if (port_text and not port_text.isdigit()) or (port is not None and not 1 <= port <= 65535):
+        raise Invalid("OVPN_TELEGRAM_API_BASE port must be a number from 1 to 65535")
     return base.rstrip("/")
 
 
@@ -115,7 +157,7 @@ def send(env, text):
         raise Invalid("OVPN_TELEGRAM_CHAT_ID is missing or malformed")
     if thread_id and not THREAD_ID_RE.match(thread_id):
         raise Invalid("OVPN_TELEGRAM_THREAD_ID must be a positive integer")
-    base = api_base(env.get("OVPN_TELEGRAM_API_BASE", ""))
+    base = api_base(env.get("OVPN_TELEGRAM_API_BASE", ""), env.get("OVPN_TELEGRAM_ALLOW_HTTP", "") == "true")
 
     payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
     if thread_id:
@@ -152,6 +194,14 @@ def send(env, text):
 
 
 def main(argv):
+    if len(argv) == 3 and argv[1] == "--check-api-base":
+        # startup check of configure.sh: the same validator as the send path; no token involved, nothing is sent
+        try:
+            api_base(argv[2], os.environ.get("OVPN_TELEGRAM_ALLOW_HTTP", "") == "true")
+        except Invalid as exc:
+            print(exc, file=sys.stderr)
+            return 2
+        return 0
     if len(argv) != 5:
         print(f"usage: {PROG} IP FAILURES REASON EXPIRES_AT_UNIX", file=sys.stderr)
         return 2

@@ -47,17 +47,28 @@ services:
       # example 172.20.0.1) and is therefore never banned: check the source addresses in the OpenVPN log before relying on bans.
       # Add your own admin networks (space separated IPv4/IPv6 addresses or CIDR networks); the default is replaced, not extended.
       OVPN_BAN_IGNOREIP: "${OVPN_BAN_IGNOREIP:-127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fe80::/10}"
-      # Telegram notification for every new ban (off by default). To enable, set these in the host environment or in the .env file
-      # next to this file (never in this file, never in git), for example:
+      # Telegram notification for every new ban (off by default). To enable, set these in the host environment or in an env file
+      # OUTSIDE this repository (mode 0600, passed with "docker compose --env-file /path/to/ovpn-admin.env up -d"; never in this
+      # file, never in git, never a .env inside the build context; .env and .env.* are ignored by .gitignore and .dockerignore), for example:
       #   OVPN_TELEGRAM_ENABLED=true  OVPN_TELEGRAM_BOT_TOKEN=<token from @BotFather>  OVPN_TELEGRAM_CHAT_ID=<chat id>
+      # Prefer OVPN_TELEGRAM_BOT_TOKEN_FILE=<path inside the container> over the token variable: the token is then read from a
+      # read-only file and never sits in the compose environment (the file wins when both are set). There is no default mount; to
+      # use it, add under this service (file on the host: owner-only, first line = the token):
+      #   volumes:
+      #     - /path/on/host/telegram-bot-token:/run/secrets/telegram-bot-token:ro
+      # and set OVPN_TELEGRAM_BOT_TOKEN_FILE=/run/secrets/telegram-bot-token.
       # OVPN_TELEGRAM_THREAD_ID is the optional forum topic (integer). OVPN_TELEGRAM_API_BASE only needs a value for a self-hosted
-      # Bot API or a test server (http:// or https://). Enabled with a missing or malformed token or chat id: one ERROR at start,
-      # no notifications, the VPN starts anyway. The token is only read by the notifier, it is never logged or passed as an argument.
+      # Bot API or a test server; it must be https:// and a valid host[:port] (no credentials, query or fragment).
+      # OVPN_TELEGRAM_ALLOW_HTTP stays false: it is for local mock tests only, and exactly "true" is needed to accept an http:// base.
+      # Enabled with a missing or malformed token, chat id or API base: one ERROR at start, no notifications, the VPN starts anyway.
+      # The token is only read by the notifier, it is never logged or passed as an argument.
       OVPN_TELEGRAM_ENABLED: "${OVPN_TELEGRAM_ENABLED:-false}"
       OVPN_TELEGRAM_BOT_TOKEN: "${OVPN_TELEGRAM_BOT_TOKEN:-}"
+      OVPN_TELEGRAM_BOT_TOKEN_FILE: "${OVPN_TELEGRAM_BOT_TOKEN_FILE:-}"
       OVPN_TELEGRAM_CHAT_ID: "${OVPN_TELEGRAM_CHAT_ID:-}"
       OVPN_TELEGRAM_THREAD_ID: "${OVPN_TELEGRAM_THREAD_ID:-}"
       OVPN_TELEGRAM_API_BASE: "${OVPN_TELEGRAM_API_BASE:-https://api.telegram.org}"
+      OVPN_TELEGRAM_ALLOW_HTTP: "${OVPN_TELEGRAM_ALLOW_HTTP:-false}"
     cap_add:
       - NET_ADMIN
     sysctls:

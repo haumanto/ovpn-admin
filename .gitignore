@@ -20,3 +20,10 @@ packrd/
 *.ntvs*
 *.njsproj
 *.sln
+
+# Secrets: OVPN_TELEGRAM_BOT_TOKEN (and any other secret) must never be committed. Keep env files outside the repository
+# (docker compose --env-file /path/to/ovpn-admin.env) or use OVPN_TELEGRAM_BOT_TOKEN_FILE; these patterns are a safety net.
+.env
+.env.*
+*.env
+!.env.example

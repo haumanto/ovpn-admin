@@ -24,3 +24,14 @@ docker-compose-slave.yaml
 img
 dashboard
 .helm
+
+# Secrets: OVPN_TELEGRAM_BOT_TOKEN must never be in the build context (COPY . . in Dockerfile.ovpn-admin would put an env file
+# into a builder layer). Same patterns as .gitignore, also in subdirectories.
+.env
+.env.*
+*.env
+**/.env
+**/.env.*
+**/*.env
+!.env.example
+!**/.env.example

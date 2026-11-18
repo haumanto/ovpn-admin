@@ -90,8 +90,11 @@ fi
 
 # --- Telegram ban notifications ---------------------------------------------------------------------------------
 # A new ban sends one Telegram message (ovpn-ban.sh calls the notifier after the DROP rule and the ban list row are written).
-# OVPN_TELEGRAM_ENABLED=true needs OVPN_TELEGRAM_BOT_TOKEN and OVPN_TELEGRAM_CHAT_ID; optional OVPN_TELEGRAM_THREAD_ID (forum
-# topic) and OVPN_TELEGRAM_API_BASE (default https://api.telegram.org, http:// or https:// only). Availability comes first: a
+# OVPN_TELEGRAM_ENABLED=true needs the bot token (OVPN_TELEGRAM_BOT_TOKEN, or OVPN_TELEGRAM_BOT_TOKEN_FILE: the path of a regular
+# readable file whose first line is the token; the file wins over the variable) and OVPN_TELEGRAM_CHAT_ID; optional
+# OVPN_TELEGRAM_THREAD_ID (forum topic) and OVPN_TELEGRAM_API_BASE (default https://api.telegram.org). The API base must be
+# https://; http:// is accepted only with OVPN_TELEGRAM_ALLOW_HTTP=true (default false, local mock tests only). The base is
+# validated by the notifier itself ("--check-api-base"), the same validator as the send path. Availability comes first: a
 # missing or malformed value logs one ERROR, notifications stay off and the VPN starts anyway.
 # The token is a secret: this block runs without "set -x" (the trace would print it), the value is kept in a shell variable that
 # is not exported, and it is removed from the environment so that openvpn and its hooks do not inherit it. Only the fail2ban
@@ -105,15 +108,34 @@ TG_TOKEN="${OVPN_TELEGRAM_BOT_TOKEN:-}"
 TG_CHAT_ID="${OVPN_TELEGRAM_CHAT_ID:-}"
 TG_THREAD_ID="${OVPN_TELEGRAM_THREAD_ID:-}"
 TG_API_BASE="${OVPN_TELEGRAM_API_BASE:-https://api.telegram.org}"
-unset OVPN_TELEGRAM_BOT_TOKEN
+TG_ALLOW_HTTP="${OVPN_TELEGRAM_ALLOW_HTTP:-false}"
+TG_TOKEN_FILE="${OVPN_TELEGRAM_BOT_TOKEN_FILE:-}"
+unset OVPN_TELEGRAM_BOT_TOKEN OVPN_TELEGRAM_BOT_TOKEN_FILE
 TG_ENABLED="false"
 case "${OVPN_TELEGRAM_ENABLED:-false}" in
   true)
     tg_problems=()
-    if [ -z "${TG_TOKEN}" ]; then
-      tg_problems+=("OVPN_TELEGRAM_BOT_TOKEN is not set")
-    elif ! [[ "${TG_TOKEN}" =~ ^[0-9]{1,20}:[A-Za-z0-9_-]{1,128}$ ]]; then
-      tg_problems+=("OVPN_TELEGRAM_BOT_TOKEN is not a bot token (<digits>:<characters>)")
+    tg_token_src="OVPN_TELEGRAM_BOT_TOKEN"
+    tg_token_ok="true"
+    if [ -n "${TG_TOKEN_FILE}" ]; then
+      # the file wins over OVPN_TELEGRAM_BOT_TOKEN; an unusable file is an error, never a silent fallback to the variable.
+      # First line only (at most 300 characters, the trailing newline and carriage return are dropped); the content is never printed.
+      tg_token_src="OVPN_TELEGRAM_BOT_TOKEN_FILE"
+      TG_TOKEN=""
+      if [ -f "${TG_TOKEN_FILE}" ] && [ -r "${TG_TOKEN_FILE}" ]; then
+        IFS= read -r -n 300 TG_TOKEN < "${TG_TOKEN_FILE}" || true
+        TG_TOKEN="${TG_TOKEN%$'\r'}"
+      else
+        tg_token_ok="false"
+        tg_problems+=("OVPN_TELEGRAM_BOT_TOKEN_FILE is not a readable regular file")
+      fi
+    fi
+    if [ "${tg_token_ok}" = "true" ]; then
+      if [ -z "${TG_TOKEN}" ]; then
+        tg_problems+=("${tg_token_src} is not set or the file is empty")
+      elif ! [[ "${TG_TOKEN}" =~ ^[0-9]{1,20}:[A-Za-z0-9_-]{1,128}$ ]]; then
+        tg_problems+=("${tg_token_src} does not hold a bot token (<digits>:<characters>)")
+      fi
     fi
     if [ -z "${TG_CHAT_ID}" ]; then
       tg_problems+=("OVPN_TELEGRAM_CHAT_ID is not set")
@@ -123,8 +145,14 @@ case "${OVPN_TELEGRAM_ENABLED:-false}" in
     if [ -n "${TG_THREAD_ID}" ] && ! [[ "${TG_THREAD_ID}" =~ ^[1-9][0-9]{0,15}$ ]]; then
       tg_problems+=("OVPN_TELEGRAM_THREAD_ID must be a positive integer")
     fi
-    if ! [[ "${TG_API_BASE}" =~ ^https?://[^[:space:]/?#@]+(/[^[:space:]?#]*)?$ ]]; then
-      tg_problems+=("OVPN_TELEGRAM_API_BASE must be an http:// or https:// URL without credentials, query or fragment")
+    case "${TG_ALLOW_HTTP}" in
+      true|false) ;;
+      *) tg_problems+=("OVPN_TELEGRAM_ALLOW_HTTP must be true or false"); TG_ALLOW_HTTP="false" ;;
+    esac
+    # the same validator as the send path (api_base in the notifier): https:// (http:// only with ALLOW_HTTP=true), host,
+    # a numeric port 1-65535, no user info, query or fragment. The reason it prints never contains the value.
+    if ! tg_base_err="$(OVPN_TELEGRAM_ALLOW_HTTP="${TG_ALLOW_HTTP}" "${TELEGRAM_TOOL}" --check-api-base "${TG_API_BASE}" 2>&1)"; then
+      tg_problems+=("${tg_base_err%%$'\n'*}")
     fi
     if [ "${#tg_problems[@]}" -eq 0 ]; then
       TG_ENABLED="true"
@@ -393,7 +421,7 @@ EOF
   # the Telegram settings go to this one command only (see the Telegram block above); no trace while the token is expanded
   { set +x; } 2>/dev/null
   OVPN_TELEGRAM_ENABLED="${TG_ENABLED}" OVPN_TELEGRAM_BOT_TOKEN="${TG_TOKEN}" OVPN_TELEGRAM_CHAT_ID="${TG_CHAT_ID}" \
-    OVPN_TELEGRAM_THREAD_ID="${TG_THREAD_ID}" OVPN_TELEGRAM_API_BASE="${TG_API_BASE}" \
+    OVPN_TELEGRAM_THREAD_ID="${TG_THREAD_ID}" OVPN_TELEGRAM_API_BASE="${TG_API_BASE}" OVPN_TELEGRAM_ALLOW_HTTP="${TG_ALLOW_HTTP}" \
     fail2ban-server -b -x >/dev/null 2>&1 &
   set -x
   for _ in $(seq 1 30); do
