@@ -9,6 +9,7 @@ Pick your section:
 * [v0.1.2 → v0.1.3](#v012--v013)
 * [v0.1.3 → v0.1.4](#v013--v014)
 * [v0.1.4 → v0.1.5](#v014--v015)
+* [v0.1.5 → v0.1.6](#v015--v016)
 * [upstream → v0.1.x](#upstream--v01x)
 
 Kubernetes/Helm deployments: see `charts/openvpn-admin/README.md`. The historical notes of the first release stay in `UPGRADING-v0.1.0.md`.
@@ -197,6 +198,27 @@ Status: release candidate. v0.1.5 is not tagged or published yet. The steps belo
 6. **Verify.** Check the start log: `docker compose -p openvpn-master logs openvpn | grep -i telegram` should print `telegram notifications: disabled` (the default) or `telegram notifications: enabled`. A bad setting prints one `ERROR` line and the VPN still starts. Then run `curl -fsS http://127.0.0.1:8080/ping`, log in to the UI with the Basic Auth user, and check the ban engine as in the v0.1.4 section.
 
 Known limits of this upgrade: a real upgrade run was not done (QA used a fresh stack with a local mock). The real Telegram API was not called. A downgrade was not tested. Restarts can send messages again for addresses still inside the find time. See `RELEASE-v0.1.5.md`, Known limitations.
+
+## v0.1.5 → v0.1.6
+
+Status: not published. v0.1.6 is not tagged or released yet. The steps below apply once the images are built from the v0.1.6 checkout. Details: [RELEASE-v0.1.6.md](RELEASE-v0.1.6.md).
+
+1. **Note your current version** (`git describe --tags --always`, or the image tags). You need it for a rollback.
+2. **Update the checkout and the compose file.** Use the v0.1.6 `docker-compose.yaml` (or `docker-compose-slave.yaml` on a slave). It adds `OVPN_BAN_REPEAT_COUNT` (default `2`). Re-apply your own edits (network, ports, `OVPN_*`, `BASIC_*`, `OVPN_MASTER_TOKEN`, Telegram settings). If you keep your own compose file, you can skip the new variable: the default is the same in the script.
+3. **Rebuild both images.** Both changed: the `openvpn` image (ban engine, manual ban watcher, notifier, start script) and the `ovpn-admin` image (API, UI, version). Run `docker compose -p openvpn-master build --pull`, then `up -d --no-deps openvpn`, then `up -d --no-deps ovpn-admin`, as in the manual steps of the upstream section. Or run `docker compose up -d --build`. `scripts/upgrade.sh` takes the same `--target-version`, `--previous-ref` and `--project-dir` options as in v0.1.5. It has not been run for this release.
+4. **No database migration.** `easyrsa_master/`, `ccd_master/` and `users.db` are not changed. The v0.1.5 to v0.1.6 diff adds no schema or SQL change. Back up before you upgrade anyway, as always.
+5. **Behavior change: repeat bans are on by default.** From v0.1.6 the second ban of an address is permanent. A permanent ban stays until someone unbans it in the UI or the API. Set `OVPN_BAN_REPEAT_COUNT` to change this:
+   * `2` (default): the second ban is permanent.
+   * a higher number delays permanence; `1` makes every ban permanent (not tested).
+   * The history starts empty after the upgrade, so bans made before the upgrade do not count.
+6. **Audit volume.** The upgrade adds files to `audit_master/` (`/etc/openvpn/audit` in the container):
+   * `ban-history.tsv`: appears at the first ban, not at start. Root-owned, mode `0600`. It keeps the ban counts and the permanent bans. Do not delete it: deleting it forgets the permanent bans and resets the counts.
+   * `control/`: created at start, owned by root, mode `0700`. It carries manual ban requests and their results. Old results are removed after 10 minutes.
+   * `bans.tsv.boot`: written at start.
+   * `bans.tsv.removals`: exists only while a forced unban is pending. A new ban of that address waits until it is gone.
+7. **Verify.** Check the start log: `docker compose -p openvpn-master logs openvpn | grep -E "ban control|fail2ban: jail"`. It should print `ban control: watching /etc/openvpn/audit/control` and `fail2ban: jail ovpn-admin running (... repeat-count=2)`. Then run `curl -fsS http://127.0.0.1:8080/ping`, log in to the UI with the Basic Auth user, and check that the **Banned IPs** tab shows **Ban IP** (master only).
+
+Known limits of this upgrade: no real upgrade run was done. QA used a fresh stack. The real Telegram API was not called. A rollback was not tested. v0.1.5 has no ban history, so after a rollback the permanent bans are not restored. If history is unreadable at start, the ban engine does not start with the default `OVPN_BAN_REQUIRED=false`: the VPN runs without bans. Fix the file and restart. See `RELEASE-v0.1.6.md`, Known limitations.
 
 ## upstream → v0.1.x
 

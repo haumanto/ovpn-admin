@@ -17,9 +17,10 @@ Simple web UI to manage OpenVPN users, their certificates & routes in Linux. Whi
 * (optionally) Storing certificates and other files in Kubernetes Secrets (**Attention, this feature is experimental!**).
 * (optionally) IPv6: dual-stack web UI listener, IPv6 pool for VPN clients, static IPv6 addresses and IPv6 routes in CCD (see [IPv6](#ipv6)).
 * Automatic banning of sources that make repeated failed logins or present revoked certificates, run by fail2ban inside the OpenVPN container, IPv4 and IPv6 (see [Ban engine](#ban-engine)). New in v0.1.4.
-* Read-only **Banned IPs** view in the admin UI (see [Banned IPs](#banned-ips)).
+* **Banned IPs** view in the admin UI, read-only on a slave (see [Banned IPs](#banned-ips)).
 * Mobile-first web UI: phone cards, a table on tablet and desktop, sheet dialogs (see [Mobile support](#mobile-support)). New in v0.1.4.
 * (optionally) A Telegram message for every new ban, off by default (see [Telegram notifications](#telegram-notifications)). New in v0.1.5.
+* Permanent bans for repeat offenders (the Nth ban of an address, `OVPN_BAN_REPEAT_COUNT`, default 2) and manual ban/unban on the master (see [Permanent bans and manual control](#permanent-bans-and-manual-control)). New in v0.1.6.
 
 ### Screenshots
 
@@ -31,7 +32,7 @@ An example of dashboard made using ovpn-admin metrics:
 
 ## Installation
 
-Release notes for this version: [RELEASE-v0.1.5.md](RELEASE-v0.1.5.md) (published with the v0.1.5 release). Earlier releases: [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md), [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md), [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0 to v0.1.4: [UPGRADING.md](UPGRADING.md). Upgrading from v0.1.4 to v0.1.5: [UPGRADING.md](UPGRADING.md#v014--v015).
+Release notes for this version: [RELEASE-v0.1.6.md](RELEASE-v0.1.6.md) (v0.1.6 is not published yet: candidate branch `v0.1.6`). Latest published release: [RELEASE-v0.1.5.md](RELEASE-v0.1.5.md) (published with the v0.1.5 release). Earlier releases: [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md), [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md), [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0 to v0.1.4: [UPGRADING.md](UPGRADING.md). Upgrading from v0.1.4 to v0.1.5: [UPGRADING.md](UPGRADING.md#v014--v015). Upgrading from v0.1.5 to v0.1.6: [UPGRADING.md](UPGRADING.md#v015--v016).
 
 ### 1. Docker
 
@@ -218,9 +219,10 @@ The `openvpn` container runs fail2ban 1.1.0 (jail `ovpn-admin`). It reads `openv
 * **What counts:** a revoked certificate (`VERIFY ERROR: ... certificate revoked`, one line per attempt) and a wrong password (`SENT CONTROL [UNDEF]: 'AUTH_FAILED'`, one per wrong password; the second `AUTH_FAILED` line of the same attempt is not counted). Nothing else counts.
 * **Default rule:** 3 failures in 600 seconds ban the address for 3600 seconds. Measured with 120 s and 60 s timers, real clients, IPv4 and IPv6: the ban starts within about half a second of the third failure and lifts at 59 to 60 seconds.
 * **Enforcement:** DROP rules in the `OVPN_BAN` (IPv4) and `OVPN_BAN6` (IPv6) chains, only for the OpenVPN listener port `OVPN_SERVER_PORT`. The admin port is never affected.
-* **Restarts:** bans are not kept, but recent failures are counted again at start, so a source still inside the findtime is banned again within seconds. See [UPGRADING.md](UPGRADING.md#v013--v014).
+* **Repeat bans:** the Nth ban of the same address is permanent (`OVPN_BAN_REPEAT_COUNT`, default 2). See [Permanent bans and manual control](#permanent-bans-and-manual-control).
+* **Restarts:** temporary bans are not kept. Permanent bans are restored from `ban-history.tsv` (v0.1.6). A source still inside the findtime is banned again within seconds, and that re-applied ban is not counted again. See [UPGRADING.md](UPGRADING.md#v013--v014).
 * **Allowlist:** `OVPN_BAN_IGNOREIP` (default: loopback, `10/8`, `172.16/12`, `192.168/16`, `fe80::/10`). Unique-local `fd00::/8` is not on the default list.
-* **Logs:** `openvpn.log` and `bans.tsv` live in the audit volume. `openvpn.log` and `fail2ban.log` are rotated in the container (`OVPN_LOG_MAX_BYTES`, `OVPN_LOG_KEEP`, `OVPN_LOG_ROTATE_INTERVAL`).
+* **Logs:** `openvpn.log`, `bans.tsv` and `ban-history.tsv` (from v0.1.6) live in the audit volume. `openvpn.log` and `fail2ban.log` are rotated in the container (`OVPN_LOG_MAX_BYTES`, `OVPN_LOG_KEEP`, `OVPN_LOG_ROTATE_INTERVAL`).
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
@@ -228,15 +230,27 @@ The `openvpn` container runs fail2ban 1.1.0 (jail `ovpn-admin`). It reads `openv
 | `OVPN_BAN_MAXRETRY` | `3` | failures that trigger a ban |
 | `OVPN_BAN_FINDTIME` | `600` | window in seconds for counting failures |
 | `OVPN_BAN_BANTIME` | `3600` | ban length in seconds |
+| `OVPN_BAN_REPEAT_COUNT` | `2` | the Nth ban of an address is permanent; `1` makes every ban permanent (v0.1.6) |
 | `OVPN_BAN_IGNOREIP` | `127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fe80::/10` | never banned (replaces the default list) |
 | `OVPN_BAN_REQUIRED` | `false` | `true` stops the container if fail2ban cannot start; `false` runs without bans and logs an error |
 | `OVPN_BAN_IPV6_REQUIRED` | `true` | `true` stops the container if IPv6 is on and the IPv6 ban chain cannot be built; `false` runs without IPv6 bans and prints a warning |
 
 Full list, measured behavior and limits: [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md). Check the filter against your own log with `fail2ban-regex`, as described in [docs/hardening/README.md](docs/hardening/README.md).
 
+### Permanent bans and manual control
+
+From v0.1.6, a repeat offender stays banned. The Nth ban of the same address is permanent, where N is `OVPN_BAN_REPEAT_COUNT` (default `2`; set `1` to make every ban permanent). The ban counts are kept in `ban-history.tsv` in the audit directory, so permanent bans survive a container restart. Set the variable in the compose file or in the environment file you pass to `docker compose`, then run `docker compose up -d --build`.
+
+The master's **Banned IPs** tab has two controls:
+
+1. **Ban IP:** enter an IPv4 or IPv6 address, optionally add a note (up to 120 characters: letters, digits, spaces, `. _ : -`), then press **Ban IP**. The ban is permanent until you unban it.
+2. **Unban:** press **Unban** on the row and confirm. This also clears the address's failure count, so its next ban counts from 1.
+
+The slave shows the list read-only. The API (`POST /api/ban/manual`, `POST /api/unban`), the Telegram messages, and the known limits are in [RELEASE-v0.1.6.md](RELEASE-v0.1.6.md).
+
 ### Telegram notifications
 
-Off by default. With it on, every new ban sends one plain-text message to a Telegram chat or forum topic. Unban sends nothing. A failed send logs one warning and never undoes the ban. Details, limits and token notes: [RELEASE-v0.1.5.md](RELEASE-v0.1.5.md).
+Off by default. With it on, every new ban sends one plain-text message to a Telegram chat or forum topic. A manual ban sends one too. Unban sends nothing. A failed send logs one warning and never undoes the ban. Details, limits and token notes: [RELEASE-v0.1.5.md](RELEASE-v0.1.5.md).
 
 Setup (not tested against the real Telegram API in QA):
 
@@ -268,7 +282,7 @@ A bad setting logs one `ERROR` line at start, notifications stay off, and the VP
 
 ### Banned IPs
 
-The **Banned IPs** tab of the admin UI is a read-only list: IP address, reason, attempts, banned since, expires, and a count badge that matches the number of rows. It refreshes on a timer and has no unban control. Data comes from `GET /api/bans`, which reads `bans.tsv`. It sits behind the same Basic Auth as the rest of the UI.
+The **Banned IPs** tab of the admin UI is a list: IP address, reason, attempts, banned since, expires (or **Permanent**), and a count badge that matches the number of rows. It refreshes on a timer. On the master it also has **Ban IP** and **Unban** (see [Permanent bans and manual control](#permanent-bans-and-manual-control)); the slave stays read-only. Data comes from `GET /api/bans`, which reads `bans.tsv`. It sits behind the same Basic Auth as the rest of the UI.
 
 ### Mobile support
 
@@ -276,7 +290,7 @@ The admin UI is mobile-first from v0.1.4. Up to 768 px each user is a card with 
 
 ## Upgrade notes
 
-Upgrading a docker compose deployment (upstream, v0.1.0, v0.1.1, v0.1.2, v0.1.3): follow [UPGRADING.md](UPGRADING.md); `scripts/upgrade.sh` backs up first and covers the audit volume. v0.1.4 steps: [UPGRADING.md](UPGRADING.md#v013--v014). v0.1.5 steps: [UPGRADING.md](UPGRADING.md#v014--v015).
+Upgrading a docker compose deployment (upstream, v0.1.0, v0.1.1, v0.1.2, v0.1.3): follow [UPGRADING.md](UPGRADING.md); `scripts/upgrade.sh` backs up first and covers the audit volume. v0.1.4 steps: [UPGRADING.md](UPGRADING.md#v013--v014). v0.1.5 steps: [UPGRADING.md](UPGRADING.md#v014--v015). v0.1.6 steps: [UPGRADING.md](UPGRADING.md#v015--v016).
 
 * **openvpn-user v1.0.4 → v1.0.9** (only relevant with password authentication, `--auth.password` / `OVPN_PASSWD_AUTH=true`). openvpn-user v1.0.9 adds the columns `secret` and `app_configured` to `users.db`. The column `secret` is added without a default value, so for every user whose password was saved by openvpn-user v1.0.4 or older it is `NULL`, and `openvpn-user auth` of v1.0.9 rejects these users (`converting NULL to string is unsupported`) — they cannot connect to the VPN any more. Users created by v1.0.9 are not affected. Additionally `openvpn-user db-migrate` does nothing on a database created by v1.0.4 until `openvpn-user db-init` has created the `migrations` table, and until the database is migrated `openvpn-user create` reports success without saving the user.
   * The Docker images handle this: `setup/configure.sh` of the openvpn image and ovpn-admin itself (when started with `--auth.password` or `--auth.db-init`) run `db-init` and `db-migrate` on start and then replace `NULL` in `secret` with an empty string (the value v1.0.9 stores for new users). All steps are idempotent.
