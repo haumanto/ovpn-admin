@@ -1,6 +1,6 @@
 # ovpn-admin v0.1.5 release notes
 
-**Status: release candidate, not published.** Nothing here is tagged, pushed, or released. No `v0.1.5` tag, image, or binary exists yet. Publishing is a Conductor step and needs its own approval.
+**Status: published.** Tag `v0.1.5`, GitHub release with amd64/arm64 binaries, GHCR images, chart release.
 
 - Candidate: branch `v0.1.5`, code SHA `d6dcd4073dbb3a7218931564f23d29046a8435ae`. The commit that adds this file sits on top of it and changes only `RELEASE-v0.1.5.md`, `README.md` and `UPGRADING.md`.
 - QA: `qa-v015/REPORT.md` (card t_d8ec88a4), verdict **SHIP** at the candidate SHA, items 1 to 12 PASS. Real OpenVPN 2.7.7 clients. Telegram was a local mock. The real Telegram API was never called.

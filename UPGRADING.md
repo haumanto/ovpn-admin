@@ -7,8 +7,8 @@ Pick your section:
 * [v0.1.0 → v0.1.1](#v010--v011)
 * [v0.1.1 → v0.1.2](#v011--v012)
 * [v0.1.2 → v0.1.3](#v012--v013)
-* [v0.1.3 → v0.1.4](#v013--v014) (release candidate, not published)
-* [v0.1.4 → v0.1.5](#v014--v015) (release candidate, not published)
+* [v0.1.3 → v0.1.4](#v013--v014)
+* [v0.1.4 → v0.1.5](#v014--v015)
 * [upstream → v0.1.x](#upstream--v01x)
 
 Kubernetes/Helm deployments: see `charts/openvpn-admin/README.md`. The historical notes of the first release stay in `UPGRADING-v0.1.0.md`.

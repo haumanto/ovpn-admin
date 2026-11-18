@@ -31,7 +31,7 @@ An example of dashboard made using ovpn-admin metrics:
 
 ## Installation
 
-Release notes for this version: [RELEASE-v0.1.5.md](RELEASE-v0.1.5.md) (v0.1.5 is not published yet). Earlier releases: [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md), [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md), [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0 to v0.1.4: [UPGRADING.md](UPGRADING.md). Upgrading from v0.1.4 to v0.1.5: [UPGRADING.md](UPGRADING.md#v014--v015).
+Release notes for this version: [RELEASE-v0.1.5.md](RELEASE-v0.1.5.md) (published with the v0.1.5 release). Earlier releases: [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md), [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md), [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0 to v0.1.4: [UPGRADING.md](UPGRADING.md). Upgrading from v0.1.4 to v0.1.5: [UPGRADING.md](UPGRADING.md#v014--v015).
 
 ### 1. Docker
 
@@ -54,7 +54,7 @@ export OVPN_MASTER_TOKEN="$(openssl rand -hex 32)"
 ./start.sh
 ```
 #### 1.1
-Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.2`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`. The v0.1.2 images are published with the v0.1.2 release. The v0.1.3 images are published with the v0.1.3 release. The v0.1.4 images are published with the v0.1.4 release. The v0.1.5 images are not published yet.
+Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.2`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`. The v0.1.2 images are published with the v0.1.2 release. The v0.1.3 images are published with the v0.1.3 release. The v0.1.4 images are published with the v0.1.4 release. The v0.1.5 images are published with the v0.1.5 release.
 
 ### 2. Building from source
 
