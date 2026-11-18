@@ -64,10 +64,13 @@
 # records the address there (atomic write; this is the commit point of the removal), then removes the DROP rule (absence verified, a firewall
 # read error is a failure, never "absent"), the row and the history entry, verifies all three, and only then clears the journal line. A
 # crash, a failed write or an unreadable ban list or history at any step leaves the journal line behind; the next ban-engine operation (setup,
-# check, ban, ban-manual, unban) completes the removal first (it converges to a clean removal once the files are readable), and restore never
-# re-adds a journaled address (an unreadable journal fails restore instead). Outcomes: before the journal write, nothing changed and the
+# check, ban, ban-manual, unban) completes the removal first (it converges to a clean removal once the files are readable), and restore
+# never re-adds a journaled address (an unreadable journal fails restore instead). Outcomes: before the journal write, nothing changed and the
 # caller got an error; from the journal write on, the address ends up unbanned and absent from history, whatever the caller was told.
-# A new ban of a journaled address supersedes the pending removal.
+# The journal line is committed intent: it is cleared only by a COMPLETED removal (all three verified) and by nothing else. A new ban of a
+# journaled address first replays the removal; when the replay of that address is not complete (an unreadable history, a failing step) the
+# new ban FAILS and the line stays, and a retry can only go on after the replay succeeded. A line is discarded only when it is not a
+# bannable address (the classifier said "invalid"); when the classifier itself fails (python3 missing or crashing) the line is kept.
 #
 # Restore and readiness: setup returns non-zero when a permanent entry of an enforced family cannot be restored (exit 3 when the failing
 # family is IPv6 with OVPN_BAN_IPV6_REQUIRED=true, 1 otherwise). The intentional opt-outs (OVPN_BAN_IPV6=false, or
@@ -79,7 +82,11 @@
 # exit 1, so readiness is degraded, and nothing is restored from it.
 #
 # State file reads: the ban list, the history and the removal journal are read with an explicit result (present / absent / error). A file
-# that exists but cannot be read is "state unknown", never "empty" or "absent". A replacement of one of these files (publish) is written to a
+# that exists but cannot be read is "state unknown", never "empty" or "absent"; "absent" is only what lstat answered with ENOENT (path_probe,
+# a python3 lstat: the shell tests -e and -L cannot tell a missing file from a failed lookup, so a metadata I/O error looked like absence).
+# A loop over a snapshot (here-string) of such a file counts the rows it consumed and compares them with the rows of the snapshot: a loop
+# that could not be set up runs no iteration, and "no failure counted" is never read as success without that.
+# A replacement of one of these files (publish) is written to a
 # temporary file and renamed only after the old content was read completely and the new content produced without error, so an unreadable
 # input can never wipe a file or acknowledge a removal. Without --force an unban whose permanence decision needs an unreadable file fails
 # without changing anything; a forced unban keeps its journal line (see above) and the next operation repeats the removal.
@@ -157,23 +164,53 @@ chain_of() { if [ "$1" = "6" ]; then echo "$CHAIN6"; else echo "$CHAIN4"; fi; }
 # classify_ip IP: sets FAM (4 or 6) and IP (canonical text form). Accepts only an address that is allowed to be banned:
 # refuses 0.x.x.x, unspecified, loopback, link-local, multicast and reserved ranges; an IPv4-mapped IPv6 address is
 # treated as the IPv4 address. The address reaches python3 as an argument, never through a shell.
+#   Status: 0 = accepted; 1 = INVALID address (not an address, or one that must never be banned); 2 = the classifier itself failed (python3
+#   missing, crashed, unexpected output): the address is unknown, not invalid, and a caller must never discard anything because of it.
+#   The python program exits 3 for an invalid or refused address; any other non-zero status (also 1, which an uncaught exception gives) is a failure.
 classify_ip() {
-  local out
+  local out rc=0
   [[ "$1" =~ ^[0-9A-Fa-f:.]{2,45}$ ]] || return 1
   out="$(python3 -c '
 import ipaddress, sys
-a = ipaddress.ip_address(sys.argv[1])
+try:
+    a = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    sys.exit(3)
 if a.version == 6 and a.ipv4_mapped is not None:
     a = a.ipv4_mapped
 if a.is_loopback or a.is_unspecified or a.is_multicast or a.is_link_local or a.is_reserved:
-    sys.exit(1)
+    sys.exit(3)
 if a.version == 4 and int(a) >> 24 == 0:
-    sys.exit(1)
+    sys.exit(3)
 print(a.version, a)
-' "$1" 2>/dev/null)" || return 1
-  [[ "$out" =~ ^[46]\ [0-9a-f:.]+$ ]] || return 1
+' "$1" 2>/dev/null)" || rc=$?
+  case "$rc" in 0) ;; 3) return 1 ;; *) return 2 ;; esac
+  [[ "$out" =~ ^[46]\ [0-9a-f:.]+$ ]] || return 2
   FAM="${out%% *}"
   IP="${out#* }"
+}
+
+# classify_or_die MESSAGE ADDRESS: classify_ip for a command line argument; exits with MESSAGE for an invalid address and with a different
+# message when the classifier itself failed
+classify_or_die() {
+  local rc=0
+  classify_ip "$2" || rc=$?
+  case "$rc" in
+    0) ;;
+    2) die "cannot check the address $2: the address classifier (python3) failed" ;;
+    *) die "$1: $2" ;;
+  esac
+}
+
+# nlines DATA: sets NLINES to the number of lines of DATA (the output of a command substitution: no trailing newline, "" = 0 lines).
+# A loop over a here-string snapshot counts its rows and compares them with this number: a loop whose redirection could not be set up
+# runs no iteration, and "no failure counted" must never be read as "everything was checked".
+nlines() {
+  local t
+  NLINES=0
+  [ -n "$1" ] || return 0
+  t="${1//[!$'\n']/}"
+  NLINES=$((${#t} + 1))
 }
 
 valid_posint() { [[ "$1" =~ ^[1-9][0-9]{0,9}$ ]]; }
@@ -256,23 +293,59 @@ publish() {
   return 1
 }
 
-# file_state FILE: what a read of FILE would see. 0 = a regular file that opens for reading; 1 = FILE does not exist (and every directory on
-# the way can be searched); 2 = anything else (a directory or other non-regular file, no read permission, a directory that cannot be
-# searched, a dangling link): the content is unknown. 2 is never to be treated as "empty" or "absent".
+# path_probe PATH: does PATH exist? 0 = it exists (lstat succeeded: any type, a link is not followed); 1 = it is MISSING (lstat failed with
+# ENOENT, and the nearest existing ancestor is a directory that can be searched, so the name really is absent); 2 = any other error (EACCES,
+# EIO, ELOOP, ENOTDIR, ENAMETOOLONG, a dangling link on the way, python3 failing to run: the existence is unknown). The shell tests
+# [ -e ] / [ -L ] cannot tell "missing" from "lstat failed": both answer false, so a metadata I/O error looked like absence. The decision is
+# taken on the errno of the filesystem call itself, in a small python program (exit 0 present, 3 missing, anything else, also the 1 of an
+# uncaught exception, = unknown). Status 2 is never to be treated as "empty", "absent" or "no entries".
+path_probe() {
+  local rc=0
+  python3 -c '
+import errno, os, stat, sys
+p = sys.argv[1]
+try:
+    os.lstat(p)
+except OSError as e:
+    if e.errno != errno.ENOENT:
+        sys.exit(2)
+else:
+    sys.exit(0)
+d = os.path.dirname(p) or "."
+while True:
+    try:
+        st = os.stat(d)
+    except FileNotFoundError:
+        try:
+            os.lstat(d)
+        except FileNotFoundError:
+            nd = os.path.dirname(d)
+            if nd == d:
+                sys.exit(2)
+            d = nd
+            continue
+        except OSError:
+            sys.exit(2)
+        sys.exit(2)
+    except OSError:
+        sys.exit(2)
+    if stat.S_ISDIR(st.st_mode) and os.access(d, os.X_OK):
+        sys.exit(3)
+    sys.exit(2)
+' "$1" 2>/dev/null || rc=$?
+  case "$rc" in 0) return 0 ;; 3) return 1 ;; *) return 2 ;; esac
+}
+
+# file_state FILE: what a read of FILE would see. 0 = a regular file that opens for reading; 1 = FILE is missing (path_probe: lstat said
+# ENOENT and the directory it belongs in is searchable); 2 = anything else (a directory or other non-regular file, no read permission, a
+# failed lookup of any kind, a dangling link): the content is unknown. 2 is never to be treated as "empty" or "absent".
 file_state() {
-  local f="$1" d
-  if [ -e "$f" ] || [ -L "$f" ]; then
-    [ -f "$f" ] && [ -r "$f" ] && { : < "$f"; } 2>/dev/null && return 0
-    return 2
-  fi
-  d="$(dirname -- "$f")"
-  while :; do
-    if [ -e "$d" ] || [ -L "$d" ]; then
-      [ -d "$d" ] && [ -x "$d" ] && return 1
-      return 2
-    fi
-    d="$(dirname -- "$d")"
-  done
+  local f="$1" pr=0
+  path_probe "$f" || pr=$?
+  [ "$pr" -eq 1 ] && return 1
+  [ "$pr" -eq 0 ] || return 2
+  [ -f "$f" ] && [ -r "$f" ] && { : < "$f"; } 2>/dev/null && return 0
+  return 2
 }
 
 # Readers of the ban list, the history and the removal journal. Every one returns 0 when the file was read completely or does not exist
@@ -351,7 +424,7 @@ txn_ban() {
   local line prev_n=0 first="$4" last="$4" prev_perm=0 n perm newperm=0 expires boot=0
   line="$(hist_line "$ip")" || { echo "ovpn-ban: cannot read the ban history $HISTORY: $ip not recorded" >&2; return 1; }
   if [ -n "$line" ]; then
-    IFS=$'\t' read -r _ prev_n first last prev_perm _ <<< "$line"
+    IFS=$'\t' read -r _ prev_n first last prev_perm _ <<< "$line" || { echo "ovpn-ban: cannot parse the history row of $ip: $ip not recorded" >&2; return 1; }
     [[ "$prev_n" =~ ^[0-9]{1,10}$ ]] || prev_n=0
     [[ "$first" =~ ^[0-9]{1,12}$ ]] || first="$now"
     [[ "$last" =~ ^[0-9]{1,12}$ ]] || last="$now"
@@ -395,9 +468,12 @@ txn_ban_fw() {
   local ip="$1" fails="$2" reason="$3" mode="$4" fam="$5" chain now out rc added=0
   chain="$(chain_of "$fam")"
   reconcile_removals || echo "ovpn-ban: WARNING: a pending removal could not be completed yet" >&2
+  # The journal line of THIS address is committed intent (a force-unban the caller was told about or crashed in). It is cleared only by a
+  # completed removal (removal_apply). While it is still there the replay of this address failed (or its journal cannot be read): the new
+  # ban fails and the line stays, so the removal is repeated by the next operation. A retry can only go on after the replay succeeded.
   removal_has "$ip"; rc=$?
   case "$rc" in
-    0) removal_drop "$ip" || { echo "ovpn-ban: cannot clear the pending removal of $ip: not banned" >&2; return 1; } ;;
+    0) echo "ovpn-ban: the pending removal of $ip could not be completed (the journal line is kept, the removal is repeated by the next operation): $ip not banned" >&2; return 1 ;;
     1) ;;
     *) echo "ovpn-ban: cannot read the removal journal $REMOVALS: $ip not banned" >&2; return 1 ;;
   esac
@@ -536,13 +612,22 @@ removal_apply() {
 # reconcile_removals: complete every removal left in the journal (the caller holds the lock). Fails when one cannot be completed or when the
 # journal itself cannot be read (the pending removals are then unknown).
 reconcile_removals() {
-  local ip rc=0 data
+  local ip rc=0 data seen=0 want crc
   data="$(read_all "$REMOVALS")" || { echo "ovpn-ban: ERROR: cannot read the removal journal $REMOVALS: pending removals unknown" >&2; return 1; }
   [ -n "$data" ] || return 0
+  nlines "$data"; want="$NLINES"
   while IFS= read -r ip <&3; do
+    seen=$((seen + 1))
     [ -n "$ip" ] || continue
-    if ! classify_ip "$ip"; then
+    crc=0
+    classify_ip "$ip" || crc=$?
+    if [ "$crc" -eq 1 ]; then
+      # only a line that is not a bannable address is discarded; a failing classifier says nothing about the line, which stays
       removal_drop "$ip" || rc=1
+      continue
+    elif [ "$crc" -ne 0 ]; then
+      echo "ovpn-ban: WARNING: the pending removal of $ip is kept: the address classifier failed" >&2
+      rc=1
       continue
     fi
     if removal_apply "$IP" "$FAM"; then
@@ -552,6 +637,10 @@ reconcile_removals() {
       rc=1
     fi
   done 3<<< "$data"
+  if [ "$seen" -ne "$want" ]; then
+    echo "ovpn-ban: ERROR: the removal journal snapshot was not consumed completely ($seen of $want lines): pending removals not done" >&2
+    return 1
+  fi
   return "$rc"
 }
 
@@ -570,7 +659,7 @@ txn_unban() {
   fi
   line="$(hist_line "$ip")" || { echo "ovpn-ban: cannot read the ban history $HISTORY: unban of $ip not done" >&2; return 1; }
   if [ -n "$line" ]; then
-    IFS=$'\t' read -r _ _ _ _ perm _ <<< "$line"
+    IFS=$'\t' read -r _ _ _ _ perm _ <<< "$line" || { echo "ovpn-ban: cannot parse the history row of $ip: unban of $ip not done" >&2; return 1; }
   fi
   if [ "$perm" != "1" ]; then
     rk="$(row_kind "$ip")" || { echo "ovpn-ban: cannot read the ban list $STATE: unban of $ip not done" >&2; return 1; }
@@ -616,15 +705,23 @@ cmd_init() {
 # Returns 2, listing nothing trustworthy, when the history or the removal journal exists but cannot be read: a failed enumeration is an error,
 # never "no permanent entries". A history file that does not exist (first start) has no entries and is a success.
 perm_entries() {
-  local line ip n first last perm reason fails data jr
+  local line ip n first last perm reason fails data jr crc seen=0 want
   data="$(read_all "$HISTORY")" || { echo "ovpn-ban: ERROR: cannot read the ban history $HISTORY" >&2; return 2; }
   [ -n "$data" ] || return 0
+  nlines "$data"; want="$NLINES"
   while IFS= read -r line || [ -n "$line" ]; do
-    IFS=$'\t' read -r ip n first last perm reason fails <<< "$line"
+    seen=$((seen + 1))
+    [ -n "$line" ] || continue
+    IFS=$'\t' read -r ip n first last perm reason fails <<< "$line" || { echo "ovpn-ban: ERROR: cannot parse a row of the ban history $HISTORY" >&2; return 2; }
     [ "$perm" = "1" ] || continue
-    if ! classify_ip "$ip"; then
+    crc=0
+    classify_ip "$ip" || crc=$?
+    if [ "$crc" -eq 1 ]; then
       echo "ovpn-ban: WARNING: permanent entry skipped, not a bannable address: $ip" >&2
       continue
+    elif [ "$crc" -ne 0 ]; then
+      echo "ovpn-ban: ERROR: cannot classify the permanent entry $ip: the address classifier failed" >&2
+      return 2
     fi
     jr=0
     removal_has "$IP" || jr=$?
@@ -639,6 +736,10 @@ perm_entries() {
     fi
     echo "$IP $FAM"
   done <<< "$data"
+  if [ "$seen" -ne "$want" ]; then
+    echo "ovpn-ban: ERROR: the history snapshot was not consumed completely ($seen of $want rows): the permanent bans are unknown" >&2
+    return 2
+  fi
 }
 
 # fail_status REQUIRED6_FAILURES OTHER_FAILURES: 3 when a required IPv6 enforcement is missing, 1 for any other failure, else 0
@@ -652,18 +753,31 @@ fail_status() {
 # stops the others, but any failure of an enforced family is returned (see fail_status). Skipped, not failed: IPv6 entries when IPv6 is off
 # or, with OVPN_BAN_IPV6_REQUIRED=false, when the IPv6 chain cannot be created (the intentional opt-outs), entries that are not an address.
 restore_permanent() {
-  local line ip n first last perm reason fails fam chain count=0 skipped=0 failed=0 req6=0 other=0 rc data jr jst=0
+  local line ip n first last perm reason fails fam chain count=0 skipped=0 failed=0 req6=0 other=0 rc data jr jst=0 crc seen=0 want
   # the whole history is read, and the journal checked, BEFORE anything is restored: an unreadable file is an error (status 1), not an empty history
   data="$(read_all "$HISTORY")" || { echo "ovpn-ban: ERROR: cannot read the ban history $HISTORY: the permanent bans are unknown, nothing restored" >&2; return 1; }
   file_state "$REMOVALS" || jst=$?
   [ "$jst" -ne 2 ] || { echo "ovpn-ban: ERROR: cannot read the removal journal $REMOVALS: nothing restored" >&2; return 1; }
   [ -n "$data" ] || return 0
+  nlines "$data"; want="$NLINES"
   while IFS= read -r line || [ -n "$line" ]; do
-    IFS=$'\t' read -r ip n first last perm reason fails <<< "$line"
+    seen=$((seen + 1))
+    [ -n "$line" ] || continue
+    if ! IFS=$'\t' read -r ip n first last perm reason fails <<< "$line"; then
+      echo "ovpn-ban: ERROR: cannot parse a row of the ban history $HISTORY" >&2
+      failed=$((failed + 1)); other=$((other + 1))
+      continue
+    fi
     [ "$perm" = "1" ] || continue
-    if ! classify_ip "$ip"; then
+    crc=0
+    classify_ip "$ip" || crc=$?
+    if [ "$crc" -eq 1 ]; then
       echo "ovpn-ban: WARNING: permanent entry skipped, not a bannable address: $ip" >&2
       skipped=$((skipped + 1))
+      continue
+    elif [ "$crc" -ne 0 ]; then
+      echo "ovpn-ban: ERROR: permanent entry $ip NOT restored: the address classifier failed" >&2
+      failed=$((failed + 1)); other=$((other + 1))
       continue
     fi
     jr=0
@@ -715,6 +829,11 @@ restore_permanent() {
     fi
     count=$((count + 1))
   done <<< "$data"
+  if [ "$seen" -ne "$want" ]; then
+    # the snapshot could not be set up or was not consumed to its end: rows were never looked at, so "no failure counted" proves nothing
+    echo "ovpn-ban: ERROR: the history snapshot was not consumed completely ($seen of $want rows): the permanent bans are not all restored" >&2
+    failed=$((failed + 1)); other=$((other + 1))
+  fi
   echo "ovpn-ban: restored $count permanent ban(s)$([ "$skipped" -gt 0 ] && echo ", $skipped skipped")$([ "$failed" -gt 0 ] && echo ", $failed FAILED")" >&2
   fail_status "$req6" "$other"
 }
@@ -732,9 +851,12 @@ txn_restore() {
 # temporary row of the address does not count, the UI could expire it); 0, or the fail_status. A rule or a row that cannot be read counts as
 # missing; a history that cannot be enumerated fails the verification (status 1).
 verify_permanent() {
-  local ip fam rc rk rrc why req6=0 other=0 entries
+  local ip fam rc rk rrc why req6=0 other=0 entries seen=0 want
   entries="$(perm_entries 2>/dev/null)" || { echo "ovpn-ban: ERROR: cannot enumerate the permanent bans of the history $HISTORY: enforcement not verified" >&2; return 1; }
+  nlines "$entries"; want="$NLINES"
+  [ "$want" -gt 0 ] || return 0
   while read -r ip fam <&3; do
+    seen=$((seen + 1))
     [ -n "$ip" ] || continue
     if [ "$fam" = "6" ] && [ "$V6_REQUIRED" != "true" ] && ! jumps_ok 6; then continue; fi
     fw_has "$fam" "$ip"; rc=$?
@@ -753,6 +875,11 @@ verify_permanent() {
       if [ "$fam" = "6" ] && [ "$V6_REQUIRED" = "true" ]; then req6=$((req6 + 1)); else other=$((other + 1)); fi
     fi
   done 3<<< "$entries"
+  if [ "$seen" -ne "$want" ]; then
+    # the entry list could not be set up as input or was not consumed to its end: entries were never verified
+    echo "ovpn-ban: ERROR: the permanent entry list was not consumed completely ($seen of $want entries): enforcement not verified" >&2
+    other=$((other + 1))
+  fi
   fail_status "$req6" "$other"
 }
 
@@ -833,7 +960,7 @@ do_ban() {
 
 cmd_ban() {
   [ "$#" -eq 2 ] || die "usage: ban IP FAILURES"
-  classify_ip "$1" || die "refusing to ban: not a public-routable IPv4 or IPv6 address: $1"
+  classify_or_die "refusing to ban: not a public-routable IPv4 or IPv6 address" "$1"
   valid_posint "$2" || die "FAILURES must be a positive integer: $2"
   do_ban "$IP" "$2" "$(reason_for "$IP")" auto
 }
@@ -842,7 +969,7 @@ cmd_ban() {
 cmd_ban_manual() {
   [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die "usage: ban-manual IP [REASON]"
   local note="${2:-}"
-  classify_ip "$1" || die "refusing to ban: not a public-routable IPv4 or IPv6 address: $1"
+  classify_or_die "refusing to ban: not a public-routable IPv4 or IPv6 address" "$1"
   [[ "$note" =~ ^[A-Za-z0-9\ ._:-]{0,120}$ ]] || die "REASON must match [A-Za-z0-9 ._:-]{0,120}"
   note="${note#"${note%%[! ]*}"}"
   note="${note%"${note##*[! ]}"}"
@@ -857,7 +984,7 @@ cmd_unban() {
     [ "$2" = "--force" ] || die "usage: unban IP [--force]"
     force=1
   fi
-  classify_ip "$1" || die "not a valid IPv4 or IPv6 address: $1"
+  classify_or_die "not a valid IPv4 or IPv6 address" "$1"
   with_state_lock txn_unban "$IP" "$FAM" "$force"
 }
 
