@@ -22,6 +22,8 @@ import (
 //
 //	ip  banned_at_unix  expires_at_unix  failures  reason
 //
+// expires_at_unix 0 marks a permanent ban: it never expires on its own and is removed only by a manual unban.
+//
 // The file sits next to the audit log (--audit.path) and is replaced atomically by the writer.
 const (
 	banFieldCount   = 5
@@ -38,11 +40,15 @@ type banEntry struct {
 	Reason    string
 }
 
-// banJSON is the wire form of a ban in GET /api/bans.
+// permanent reports a ban without an expiry (expires_at 0 in the ban list).
+func (b banEntry) permanent() bool { return b.ExpiresAt == 0 }
+
+// banJSON is the wire form of a ban in GET /api/bans. A permanent ban has "permanent": true and an empty expires_at.
 type banJSON struct {
 	IP        string `json:"ip"`
 	BannedAt  string `json:"banned_at"`
 	ExpiresAt string `json:"expires_at"`
+	Permanent bool   `json:"permanent"`
 	Failures  int    `json:"failures"`
 	Reason    string `json:"reason"`
 }
@@ -74,7 +80,7 @@ func parseBanLine(line string) (banEntry, error) {
 		return banEntry{}, fmt.Errorf("bad banned_at %q", f[1])
 	}
 	expiresAt, err := strconv.ParseInt(strings.TrimSpace(f[2]), 10, 64)
-	if err != nil || expiresAt <= 0 {
+	if err != nil || expiresAt < 0 {
 		return banEntry{}, fmt.Errorf("bad expires_at %q", f[2])
 	}
 	failures, err := strconv.Atoi(strings.TrimSpace(f[3]))
@@ -90,8 +96,8 @@ func parseBanLine(line string) (banEntry, error) {
 	}, nil
 }
 
-// parseBans parses the file content, skips malformed rows and rows that expired at or before now, and returns the
-// rest newest ban first (ties by IP). The second result counts the malformed rows.
+// parseBans parses the file content, skips malformed rows and rows that expired at or before now (a permanent row,
+// expires_at 0, never expires), and returns the rest newest ban first (ties by IP). The second result counts the malformed rows.
 func parseBans(data []byte, now time.Time) ([]banEntry, int) {
 	bans := []banEntry{}
 	skipped := 0
@@ -104,7 +110,7 @@ func parseBans(data []byte, now time.Time) ([]banEntry, int) {
 			skipped++
 			continue
 		}
-		if b.ExpiresAt <= now.Unix() {
+		if !b.permanent() && b.ExpiresAt <= now.Unix() {
 			continue
 		}
 		bans = append(bans, b)
@@ -153,13 +159,17 @@ func (oAdmin *OvpnAdmin) bansHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := bansResponse{Bans: []banJSON{}}
 	for _, b := range readBans(banListPath(), time.Now()) {
-		resp.Bans = append(resp.Bans, banJSON{
+		j := banJSON{
 			IP:        b.IP,
 			BannedAt:  auditTimeString(b.BannedAt),
-			ExpiresAt: auditTimeString(b.ExpiresAt),
+			Permanent: b.permanent(),
 			Failures:  b.Failures,
 			Reason:    b.Reason,
-		})
+		}
+		if !j.Permanent {
+			j.ExpiresAt = auditTimeString(b.ExpiresAt)
+		}
+		resp.Bans = append(resp.Bans, j)
 	}
 	body, err := json.Marshal(resp)
 	if err != nil {

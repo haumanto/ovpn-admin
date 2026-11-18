@@ -312,6 +312,11 @@ var reasonLabel = function(reason) {
   if (!reason) {
     return 'No reason recorded';
   }
+  // a manual ban is written as 'manual' or 'manual: <note>'; the note may contain any character, '+' included
+  var manual = /^manual(?:: (.*))?$/.exec(String(reason));
+  if (manual) {
+    return manual[1] ? 'Manual ban: ' + manual[1] : 'Manual ban';
+  }
   return String(reason).split('+').map(function(part) {
     return REASON_LABELS[part] || part;
   }).join(' + ');
@@ -319,10 +324,13 @@ var reasonLabel = function(reason) {
 
 var normalizeBan = function(b) {
   b = (b && typeof b === 'object') ? b : {};
+  // a permanent ban has permanent: true and an empty expires_at; it never expires on its own
+  var permanent = b.permanent === true;
   return {
     ip: String(b.ip || ''),
+    permanent: permanent,
     bannedMs: parseTimestamp(b.banned_at),
-    expiresMs: parseTimestamp(b.expires_at),
+    expiresMs: permanent ? 0 : parseTimestamp(b.expires_at),
     failures: Number(b.failures) || 0,
     reason: String(b.reason || ''),
     reasonLabel: reasonLabel(b.reason)
@@ -336,7 +344,7 @@ var viewFromHash = function() {
 // Adds the derived fields the ban cards and rows read.
 var decorateBan = function(b, nowMs) {
   var since = b.bannedMs ? new Date(b.bannedMs) : null;
-  var exp = b.expiresMs ? new Date(b.expiresMs) : null;
+  var exp = !b.permanent && b.expiresMs ? new Date(b.expiresMs) : null;
   return Object.assign({}, b, {
     _since: since ? {
       relative: relativePast(b.bannedMs, nowMs),
@@ -351,8 +359,32 @@ var decorateBan = function(b, nowMs) {
       utc: formatUtcSeconds(exp)
     } : null,
     // past its expiry before the next refresh: the row stays, dimmed
-    _expired: b.expiresMs > 0 && b.expiresMs <= nowMs
+    _expired: !b.permanent && b.expiresMs > 0 && b.expiresMs <= nowMs
   });
+};
+
+// Manual ban form. The note limit and character set are those of the ban
+// watcher (setup/ovpn-ban-control.py); the server checks everything again.
+var BAN_NOTE_MAX = 120;
+var validateBanIp = function(value) {
+  var ip = String(value || '').trim();
+  if (ip === '') {
+    return 'Enter an IP address.';
+  }
+  if (!/^[0-9A-Fa-f:.]{2,45}$/.test(ip) || (ip.indexOf('.') < 0 && ip.indexOf(':') < 0)) {
+    return 'Enter an IPv4 or IPv6 address, for example 203.0.113.9.';
+  }
+  return '';
+};
+var validateBanNote = function(value) {
+  var note = String(value || '');
+  if (note.length > BAN_NOTE_MAX) {
+    return 'The note is longer than ' + BAN_NOTE_MAX + ' characters.';
+  }
+  if (!/^[A-Za-z0-9 ._:-]*$/.test(note)) {
+    return 'Use letters, digits, spaces and . _ : - only.';
+  }
+  return '';
 };
 
 var BANS_POLL_MS = 30000;
@@ -837,6 +869,7 @@ const app = createApp({
       bansFailures: 0,
       bansNow: Date.now(),
       bansAnnounce: '',
+      bansQuiet: false,
       bansSearch: '',
     }
   },
@@ -1193,7 +1226,7 @@ const app = createApp({
           _this.bansError = '';
           _this.bansStaleError = '';
           // announced only when the count changes: silent polls do not chatter
-          if (previous !== null && previous !== bans.length) {
+          if (previous !== null && previous !== bans.length && !_this.bansQuiet) {
             _this.bansAnnounce = plural(bans.length, 'active ban');
           }
         })
@@ -1297,7 +1330,24 @@ const app = createApp({
         return;
       }
       this.dialog = null;
+      if (this.view == 'bans') {
+        this.focusAfterBans();
+        return;
+      }
       this.focusAfterReload(d ? d.username : '');
+    },
+    // after a Banned IPs dialog: the opener keeps focus; when its row is gone, Ban IP gets it
+    focusAfterBans: function() {
+      this.$nextTick(function() {
+        var active = document.activeElement;
+        if (active && active !== document.body && active.isConnected) {
+          return;
+        }
+        var target = document.getElementById('ban-add-btn') || document.getElementById('add-user-btn');
+        if (target) {
+          target.focus();
+        }
+      });
     },
     // The row list reloads after most actions; when the opener is gone, focus
     // goes to the row's History button, or to Add user when the row is gone.
@@ -1322,6 +1372,12 @@ const app = createApp({
       var d = this.dialog;
       if (!d || !d.submitted) {
         return '';
+      }
+      if (name == 'ban-ip') {
+        return validateBanIp(d.ip);
+      }
+      if (name == 'ban-note') {
+        return validateBanNote(d.note);
       }
       if (name == 'username') {
         return validateUsername(d.username);
@@ -1361,6 +1417,84 @@ const app = createApp({
           _this.dialog.sessions = null;
           _this.dialog.checking = false;
         }
+      });
+    },
+
+    // ---- manual ban and unban (Banned IPs view, master only) ----
+    openBanAdd: function() {
+      this.dialog = { kind: 'ban-add', ip: '', note: '', submitted: false, busy: false, error: '' };
+    },
+    openUnban: function(ban) {
+      this.dialog = { kind: 'unban', ip: ban.ip, permanent: !!ban.permanent, busy: false, error: '' };
+    },
+    banForm: function(ip, note) {
+      var data = new URLSearchParams();
+      data.append('ip', ip);
+      if (note) {
+        data.append('reason', note);
+      }
+      return data;
+    },
+    // reloads the list after a change, also when a poll is already running (its answer may predate the change)
+    reloadBans: function() {
+      var _this = this;
+      var running = _this.bansPromise;
+      if (running) {
+        return running.then(function() { return _this.loadBans(false); });
+      }
+      return _this.loadBans(false);
+    },
+    // one request: busy state, no double submit, inline error, toast and list reload on success
+    runBanRequest: function(url, form, verb, onSuccess) {
+      var _this = this;
+      var d = _this.dialog;
+      if (!d || d.busy) {
+        return;
+      }
+      d.busy = true;
+      d.error = '';
+      axios.request(axios_cfg(url, form, 'form'))
+      .then(function() {
+        _this.dialog = null;
+        var message = onSuccess(d);
+        _this.focusAfterBans();
+        // the count change that follows must not replace the result in the live region
+        _this.bansQuiet = true;
+        return _this.reloadBans().then(function() {
+          _this.bansQuiet = false;
+          _this.bansAnnounce = message + '. ' + plural(_this.bans.length, 'active ban') + '.';
+          // an unbanned row is gone now: focus must not fall back to the page
+          _this.focusAfterBans();
+        });
+      })
+      .catch(function(error) {
+        // a failed reload after a successful change is shown by the list itself; this branch is for the request
+        if (_this.dialog === d) {
+          d.busy = false;
+          d.error = 'Could not ' + verb + ' ' + d.ip + ': ' + trimPeriod(errorMessage(error)) + '.';
+        }
+      });
+    },
+    submitBanAdd: function() {
+      var _this = this;
+      var d = _this.dialog;
+      d.submitted = true;
+      if (validateBanIp(d.ip) || validateBanNote(d.note)) {
+        return;
+      }
+      var ip = d.ip.trim();
+      d.ip = ip;
+      _this.runBanRequest('api/ban/manual', _this.banForm(ip, d.note.trim()), 'ban', function() {
+        _this.toast('success', ip + ' banned', 'The ban is permanent until you unban it.');
+        return ip + ' banned permanently';
+      });
+    },
+    submitUnban: function() {
+      var _this = this;
+      var d = _this.dialog;
+      _this.runBanRequest('api/unban', _this.banForm(d.ip), 'unban', function() {
+        _this.toast('success', d.ip + ' unbanned', 'It can connect again.');
+        return d.ip + ' unbanned';
       });
     },
 

@@ -167,6 +167,7 @@ body.ov-scroll-locked { overflow: hidden; }
 .ov-badge-active { background: var(--c-active-bg); color: var(--c-active-text); border-color: var(--c-active-border); }
 .ov-badge-expired { background: var(--c-warn-bg); color: var(--c-warn-text); border-color: var(--c-warn-border); }
 .ov-badge-revoked { background: var(--c-revoked-bg); color: var(--c-revoked-text); height: auto; min-height: 24px; padding-top: 3px; padding-bottom: 3px; white-space: normal; }
+.ov-badge-permanent { background: var(--c-danger); color: #fff; }
 .ov-badge-reason { background: var(--c-ban-bg); color: var(--c-ban-text); height: auto; min-height: 24px; padding-top: 3px; padding-bottom: 3px; white-space: normal; border-radius: 12px; }
 .ov-count {
   display: inline-flex; align-items: center; justify-content: center; min-width: 22px; height: 22px; padding: 0 6px;
@@ -416,6 +417,11 @@ table.ov-hist { width: 100%; border-collapse: collapse; }
 .ov-ban-facts dt { font-size: 12px; line-height: 16px; color: var(--c-text-muted); font-weight: 400; }
 .ov-ban-facts dd { margin: 0; font-weight: 600; font-size: var(--fs-small); line-height: var(--lh-small); }
 .ov-ban-facts .ov-cell2 { font-weight: 400; }
+.ov-ban-actions { display: flex; margin-top: var(--sp-3); }
+.ov-ban-actions .ov-btn { flex: 1 1 auto; }
+.ov-ban-act { text-align: right; white-space: nowrap; width: 1%; }
+.ov-toolbar-end { margin-left: auto; }
+@media (min-width: 769px) { .ov-toolbar-end { margin-left: var(--sp-2); } }
 
 /* ---- toasts (@kyvg/vue3-notification): bottom of the screen, the header stays free ---- */
 .vue-notification-group {

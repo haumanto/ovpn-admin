@@ -188,10 +188,11 @@
       </div>
     </section>
 
-    <!-- BANNED IPS (read-only) -->
+    <!-- BANNED IPS (read-only on a slave) -->
     <section v-if="view == 'bans'" aria-labelledby="bans-h">
       <div class="ov-toolbar">
         <h1 id="bans-h" class="ov-view-title">Banned IPs</h1>
+        <button type="button" id="ban-add-btn" class="ov-btn ov-btn-primary ov-toolbar-end" v-if="serverRole == 'master'" :disabled="offline" @click="openBanAdd()"><svg class="ov-icon" aria-hidden="true"><use href="#i-ban"/></svg>Ban IP</button>
         <div class="ov-search" v-if="bansShowSearch">
           <label class="visually-hidden" for="ban-search">Search banned IPs</label>
           <svg class="ov-icon" aria-hidden="true"><use href="#i-search"/></svg>
@@ -222,7 +223,8 @@
               </div>
               <div>
                 <dt>Expires</dt>
-                <dd class="ov-num" v-if="ban._exp" :title="ban._exp.utc + ' UTC'">{{ ban._exp.relative }}<span class="ov-cell2">{{ ban._exp.short }}</span></dd>
+                <dd v-if="ban.permanent"><span class="ov-badge ov-badge-permanent">Permanent</span><span class="ov-cell2">Until unbanned</span></dd>
+                <dd class="ov-num" v-else-if="ban._exp" :title="ban._exp.utc + ' UTC'">{{ ban._exp.relative }}<span class="ov-cell2">{{ ban._exp.short }}</span></dd>
                 <dd v-else><span class="ov-muted">—</span></dd>
               </div>
               <div>
@@ -230,6 +232,9 @@
                 <dd class="ov-num">{{ ban.failures }}</dd>
               </div>
             </dl>
+            <div class="ov-ban-actions" v-if="serverRole == 'master'">
+              <button type="button" class="ov-btn" :data-unban-for="ban.ip" :aria-label="'Unban ' + ban.ip" :disabled="offline" @click.left.stop="openUnban(ban)">Unban</button>
+            </div>
           </li>
         </ul>
         <div class="ov-table-wrap" v-else>
@@ -242,6 +247,7 @@
                 <th scope="col">Attempts</th>
                 <th scope="col" aria-sort="descending">Banned since</th>
                 <th scope="col">Expires</th>
+                <th scope="col" v-if="serverRole == 'master'"><span class="visually-hidden">Actions</span></th>
               </tr>
             </thead>
             <tbody>
@@ -253,12 +259,13 @@
                 </td>
                 <td class="ov-num">{{ ban.failures }}</td>
                 <td class="ov-num" :title="ban._since ? ban._since.utc + ' UTC' : null"><template v-if="ban._since">{{ ban._since.full }}<span class="ov-cell2">{{ ban._since.relative }}</span></template><template v-else>—</template></td>
-                <td class="ov-num" :title="ban._exp ? ban._exp.utc + ' UTC' : null"><template v-if="ban._exp">{{ ban._exp.full }}<span class="ov-cell2">{{ ban._exp.relative }}</span></template><template v-else>—</template></td>
+                <td class="ov-num" :title="ban._exp ? ban._exp.utc + ' UTC' : null"><template v-if="ban.permanent"><span class="ov-badge ov-badge-permanent">Permanent</span><span class="ov-cell2">Until unbanned</span></template><template v-else-if="ban._exp">{{ ban._exp.full }}<span class="ov-cell2">{{ ban._exp.relative }}</span></template><template v-else>—</template></td>
+                <td class="ov-ban-act" v-if="serverRole == 'master'"><button type="button" class="ov-btn" :data-unban-for="ban.ip" :aria-label="'Unban ' + ban.ip" :disabled="offline" @click.left.stop="openUnban(ban)">Unban</button></td>
               </tr>
             </tbody>
           </table>
         </div>
-        <p class="ov-note"><svg class="ov-icon" aria-hidden="true"><use href="#i-info"/></svg><span>Read-only. The server bans an IP after repeated rejected logins or connections with a revoked certificate. Bans end on their own at the expiry time. Times are in your time zone, {{ tzLabel }}.</span></p>
+        <p class="ov-note"><svg class="ov-icon" aria-hidden="true"><use href="#i-info"/></svg><span><template v-if="serverRole == 'slave'">Read-only replica. Bans are managed on the master. </template>The server bans an IP after repeated rejected logins or connections with a revoked certificate. A temporary ban ends on its own at the expiry time. A permanent ban stays until it is unbanned<template v-if="serverRole == 'master'"> here</template>. Times are in your time zone, {{ tzLabel }}.</span></p>
       </template>
     </section>
   </main>
@@ -285,6 +292,44 @@
     <template #footer>
       <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
       <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" :disabled="dialog.busy || offline">{{ dialog.busy ? 'Creating…' : 'Create user' }}</button>
+    </template>
+  </app-dialog>
+
+  <!-- Ban IP -->
+  <app-dialog v-if="dialog && dialog.kind == 'ban-add'" title="Ban IP" :busy="dialog.busy" @close="closeDialog()">
+    <form id="dialog-form" novalidate @submit.prevent="submitBanAdd()">
+      <div class="ov-field">
+        <label class="ov-label" for="f-ban-ip">IP address</label>
+        <input id="f-ban-ip" class="ov-input ov-mono" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+          placeholder="203.0.113.9" v-model="dialog.ip" :aria-invalid="fieldError('ban-ip') ? 'true' : null"
+          aria-describedby="f-ban-ip-help f-ban-ip-err">
+        <div class="ov-help" id="f-ban-ip-help">IPv4 or IPv6. The ban is permanent until you unban the address.</div>
+        <div class="ov-error" id="f-ban-ip-err" v-if="fieldError('ban-ip')">{{ fieldError('ban-ip') }}</div>
+      </div>
+      <div class="ov-field">
+        <label class="ov-label" for="f-ban-note">Note <span class="ov-muted">(optional)</span></label>
+        <input id="f-ban-note" class="ov-input" type="text" maxlength="120" autocomplete="off" spellcheck="false"
+          v-model="dialog.note" :aria-invalid="fieldError('ban-note') ? 'true' : null" aria-describedby="f-ban-note-help f-ban-note-err">
+        <div class="ov-help" id="f-ban-note-help">Up to 120 characters: letters, digits, spaces and . _ : -</div>
+        <div class="ov-error" id="f-ban-note-err" v-if="fieldError('ban-note')">{{ fieldError('ban-note') }}</div>
+      </div>
+    </form>
+    <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
+    <template #footer>
+      <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
+      <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" :disabled="dialog.busy || offline" :aria-busy="dialog.busy ? 'true' : null">{{ dialog.busy ? 'Banning…' : 'Ban IP' }}</button>
+    </template>
+  </app-dialog>
+
+  <!-- Unban -->
+  <app-dialog v-if="dialog && dialog.kind == 'unban'" :title="'Unban ' + dialog.ip + '?'" :busy="dialog.busy"
+    initial-focus="cancel" describe-body @close="closeDialog()">
+    <p><strong class="ov-mono">{{ dialog.ip }}</strong> can connect again right away.<template v-if="dialog.permanent"> This ban is permanent.</template></p>
+    <p class="ov-muted">Unban also clears the failure history of this address, so it starts clean.</p>
+    <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
+    <template #footer>
+      <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
+      <button type="button" class="ov-btn ov-btn-primary" :disabled="dialog.busy || offline" :aria-busy="dialog.busy ? 'true' : null" @click="submitUnban()">{{ dialog.busy ? 'Unbanning…' : 'Unban' }}</button>
     </template>
   </app-dialog>
 

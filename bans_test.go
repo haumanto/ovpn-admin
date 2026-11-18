@@ -110,7 +110,7 @@ func TestBansEndpointValidRows(t *testing.T) {
 		t.Fatalf("got %+v, want [%+v]", resp.Bans, want)
 	}
 	// wire keys are exactly the contract's names
-	for _, key := range []string{`"bans":[{`, `"ip":"146.70.195.37"`, `"banned_at":"`, `"expires_at":"`, `"failures":3`, `"reason":"certificate revoked or auth failure"`} {
+	for _, key := range []string{`"bans":[{`, `"ip":"146.70.195.37"`, `"banned_at":"`, `"expires_at":"`, `"permanent":false`, `"failures":3`, `"reason":"certificate revoked or auth failure"`} {
 		if !strings.Contains(body, key) {
 			t.Errorf("body %s lacks %s", body, key)
 		}

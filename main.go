@@ -628,6 +628,8 @@ func main() {
 	http.HandleFunc(*listenBaseUrl+"api/user/statistic", ovpnAdmin.userStatisticHandler)
 	http.HandleFunc(*listenBaseUrl+"api/user/audit", ovpnAdmin.userAuditHandler)
 	http.HandleFunc(*listenBaseUrl+"api/bans", ovpnAdmin.bansHandler)
+	http.HandleFunc(*listenBaseUrl+"api/ban/manual", ovpnAdmin.banManualHandler)
+	http.HandleFunc(*listenBaseUrl+"api/unban", ovpnAdmin.unbanHandler)
 	http.HandleFunc(*listenBaseUrl+"api/user/ccd", ovpnAdmin.userShowCcdHandler)
 	http.HandleFunc(*listenBaseUrl+"api/user/ccd/apply", ovpnAdmin.userApplyCcdHandler)
 
