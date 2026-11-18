@@ -88,6 +88,66 @@ if ! [[ "${BAN_IGNOREIP}" =~ ^[0-9A-Fa-f:./]+( [0-9A-Fa-f:./]+)*$ ]]; then
 fi
 
 
+# --- Telegram ban notifications ---------------------------------------------------------------------------------
+# A new ban sends one Telegram message (ovpn-ban.sh calls the notifier after the DROP rule and the ban list row are written).
+# OVPN_TELEGRAM_ENABLED=true needs OVPN_TELEGRAM_BOT_TOKEN and OVPN_TELEGRAM_CHAT_ID; optional OVPN_TELEGRAM_THREAD_ID (forum
+# topic) and OVPN_TELEGRAM_API_BASE (default https://api.telegram.org, http:// or https:// only). Availability comes first: a
+# missing or malformed value logs one ERROR, notifications stay off and the VPN starts anyway.
+# The token is a secret: this block runs without "set -x" (the trace would print it), the value is kept in a shell variable that
+# is not exported, and it is removed from the environment so that openvpn and its hooks do not inherit it. Only the fail2ban
+# server gets it (and with it the notifier, started by the ban action), through a one-command environment in start_fail2ban,
+# never through an argument, a file or the log. Nothing here prints the token or the chat id.
+# It runs before the first child process of this script, so that no later process (openvpn, its hooks, the log tails) inherits the token.
+TELEGRAM_TOOL="/usr/local/sbin/ovpn-telegram-notify"
+install -D -m 0755 /etc/openvpn/setup/ovpn-telegram-notify.py "${TELEGRAM_TOOL}"
+{ set +x; } 2>/dev/null
+TG_TOKEN="${OVPN_TELEGRAM_BOT_TOKEN:-}"
+TG_CHAT_ID="${OVPN_TELEGRAM_CHAT_ID:-}"
+TG_THREAD_ID="${OVPN_TELEGRAM_THREAD_ID:-}"
+TG_API_BASE="${OVPN_TELEGRAM_API_BASE:-https://api.telegram.org}"
+unset OVPN_TELEGRAM_BOT_TOKEN
+TG_ENABLED="false"
+case "${OVPN_TELEGRAM_ENABLED:-false}" in
+  true)
+    tg_problems=()
+    if [ -z "${TG_TOKEN}" ]; then
+      tg_problems+=("OVPN_TELEGRAM_BOT_TOKEN is not set")
+    elif ! [[ "${TG_TOKEN}" =~ ^[0-9]{1,20}:[A-Za-z0-9_-]{1,128}$ ]]; then
+      tg_problems+=("OVPN_TELEGRAM_BOT_TOKEN is not a bot token (<digits>:<characters>)")
+    fi
+    if [ -z "${TG_CHAT_ID}" ]; then
+      tg_problems+=("OVPN_TELEGRAM_CHAT_ID is not set")
+    elif ! [[ "${TG_CHAT_ID}" =~ ^(-?[0-9]{1,20}|@[A-Za-z][A-Za-z0-9_]{3,63})$ ]]; then
+      tg_problems+=("OVPN_TELEGRAM_CHAT_ID must be an integer or @channelname")
+    fi
+    if [ -n "${TG_THREAD_ID}" ] && ! [[ "${TG_THREAD_ID}" =~ ^[1-9][0-9]{0,15}$ ]]; then
+      tg_problems+=("OVPN_TELEGRAM_THREAD_ID must be a positive integer")
+    fi
+    if ! [[ "${TG_API_BASE}" =~ ^https?://[^[:space:]/?#@]+(/[^[:space:]?#]*)?$ ]]; then
+      tg_problems+=("OVPN_TELEGRAM_API_BASE must be an http:// or https:// URL without credentials, query or fragment")
+    fi
+    if [ "${#tg_problems[@]}" -eq 0 ]; then
+      TG_ENABLED="true"
+    else
+      tg_joined="$(printf '%s; ' "${tg_problems[@]}")"
+      echo "ERROR: OVPN_TELEGRAM_ENABLED=true but ${tg_joined%; }: Telegram notifications are disabled, the VPN starts anyway" >&2
+    fi
+    ;;
+  false) ;;
+  *) echo "ERROR: OVPN_TELEGRAM_ENABLED must be true or false: Telegram notifications are disabled, the VPN starts anyway" >&2 ;;
+esac
+if [ "${TG_ENABLED}" = "true" ]; then
+  echo "telegram notifications: enabled"
+  if [ "${BAN_ENABLED}" != "true" ]; then
+    echo "WARNING: OVPN_BAN_ENABLED=false: no address is banned, so no Telegram notification is ever sent" >&2
+  fi
+else
+  TG_TOKEN=""
+  echo "telegram notifications: disabled"
+fi
+set -x
+
+
 cd "${EASY_RSA_LOC}"
 
 if [ -e "${SERVER_CERT}" ]; then
@@ -247,6 +307,7 @@ tail -n 0 -F "${OPENVPN_LOG}" &
 BAN_STATE_FILE="${AUDIT_LOG_DIR}/bans.tsv"
 export OVPN_BAN_STATE="${BAN_STATE_FILE}" OVPN_BAN_LOG="${OPENVPN_LOG}" OVPN_BAN_BANTIME="${BAN_BANTIME}" OVPN_IPTABLES_BIN="${IPTABLES_BIN}" OVPN_IP6TABLES_BIN="${IP6TABLES_BIN}"
 # the enforced scope, derived above from the same variables as the openvpn command line (never taken from OVPN_BAN_PORT)
+export OVPN_BAN_NOTIFY_LOG="${FAIL2BAN_LOG}"
 export OVPN_BAN_PORT="${BAN_PORT}" OVPN_BAN_PROTOS="${BAN_PROTOS}" OVPN_BAN_IPV6="${BAN_IPV6}" OVPN_BAN_IPV6_REQUIRED="${BAN_IPV6_REQUIRED}" OVPN_LISTEN_PORT="${ADMIN_PORT}"
 BAN_TOOL="/usr/local/sbin/ovpn-ban.sh"
 install -D -m 0755 /etc/openvpn/setup/ovpn-ban.sh "${BAN_TOOL}"
@@ -329,7 +390,12 @@ EOF
   tail -n 0 -F "${FAIL2BAN_LOG}" &
 
   # started in the background and polled: with a broken runtime directory the forking parent never returns on its own
-  fail2ban-server -b -x >/dev/null 2>&1 &
+  # the Telegram settings go to this one command only (see the Telegram block above); no trace while the token is expanded
+  { set +x; } 2>/dev/null
+  OVPN_TELEGRAM_ENABLED="${TG_ENABLED}" OVPN_TELEGRAM_BOT_TOKEN="${TG_TOKEN}" OVPN_TELEGRAM_CHAT_ID="${TG_CHAT_ID}" \
+    OVPN_TELEGRAM_THREAD_ID="${TG_THREAD_ID}" OVPN_TELEGRAM_API_BASE="${TG_API_BASE}" \
+    fail2ban-server -b -x >/dev/null 2>&1 &
+  set -x
   for _ in $(seq 1 30); do
     fail2ban-client ping >/dev/null 2>&1 && break
     sleep 1

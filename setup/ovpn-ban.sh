@@ -5,7 +5,8 @@
 #   ovpn-ban.sh setup            create the OVPN_BAN (IPv4) and OVPN_BAN6 (IPv6) chains and their INPUT jumps (jail start);
 #                                exit 3 when IPv6 is enabled, the IPv6 chain cannot be created and OVPN_BAN_IPV6_REQUIRED is not false
 #   ovpn-ban.sh check            verify the chains and jumps of every enforced family; exit 3 = required IPv6 enforcement missing
-#   ovpn-ban.sh ban IP FAILURES  DROP IP in OVPN_BAN (IPv4) or OVPN_BAN6 (IPv6) and add (or replace) its row in the ban list
+#   ovpn-ban.sh ban IP FAILURES  DROP IP in OVPN_BAN (IPv4) or OVPN_BAN6 (IPv6) and add (or replace) its row in the ban list;
+#                                a new ban then sends the Telegram notification when OVPN_TELEGRAM_ENABLED=true (see below)
 #   ovpn-ban.sh unban IP         remove the DROP rule and the row; succeeds when neither exists
 #   ovpn-ban.sh flush            remove every DROP rule of both chains and clear the ban list
 #   ovpn-ban.sh teardown         remove the INPUT jumps, flush, delete both chains (actionstop, ban engine disabled)
@@ -30,6 +31,12 @@
 #   OVPN_BAN_STATE      ban list path
 #   OVPN_BAN_BANTIME    seconds a ban lasts, used for expires_at_unix (default 3600)
 #   OVPN_BAN_LOG        OpenVPN log, only read to name the reason of a ban (default /etc/openvpn/audit/openvpn.log)
+#   OVPN_BAN_NOTIFY_LOG  file that receives the warning when a Telegram notification fails (set by configure.sh to the fail2ban log)
+#   OVPN_TELEGRAM_ENABLED  set by configure.sh (true only when the Telegram settings are valid); with true, a successful new ban
+#                       runs /usr/local/sbin/ovpn-telegram-notify IP FAILURES REASON EXPIRES_AT after the DROP rule and the row are
+#                       written. The bot token and chat id reach the notifier through its environment only (inherited from the
+#                       fail2ban server, set by configure.sh), never through an argument. A notifier failure is one warning in the
+#                       fail2ban log, which the container log mirrors; the ban stays successful and the exit status is not affected. No notification on unban.
 #
 # IPv4 and IPv6 sources are banned in their own chain (iptables and ip6tables). Nothing from the caller reaches a shell:
 # IP and FAILURES are validated (python3 ipaddress, strict patterns) and every command is called with a fixed argument vector.
@@ -51,6 +58,8 @@ STATE="${OVPN_BAN_STATE:-/etc/openvpn/audit/bans.tsv}"
 LOCK="${STATE}.lock"
 BANTIME="${OVPN_BAN_BANTIME:-3600}"
 OVPN_LOG="${OVPN_BAN_LOG:-/etc/openvpn/audit/openvpn.log}"
+NOTIFY_BIN="/usr/local/sbin/ovpn-telegram-notify"
+NOTIFY_LOG="${OVPN_BAN_NOTIFY_LOG:-}"
 
 die() { echo "ovpn-ban: $*" >&2; exit 1; }
 
@@ -189,13 +198,32 @@ reason_for() {
   esac
 }
 
-do_ban_row() { # ip failures reason
-  local now
-  now="$(date +%s)"
+do_ban_row() { # ip failures reason now
   {
     rows_without "$1"
-    printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$now" "$((now + BANTIME))" "$2" "$3"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$4" "$(($4 + BANTIME))" "$2" "$3"
   } | write_rows
+}
+
+# notify_ban IP FAILURES REASON EXPIRES_AT: Telegram message for a new ban (see the header). Never fails the caller. fail2ban does
+# not log the stderr of a successful action, so a warning of the notifier is appended to OVPN_BAN_NOTIFY_LOG (the fail2ban log,
+# which the container mirrors to its log; set by configure.sh) and also written to our own stderr (visible to a manual caller).
+# The notifier prints at most one line, never the token or a response body; the line is cut to its first 300 characters.
+notify_ban() {
+  local rc=0 msg=""
+  [ "${OVPN_TELEGRAM_ENABLED:-false}" = "true" ] || return 0
+  if [ ! -x "$NOTIFY_BIN" ]; then
+    msg="ovpn-ban: WARNING: Telegram notification for $1 not sent: $NOTIFY_BIN is not installed"
+  else
+    msg="$(timeout 20 "$NOTIFY_BIN" "$@" 2>&1 </dev/null)" || rc=$?
+    if [ "$rc" -gt 2 ]; then msg="ovpn-ban: WARNING: Telegram notification for $1 failed (notifier exit $rc)"; fi
+  fi
+  msg="${msg%%$'\n'*}"
+  [ -n "$msg" ] || return 0
+  msg="${msg:0:300}"
+  echo "$msg" >&2
+  if [ -n "$NOTIFY_LOG" ]; then echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >>"$NOTIFY_LOG" 2>/dev/null || true; fi
+  return 0
 }
 
 do_unban_row() { rows_without "$1" | write_rows; }
@@ -253,12 +281,22 @@ cmd_ban() {
   [ "$#" -eq 2 ] || die "usage: ban IP FAILURES"
   classify_ip "$1" || die "refusing to ban: not a public-routable IPv4 or IPv6 address: $1"
   valid_posint "$2" || die "FAILURES must be a positive integer: $2"
-  local chain
+  local chain now reason added=0
   need_listener
   chain="$(chain_of "$FAM")"
   ensure_chain "$FAM" || die "cannot create chain $chain"
-  ipt "$FAM" -C "$chain" -s "$IP" -j DROP >/dev/null 2>&1 || ipt "$FAM" -A "$chain" -s "$IP" -j DROP || die "cannot add DROP rule for $IP"
-  with_state_lock do_ban_row "$IP" "$2" "$(reason_for "$IP")" || die "rule added but cannot update $STATE"
+  if ! ipt "$FAM" -C "$chain" -s "$IP" -j DROP >/dev/null 2>&1; then
+    ipt "$FAM" -A "$chain" -s "$IP" -j DROP || die "cannot add DROP rule for $IP"
+    added=1
+  fi
+  now="$(date +%s)"
+  reason="$(reason_for "$IP")"
+  with_state_lock do_ban_row "$IP" "$2" "$reason" "$now" || die "rule added but cannot update $STATE"
+  # a new ban only (an address that already had its DROP rule is not announced again); the ban is complete at this point
+  if [ "$added" -eq 1 ]; then
+    notify_ban "$IP" "$2" "$reason" "$((now + BANTIME))"
+  fi
+  return 0
 }
 
 cmd_unban() {
