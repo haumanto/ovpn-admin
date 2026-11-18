@@ -21,7 +21,7 @@ services:
       # logins (AUTH_FAILED) or revoked-certificate attempts within OVPN_BAN_FINDTIME seconds, for OVPN_BAN_BANTIME seconds.
       # Ban rules live in the OVPN_BAN chain (iptables, IPv4) and the OVPN_BAN6 chain (ip6tables, IPv6); both are only
       # reached for traffic to the OpenVPN listener port OVPN_SERVER_PORT (derived with its transport from OVPN_PROTO), never for the ovpn-admin port 8080.
-      # The active bans are listed in bans.tsv in the audit directory. Bans are not kept across container restarts.
+      # The active bans are listed in bans.tsv in the audit directory. Temporary bans are not kept across container restarts; permanent bans (see OVPN_BAN_REPEAT_COUNT) are.
       # IPv6 firewall backend; set ip6tables-legacy together with iptables-legacy
       OVPN_IP6TABLES_BIN: "${OVPN_IP6TABLES_BIN:-ip6tables}"
       # OpenVPN listener port inside the container. The same value is the --port of openvpn, the right side of the port
@@ -42,6 +42,9 @@ services:
       OVPN_BAN_MAXRETRY: "${OVPN_BAN_MAXRETRY:-3}"
       OVPN_BAN_FINDTIME: "${OVPN_BAN_FINDTIME:-600}"
       OVPN_BAN_BANTIME: "${OVPN_BAN_BANTIME:-3600}"
+      # The Nth ban of the same address is permanent (never expires, survives container restarts; kept in ban-history.tsv in the
+      # audit directory). 2 = the second ban is permanent; 1 = every ban is permanent. A permanent ban is lifted by hand only.
+      OVPN_BAN_REPEAT_COUNT: "${OVPN_BAN_REPEAT_COUNT:-2}"
       # Allowlist, never banned: loopback and private ranges, which include the Docker networks (172.16.0.0/12).
       # A client whose connection reaches OpenVPN through Docker's proxy shows up with the bridge gateway address (for
       # example 172.20.0.1) and is therefore never banned: check the source addresses in the OpenVPN log before relying on bans.

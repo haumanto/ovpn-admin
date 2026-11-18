@@ -17,8 +17,8 @@ Configuration comes from the environment only, never from argv, a file or the ou
 The message is plain text (no parse_mode), at most 4000 characters:
     🚫 ovpn-admin: banned <ip>
     Reason: <reason>
-    Attempts: <failures>
-    Until: <YYYY-MM-DD HH:MM UTC>
+    Attempts: <failures>            (left out when FAILURES is 0, the manual ban)
+    Until: <YYYY-MM-DD HH:MM UTC>   (or "Until: permanent" when EXPIRES_AT_UNIX is 0)
     Server: <hostname>
 
 Exit status: 0 sent, 1 delivery failed, 2 invalid input or configuration. On failure exactly one line starting with
@@ -41,8 +41,9 @@ PROG = "ovpn-telegram-notify"
 DEFAULT_API_BASE = "https://api.telegram.org"
 MAX_TEXT = 4000
 TIMEOUT_SECONDS = 10
-# the reasons ovpn-ban.sh (reason_for) can produce, nothing else is accepted
+# the reasons ovpn-ban.sh (reason_for) can produce, plus "manual" and "manual: <note>" (ban-manual); nothing else is accepted
 REASONS = {
+    "manual",
     "fail2ban",
     "revoked-certificate",
     "auth-failed",
@@ -52,8 +53,9 @@ REASONS = {
 TOKEN_RE = re.compile(r"^[0-9]{1,20}:[A-Za-z0-9_-]{1,128}$")
 CHAT_ID_RE = re.compile(r"^(-?[0-9]{1,20}|@[A-Za-z][A-Za-z0-9_]{3,63})$")
 THREAD_ID_RE = re.compile(r"^[1-9][0-9]{0,15}$")
-FAILURES_RE = re.compile(r"^[1-9][0-9]{0,9}$")
-EXPIRES_RE = re.compile(r"^[1-9][0-9]{0,11}$")
+MANUAL_REASON_RE = re.compile(r"^manual: [A-Za-z0-9._:-]([A-Za-z0-9 ._:-]{0,118}[A-Za-z0-9._:-])?$")
+FAILURES_RE = re.compile(r"^(0|[1-9][0-9]{0,9})$")
+EXPIRES_RE = re.compile(r"^(0|[1-9][0-9]{0,11})$")
 HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
 BRACKET_RE = re.compile(r"^\[[0-9A-Fa-f:.]+\](:[0-9]+)?$")
 
@@ -127,23 +129,25 @@ def build_message(ip, failures, reason, expires_at):
     if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
     if not FAILURES_RE.match(failures):
-        raise Invalid("FAILURES must be a positive integer")
-    if reason not in REASONS:
+        raise Invalid("FAILURES must be a non-negative integer")
+    if reason not in REASONS and not MANUAL_REASON_RE.fullmatch(reason):
         raise Invalid("REASON is not a known ban reason")
     if not EXPIRES_RE.match(expires_at):
-        raise Invalid("EXPIRES_AT must be a unix time in seconds")
-    try:
-        until = datetime.datetime.fromtimestamp(int(expires_at), datetime.timezone.utc)
-    except (OverflowError, OSError, ValueError):
-        raise Invalid("EXPIRES_AT is out of range") from None
+        raise Invalid("EXPIRES_AT must be a unix time in seconds, or 0 for a permanent ban")
+    if int(expires_at) == 0:
+        until_text = "permanent"
+    else:
+        try:
+            until = datetime.datetime.fromtimestamp(int(expires_at), datetime.timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            raise Invalid("EXPIRES_AT is out of range") from None
+        until_text = f"{until:%Y-%m-%d %H:%M} UTC"
     host = socket.gethostname()
-    text = (
-        f"\U0001F6AB ovpn-admin: banned {addr}\n"
-        f"Reason: {reason}\n"
-        f"Attempts: {int(failures)}\n"
-        f"Until: {until:%Y-%m-%d %H:%M} UTC\n"
-        f"Server: {host}"
-    )
+    lines = [f"\U0001F6AB ovpn-admin: banned {addr}", f"Reason: {reason}"]
+    if int(failures) > 0:
+        lines.append(f"Attempts: {int(failures)}")
+    lines += [f"Until: {until_text}", f"Server: {host}"]
+    text = "\n".join(lines)
     return str(addr), text[:MAX_TEXT]
 
 

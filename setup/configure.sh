@@ -22,6 +22,8 @@ BAN_REQUIRED="${OVPN_BAN_REQUIRED:-false}"
 BAN_MAXRETRY="${OVPN_BAN_MAXRETRY:-3}"
 BAN_FINDTIME="${OVPN_BAN_FINDTIME:-600}"
 BAN_BANTIME="${OVPN_BAN_BANTIME:-3600}"
+# the Nth ban of the same address is permanent (never expires; kept across restarts in ban-history.tsv); 1 = every ban is permanent
+BAN_REPEAT_COUNT="${OVPN_BAN_REPEAT_COUNT:-2}"
 # The enforced port and transport are derived below from OVPN_SERVER_PORT and OVPN_PROTO, the values of the openvpn command
 # line. OVPN_BAN_PORT is only an optional assertion: when set it must equal the derived listener port or the container stops.
 BAN_PORT_ASSERT="${OVPN_BAN_PORT:-}"
@@ -41,7 +43,7 @@ for ban_bool in OVPN_BAN_ENABLED:"${BAN_ENABLED}" OVPN_BAN_REQUIRED:"${BAN_REQUI
     exit 1
   fi
 done
-for ban_num in OVPN_BAN_MAXRETRY:"${BAN_MAXRETRY}" OVPN_BAN_FINDTIME:"${BAN_FINDTIME}" OVPN_BAN_BANTIME:"${BAN_BANTIME}" OVPN_LOG_MAX_BYTES:"${LOG_MAX_BYTES}" OVPN_LOG_KEEP:"${LOG_KEEP}" OVPN_LOG_ROTATE_INTERVAL:"${LOG_ROTATE_INTERVAL}"; do
+for ban_num in OVPN_BAN_MAXRETRY:"${BAN_MAXRETRY}" OVPN_BAN_FINDTIME:"${BAN_FINDTIME}" OVPN_BAN_BANTIME:"${BAN_BANTIME}" OVPN_BAN_REPEAT_COUNT:"${BAN_REPEAT_COUNT}" OVPN_LOG_MAX_BYTES:"${LOG_MAX_BYTES}" OVPN_LOG_KEEP:"${LOG_KEEP}" OVPN_LOG_ROTATE_INTERVAL:"${LOG_ROTATE_INTERVAL}"; do
   if ! [[ "${ban_num#*:}" =~ ^[1-9][0-9]{0,9}$ ]]; then
     echo "ERROR: ${ban_num%%:*} must be a positive integer, got \"${ban_num#*:}\"" >&2
     exit 1
@@ -331,16 +333,46 @@ chown nobody:nogroup "${OPENVPN_LOG}"
 chmod 600 "${OPENVPN_LOG}"
 tail -n 0 -F "${OPENVPN_LOG}" &
 
-# ban list and enforcement, see ovpn-ban.sh (installed fresh at every start)
+# ban list and enforcement, see ovpn-ban.sh (installed fresh at every start). The ban history (ban-history.tsv, same directory) keeps
+# the ban counts and the permanent bans across restarts; "init" below leaves it alone and "setup" restores the permanent bans.
 BAN_STATE_FILE="${AUDIT_LOG_DIR}/bans.tsv"
-export OVPN_BAN_STATE="${BAN_STATE_FILE}" OVPN_BAN_LOG="${OPENVPN_LOG}" OVPN_BAN_BANTIME="${BAN_BANTIME}" OVPN_IPTABLES_BIN="${IPTABLES_BIN}" OVPN_IP6TABLES_BIN="${IP6TABLES_BIN}"
+export OVPN_BAN_STATE="${BAN_STATE_FILE}" OVPN_BAN_LOG="${OPENVPN_LOG}" OVPN_BAN_BANTIME="${BAN_BANTIME}" OVPN_BAN_REPEAT_COUNT="${BAN_REPEAT_COUNT}" OVPN_IPTABLES_BIN="${IPTABLES_BIN}" OVPN_IP6TABLES_BIN="${IP6TABLES_BIN}"
 # the enforced scope, derived above from the same variables as the openvpn command line (never taken from OVPN_BAN_PORT)
 export OVPN_BAN_NOTIFY_LOG="${FAIL2BAN_LOG}"
 export OVPN_BAN_PORT="${BAN_PORT}" OVPN_BAN_PROTOS="${BAN_PROTOS}" OVPN_BAN_IPV6="${BAN_IPV6}" OVPN_BAN_IPV6_REQUIRED="${BAN_IPV6_REQUIRED}" OVPN_LISTEN_PORT="${ADMIN_PORT}"
 BAN_TOOL="/usr/local/sbin/ovpn-ban.sh"
 install -D -m 0755 /etc/openvpn/setup/ovpn-ban.sh "${BAN_TOOL}"
+# manual ban/unban queue shared with the ovpn-admin container: a directory next to bans.tsv, owned by root, mode 0700 (the admin
+# container runs as root too); the watcher (started below, only with the ban engine) executes the requests through ovpn-ban.sh
+BAN_CONTROL_TOOL="/usr/local/sbin/ovpn-ban-control"
+BAN_CONTROL_DIR="${AUDIT_LOG_DIR}/control"
+install -D -m 0755 /etc/openvpn/setup/ovpn-ban-control.py "${BAN_CONTROL_TOOL}"
+export OVPN_BAN_TOOL="${BAN_TOOL}" OVPN_BAN_CONTROL_DIR="${BAN_CONTROL_DIR}"
 # clear the ban list once, before fail2ban starts: a fresh network namespace has no bans, so no stale rows
 "${BAN_TOOL}" init
+
+# start_ban_control: the queue watcher of the manual ban control (see ovpn-ban-control.py), in the background for the life of the
+# container. Started with the Telegram settings in its environment (the notification of a manual ban comes from ovpn-ban.sh, like
+# the one of fail2ban), set the same way as for the fail2ban server: one-command environment, no trace while the token is expanded.
+# A watcher that does not come up is an error line, not a reason to stop the VPN.
+start_ban_control() {
+  mkdir -p "${BAN_CONTROL_DIR}" && chown root:root "${BAN_CONTROL_DIR}" && chmod 0700 "${BAN_CONTROL_DIR}" || {
+    echo "ERROR: cannot create the ban control directory ${BAN_CONTROL_DIR}: manual ban control is NOT available" >&2
+    return 1
+  }
+  { set +x; } 2>/dev/null
+  OVPN_TELEGRAM_ENABLED="${TG_ENABLED}" OVPN_TELEGRAM_BOT_TOKEN="${TG_TOKEN}" OVPN_TELEGRAM_CHAT_ID="${TG_CHAT_ID}" \
+    OVPN_TELEGRAM_THREAD_ID="${TG_THREAD_ID}" OVPN_TELEGRAM_API_BASE="${TG_API_BASE}" OVPN_TELEGRAM_ALLOW_HTTP="${TG_ALLOW_HTTP}" \
+    "${BAN_CONTROL_TOOL}" "${BAN_CONTROL_DIR}" &
+  BAN_CONTROL_PID=$!
+  set -x
+  sleep 1
+  if ! kill -0 "${BAN_CONTROL_PID}" 2>/dev/null; then
+    echo "ERROR: the ban control watcher did not start: manual ban control is NOT available" >&2
+    return 1
+  fi
+  echo "ban control: watching ${BAN_CONTROL_DIR}"
+}
 
 # start_fail2ban: writes the fail2ban config from the validated values above (always rebuilt, so nothing stale
 # survives a restart), starts the server and checks that the jail is running. Returns non-zero on any failure;
@@ -451,7 +483,9 @@ if [ "${BAN_ENABLED}" = "true" ]; then
     fi
   fi
   if start_fail2ban && "${BAN_TOOL}" check; then
-    echo "fail2ban: jail ovpn-admin running (maxretry=${BAN_MAXRETRY} findtime=${BAN_FINDTIME}s bantime=${BAN_BANTIME}s)"
+    echo "fail2ban: jail ovpn-admin running (maxretry=${BAN_MAXRETRY} findtime=${BAN_FINDTIME}s bantime=${BAN_BANTIME}s repeat-count=${BAN_REPEAT_COUNT})"
+    # after the jail start (its start action rebuilt the chains and restored the permanent bans), before OpenVPN
+    start_ban_control || true
   else
     ban_rc=$?
     if [ "${ban_rc}" -eq 3 ]; then
