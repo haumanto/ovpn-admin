@@ -63,15 +63,30 @@
 # Removal journal (force-unban recovery): OVPN_BAN_STATE.removals, root:root 0600, one canonical address per line. unban IP --force first
 # records the address there (atomic write; this is the commit point of the removal), then removes the DROP rule (absence verified, a firewall
 # read error is a failure, never "absent"), the row and the history entry, verifies all three, and only then clears the journal line. A
-# crash or a failed write at any step leaves the journal line behind; the next ban-engine operation (setup, check, ban, ban-manual, unban)
-# completes the removal first, and restore never re-adds a journaled address. Outcomes: before the journal write, nothing changed and the
+# crash, a failed write or an unreadable ban list or history at any step leaves the journal line behind; the next ban-engine operation (setup,
+# check, ban, ban-manual, unban) completes the removal first (it converges to a clean removal once the files are readable), and restore never
+# re-adds a journaled address (an unreadable journal fails restore instead). Outcomes: before the journal write, nothing changed and the
 # caller got an error; from the journal write on, the address ends up unbanned and absent from history, whatever the caller was told.
 # A new ban of a journaled address supersedes the pending removal.
 #
 # Restore and readiness: setup returns non-zero when a permanent entry of an enforced family cannot be restored (exit 3 when the failing
 # family is IPv6 with OVPN_BAN_IPV6_REQUIRED=true, 1 otherwise). The intentional opt-outs (OVPN_BAN_IPV6=false, or
 # OVPN_BAN_IPV6_REQUIRED=false with no usable IPv6 chain) are warnings, not failures. check also verifies, for every permanent history entry,
-# that its DROP rule and row exist; a missing one is reconciled once (the same restore) and fails check (same exit codes) if it stays missing.
+# that its DROP rule and a PERMANENT row (expires_at=0; a temporary row of the address does not count) exist; a missing one is reconciled once
+# (the same restore, which replaces the row) and fails check (same exit codes) if it stays missing. A healthy check changes nothing.
+# Both setup and check need a successful enumeration of the permanent history: a history file that does not exist (first start) has no
+# entries and is fine, one that exists but cannot be read (permissions, a directory in its place, an I/O error) fails setup and check with
+# exit 1, so readiness is degraded, and nothing is restored from it.
+#
+# State file reads: the ban list, the history and the removal journal are read with an explicit result (present / absent / error). A file
+# that exists but cannot be read is "state unknown", never "empty" or "absent". A replacement of one of these files (publish) is written to a
+# temporary file and renamed only after the old content was read completely and the new content produced without error, so an unreadable
+# input can never wipe a file or acknowledge a removal. Without --force an unban whose permanence decision needs an unreadable file fails
+# without changing anything; a forced unban keeps its journal line (see above) and the next operation repeats the removal.
+#
+# Firewall reads (fw_has): "iptables -C" status 0 = rule present; status 1 is not taken for "absent" on its own: the chain listing ("-S chain")
+# is read and searched for the rule "-A chain -s IP[/32|/128] -j DROP" (listed = present, readable and not listed = absent, listing
+# unreadable: absent only when the whole ruleset is readable and has no such chain); any other status = state unknown (error).
 #
 # IPv4 and IPv6 sources are banned in their own chain (iptables and ip6tables). Nothing from the caller reaches a shell:
 # IP and FAILURES are validated (python3 ipaddress, strict patterns) and every command is called with a fixed argument vector.
@@ -227,24 +242,74 @@ write_file() {
   return 1
 }
 
-# write_rows: stdin becomes the new ban list; write_hist: stdin becomes the new ban history
-write_rows() { write_file "$STATE"; }
-write_hist() { write_file "$HISTORY"; }
-
-# hist_line IP: the history row of IP (empty when there is none); hist_without IP: every other row
-hist_line() {
-  [ -f "$HISTORY" ] || return 0
-  awk -F '\t' -v ip="$1" '$1 == ip { print; exit }' "$HISTORY"
+# publish FILE CMD [ARGS]: the new content of FILE is the output of CMD. FILE is replaced (atomic rename, 0600) only when CMD succeeded, so
+# a producer that fails half way (a read error of the old content) can never publish partial content. Returns 1 and leaves FILE as it was
+# otherwise. Pipelines are not used for replacements: their status would be the one of the writer and hide the one of the producer.
+publish() {
+  local f="$1" tmp
+  shift
+  tmp="$(mktemp "${f}.XXXXXX")" || return 1
+  if "$@" > "$tmp" && chmod 0600 "$tmp" && mv -f "$tmp" "$f"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
 }
-hist_without() {
-  [ -f "$HISTORY" ] || return 0
-  awk -F '\t' -v ip="$1" '$1 != ip' "$HISTORY"
+
+# file_state FILE: what a read of FILE would see. 0 = a regular file that opens for reading; 1 = FILE does not exist (and every directory on
+# the way can be searched); 2 = anything else (a directory or other non-regular file, no read permission, a directory that cannot be
+# searched, a dangling link): the content is unknown. 2 is never to be treated as "empty" or "absent".
+file_state() {
+  local f="$1" d
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    [ -f "$f" ] && [ -r "$f" ] && { : < "$f"; } 2>/dev/null && return 0
+    return 2
+  fi
+  d="$(dirname -- "$f")"
+  while :; do
+    if [ -e "$d" ] || [ -L "$d" ]; then
+      [ -d "$d" ] && [ -x "$d" ] && return 1
+      return 2
+    fi
+    d="$(dirname -- "$d")"
+  done
 }
 
-# rows_without IP: current rows except the one of IP
-rows_without() {
-  [ -f "$STATE" ] || return 0
-  awk -F '\t' -v ip="$1" '$1 != ip' "$STATE"
+# Readers of the ban list, the history and the removal journal. Every one returns 0 when the file was read completely or does not exist
+# (a first start: no entries), and 2 when it exists but cannot be read (state unknown, never "empty"). Output is only trusted with status 0.
+#   hist_line IP     the history row of IP (no output when there is none)
+#   hist_without IP  every other history row;  rows_without IP  every other ban list row
+#   read_all FILE    the whole file (callers take it into a variable and check the status before looping over it)
+read_rows() { # FILE MODE IP: MODE line = the first row of IP, MODE others = every row except those of IP
+  local f="$1" mode="$2" ip="$3" st=0
+  file_state "$f" || st=$?
+  [ "$st" -eq 1 ] && return 0
+  [ "$st" -eq 0 ] || return 2
+  if [ "$mode" = "line" ]; then
+    awk -F '\t' -v ip="$ip" '$1 == ip { print; exit }' "$f" || return 2
+  else
+    awk -F '\t' -v ip="$ip" '$1 != ip' "$f" || return 2
+  fi
+}
+read_all() {
+  local st=0
+  file_state "$1" || st=$?
+  [ "$st" -eq 1 ] && return 0
+  [ "$st" -eq 0 ] || return 2
+  cat -- "$1" || return 2
+}
+hist_line() { read_rows "$HISTORY" line "$1"; }
+hist_without() { read_rows "$HISTORY" others "$1"; }
+rows_without() { read_rows "$STATE" others "$1"; }
+
+# row_kind IP: what the ban list says about IP: "none" (no row), "perm" (every row of IP has expires_at 0), "temp" (a row with an expiry).
+# Status 2 when the ban list cannot be read. Only a "perm" row satisfies a permanent entry.
+row_kind() {
+  local st=0
+  file_state "$STATE" || st=$?
+  [ "$st" -eq 1 ] && { echo none; return 0; }
+  [ "$st" -eq 0 ] || return 2
+  awk -F '\t' -v ip="$1" '$1 == ip { f = 1; if ($3 != "0") bad = 1 } END { print (!f ? "none" : (bad ? "temp" : "perm")) }' "$STATE" || return 2
 }
 
 # reason_for IP: which failure kinds the log shows for IP (only fixed words are returned)
@@ -263,12 +328,20 @@ reason_for() {
   esac
 }
 
-# ban_row IP FAILURES REASON BANNED_AT EXPIRES_AT: the ban list with the row of IP added or replaced (the caller holds the lock)
-ban_row() {
-  {
-    rows_without "$1"
-    printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$4" "$5" "$2" "$3"
-  } | write_rows
+# rows_with IP FAILURES REASON BANNED_AT EXPIRES_AT: the ban list content with the row of IP added or replaced (a producer for publish)
+rows_with() {
+  rows_without "$1" || return 1
+  printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$4" "$5" "$2" "$3"
+}
+
+# ban_row IP FAILURES REASON BANNED_AT EXPIRES_AT: replace (or add) the row of IP (the caller holds the lock); fails, leaving the ban list
+# as it was, when the current ban list cannot be read completely
+ban_row() { publish "$STATE" rows_with "$@"; }
+
+# hist_with IP N FIRST LAST PERM REASON FAILURES: the history content with the row of IP added or replaced (a producer for publish)
+hist_with() {
+  hist_without "$1" || return 1
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@"
 }
 
 # txn_ban IP FAILURES REASON NOW MODE: the history and ban list part of a ban, under the lock. MODE is auto (fail2ban) or manual.
@@ -276,7 +349,7 @@ ban_row() {
 txn_ban() {
   local ip="$1" fails="$2" reason="$3" now="$4" mode="$5"
   local line prev_n=0 first="$4" last="$4" prev_perm=0 n perm newperm=0 expires boot=0
-  line="$(hist_line "$ip")"
+  line="$(hist_line "$ip")" || { echo "ovpn-ban: cannot read the ban history $HISTORY: $ip not recorded" >&2; return 1; }
   if [ -n "$line" ]; then
     IFS=$'\t' read -r _ prev_n first last prev_perm _ <<< "$line"
     [[ "$prev_n" =~ ^[0-9]{1,10}$ ]] || prev_n=0
@@ -308,10 +381,7 @@ txn_ban() {
   [ "$perm" = "1" ] && [ "$prev_perm" = "0" ] && newperm=1
   expires=$((now + BANTIME))
   [ "$perm" = "1" ] && expires=0
-  {
-    hist_without "$ip"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ip" "$n" "$first" "$last" "$perm" "$reason" "$fails"
-  } | write_hist || return 1
+  publish "$HISTORY" hist_with "$ip" "$n" "$first" "$last" "$perm" "$reason" "$fails" || return 1
   # 2 = the history (authoritative for permanence) is written, the row is not: setup/check restore the row of a permanent entry
   ban_row "$ip" "$fails" "$reason" "$now" "$expires" || return 2
   echo "$perm $newperm $expires"
@@ -325,9 +395,12 @@ txn_ban_fw() {
   local ip="$1" fails="$2" reason="$3" mode="$4" fam="$5" chain now out rc added=0
   chain="$(chain_of "$fam")"
   reconcile_removals || echo "ovpn-ban: WARNING: a pending removal could not be completed yet" >&2
-  if removal_has "$ip"; then
-    removal_drop "$ip" || { echo "ovpn-ban: cannot clear the pending removal of $ip: not banned" >&2; return 1; }
-  fi
+  removal_has "$ip"; rc=$?
+  case "$rc" in
+    0) removal_drop "$ip" || { echo "ovpn-ban: cannot clear the pending removal of $ip: not banned" >&2; return 1; } ;;
+    1) ;;
+    *) echo "ovpn-ban: cannot read the removal journal $REMOVALS: $ip not banned" >&2; return 1 ;;
+  esac
   ensure_chain "$fam" || { echo "ovpn-ban: cannot create chain $chain" >&2; return 1; }
   fw_has "$fam" "$ip"; rc=$?
   case "$rc" in
@@ -369,16 +442,28 @@ notify_ban() {
   return 0
 }
 
-# fw_has FAMILY IP: is there a DROP rule for IP? 0 = present, 1 = verified absent (the chain exists without the rule, or the whole
+# fw_listed CHAIN IP: reads "iptables -S CHAIN" on stdin; 0 when it lists the rule "-A CHAIN -s IP -j DROP" (the source printed as IP, IP/32 or
+# IP/128, no other match: the shape ovpn-ban.sh adds and "-C -s IP -j DROP" asks for)
+fw_listed() {
+  awk -v chain="$1" -v ip="$2" '
+    $1 == "-A" && $2 == chain && NF == 6 && $3 == "-s" && $5 == "-j" && $6 == "DROP" && ($4 == ip || $4 == ip "/32" || $4 == ip "/128") { found = 1 }
+    END { exit !found }'
+}
+
+# fw_has FAMILY IP: is there a DROP rule for IP? 0 = present, 1 = verified absent (the chain listing was read and has no such rule, or the whole
 # ruleset can be read and has no such chain), 2 = the firewall cannot be read (state unknown, never to be treated as absent).
-# "iptables -C" exits 1 for a missing rule and also for a missing chain; any other status is an error.
+# "iptables -C" exits 1 for a missing rule and also for a missing chain, and a backend is not trusted to use 1 for nothing else: after status 1
+# the chain listing ("-S chain") is read and searched for the rule. A rule that "-C" did not find but the listing shows counts as present.
 fw_has() {
-  local fam="$1" ip="$2" chain rc all
+  local fam="$1" ip="$2" chain rc all listing
   chain="$(chain_of "$fam")"
   ipt "$fam" -C "$chain" -s "$ip" -j DROP >/dev/null 2>&1 && return 0
   rc=$?
   [ "$rc" -eq 1 ] || return 2
-  ipt "$fam" -S "$chain" >/dev/null 2>&1 && return 1
+  if listing="$(ipt "$fam" -S "$chain" 2>/dev/null)"; then
+    fw_listed "$chain" "$ip" <<< "$listing"
+    case "$?" in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
+  fi
   all="$(ipt "$fam" -S 2>/dev/null)" || return 2
   if grep -qxF -- "-N $chain" <<< "$all"; then return 2; fi
   return 1
@@ -401,33 +486,59 @@ fw_remove() {
   return 1
 }
 
-# Removal journal (see the header): one canonical address per line, rewritten atomically, only under the state lock.
-removal_has() { [ -f "$REMOVALS" ] && grep -qxF -- "$1" "$REMOVALS"; }
-removal_without() {
-  [ -f "$REMOVALS" ] || return 0
-  awk -v ip="$1" '$0 != ip && $0 != ""' "$REMOVALS"
+# Removal journal (see the header): one canonical address per line, rewritten atomically, only under the state lock. Like the other state
+# files it is read with an explicit result: removal_has returns 0 = journaled, 1 = not journaled (or no journal yet), 2 = journal unreadable.
+removal_has() {
+  local st=0
+  file_state "$REMOVALS" || st=$?
+  [ "$st" -eq 1 ] && return 1
+  [ "$st" -eq 0 ] || return 2
+  grep -qxF -- "$1" "$REMOVALS"
+  case "$?" in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
 }
-removal_add() { { removal_without "$1"; echo "$1"; } | write_file "$REMOVALS"; }
-removal_drop() { removal_has "$1" || return 0; removal_without "$1" | write_file "$REMOVALS"; }
-row_has() { [ -f "$STATE" ] && awk -F '\t' -v ip="$1" '$1 == ip { f = 1 } END { exit !f }' "$STATE"; }
+removal_without() {
+  local st=0
+  file_state "$REMOVALS" || st=$?
+  [ "$st" -eq 1 ] && return 0
+  [ "$st" -eq 0 ] || return 2
+  awk -v ip="$1" '$0 != ip && $0 != ""' "$REMOVALS" || return 2
+}
+removal_with() { removal_without "$1" || return 1; echo "$1"; }
+removal_add() { publish "$REMOVALS" removal_with "$1"; }
+removal_drop() {
+  local rc=0
+  removal_has "$1" || rc=$?
+  [ "$rc" -eq 1 ] && return 0
+  [ "$rc" -eq 0 ] || return 1
+  publish "$REMOVALS" removal_without "$1"
+}
 
 # removal_apply IP FAMILY: carry out a recorded removal (idempotent, every step can be repeated): DROP rule (absence read back), row, history
-# entry, then verify all three and clear the journal line. Returns 1 at the first step that fails; the journal line stays.
+# entry, then verify all three and clear the journal line. Returns 1 at the first step that fails, including every read error of the ban
+# list or the history (an unreadable file is not an absent entry); the journal line then stays and the next ban engine operation repeats the
+# removal. Replacements of the ban list and the history are published only after their old content was read completely (publish).
 removal_apply() {
-  local ip="$1" fam="$2" rc
+  local ip="$1" fam="$2" rc line rk
   fw_remove "$fam" "$ip" || return 1
-  rows_without "$ip" | write_rows || return 1
-  if [ -n "$(hist_line "$ip")" ]; then hist_without "$ip" | write_hist || return 1; fi
+  publish "$STATE" rows_without "$ip" || { echo "ovpn-ban: cannot rewrite the ban list $STATE: removal of $ip not complete" >&2; return 1; }
+  line="$(hist_line "$ip")" || { echo "ovpn-ban: cannot read the ban history $HISTORY: removal of $ip not complete" >&2; return 1; }
+  if [ -n "$line" ]; then
+    publish "$HISTORY" hist_without "$ip" || { echo "ovpn-ban: cannot rewrite the ban history $HISTORY: removal of $ip not complete" >&2; return 1; }
+  fi
   fw_has "$fam" "$ip"; rc=$?
   [ "$rc" -eq 1 ] || { echo "ovpn-ban: $ip is still in the firewall after its removal" >&2; return 1; }
-  if row_has "$ip" || [ -n "$(hist_line "$ip")" ]; then echo "ovpn-ban: $ip is still in the ban list or history after its removal" >&2; return 1; fi
+  rk="$(row_kind "$ip")" || { echo "ovpn-ban: cannot read the ban list $STATE: removal of $ip not verified" >&2; return 1; }
+  line="$(hist_line "$ip")" || { echo "ovpn-ban: cannot read the ban history $HISTORY: removal of $ip not verified" >&2; return 1; }
+  if [ "$rk" != "none" ] || [ -n "$line" ]; then echo "ovpn-ban: $ip is still in the ban list or history after its removal" >&2; return 1; fi
   removal_drop "$ip" || return 1
 }
 
-# reconcile_removals: complete every removal left in the journal (the caller holds the lock). Fails when one cannot be completed.
+# reconcile_removals: complete every removal left in the journal (the caller holds the lock). Fails when one cannot be completed or when the
+# journal itself cannot be read (the pending removals are then unknown).
 reconcile_removals() {
-  local ip rc=0
-  [ -s "$REMOVALS" ] || return 0
+  local ip rc=0 data
+  data="$(read_all "$REMOVALS")" || { echo "ovpn-ban: ERROR: cannot read the removal journal $REMOVALS: pending removals unknown" >&2; return 1; }
+  [ -n "$data" ] || return 0
   while IFS= read -r ip <&3; do
     [ -n "$ip" ] || continue
     if ! classify_ip "$ip"; then
@@ -440,39 +551,41 @@ reconcile_removals() {
       echo "ovpn-ban: WARNING: the pending removal of $IP is not complete yet" >&2
       rc=1
     fi
-  done 3< "$REMOVALS"
+  done 3<<< "$data"
   return "$rc"
 }
 
 # txn_unban IP FAMILY FORCE: under the lock. A permanent address (history flag, or a row without expiry) is kept unless FORCE=1.
 # FORCE=1 records the removal in the journal first (the commit point), then applies it (removal_apply): from there on it always ends in
-# "unbanned", even when a step fails and the caller is told so. Success is only reported after absence is verified.
+# "unbanned", even when a step fails (an unreadable history or ban list included) and the caller is told so: the journal line stays and the
+# removal is repeated by the next operation, never reversed. Success is only reported after absence is verified. Without FORCE the
+# permanence decision needs the history and the ban list: when one cannot be read the state is unknown and the unban fails (nothing changed).
 txn_unban() {
-  local ip="$1" fam="$2" force="$3" line perm=0 rowexp
+  local ip="$1" fam="$2" force="$3" line perm=0 rk
   reconcile_removals || echo "ovpn-ban: WARNING: a pending removal could not be completed yet" >&2
-  line="$(hist_line "$ip")"
-  if [ -n "$line" ]; then
-    IFS=$'\t' read -r _ _ _ _ perm _ <<< "$line"
-  fi
-  if [ "$perm" != "1" ] && [ -f "$STATE" ]; then
-    rowexp="$(awk -F '\t' -v ip="$ip" '$1 == ip { print $3; exit }' "$STATE")"
-    [ "$rowexp" = "0" ] && perm=1
-  fi
-  if [ "$perm" = "1" ] && [ "$force" != "1" ]; then
-    echo "ovpn-ban: $ip is permanently banned, unban ignored (use unban $ip --force)" >&2
-    return 0
-  fi
   if [ "$force" = "1" ]; then
     removal_add "$ip" || { echo "ovpn-ban: cannot record the removal of $ip: nothing was changed" >&2; return 1; }
     removal_apply "$ip" "$fam" || { echo "ovpn-ban: removal of $ip is recorded but not complete: the next ban engine operation finishes it, it is not restored" >&2; return 1; }
     return 0
   fi
+  line="$(hist_line "$ip")" || { echo "ovpn-ban: cannot read the ban history $HISTORY: unban of $ip not done" >&2; return 1; }
+  if [ -n "$line" ]; then
+    IFS=$'\t' read -r _ _ _ _ perm _ <<< "$line"
+  fi
+  if [ "$perm" != "1" ]; then
+    rk="$(row_kind "$ip")" || { echo "ovpn-ban: cannot read the ban list $STATE: unban of $ip not done" >&2; return 1; }
+    [ "$rk" = "perm" ] && perm=1
+  fi
+  if [ "$perm" = "1" ]; then
+    echo "ovpn-ban: $ip is permanently banned, unban ignored (use unban $ip --force)" >&2
+    return 0
+  fi
   fw_remove "$fam" "$ip" || return 1
-  rows_without "$ip" | write_rows || return 1
+  publish "$STATE" rows_without "$ip" || return 1
   return 0
 }
 
-do_clear_rows() { : | write_rows; }
+do_clear_rows() { : | write_file "$STATE"; }
 
 # flush_chains: empty both chains when they exist; fails only when an existing chain cannot be emptied
 flush_chains() {
@@ -500,9 +613,12 @@ cmd_init() {
 
 # perm_entries: one line "IP FAM" per permanent entry of the history that is to be enforced now. Not listed: addresses with a pending
 # removal, entries that are not a bannable address (warning), IPv6 entries with IPv6 off (the intentional opt-out, warning).
+# Returns 2, listing nothing trustworthy, when the history or the removal journal exists but cannot be read: a failed enumeration is an error,
+# never "no permanent entries". A history file that does not exist (first start) has no entries and is a success.
 perm_entries() {
-  local line ip n first last perm reason fails
-  [ -f "$HISTORY" ] || return 0
+  local line ip n first last perm reason fails data jr
+  data="$(read_all "$HISTORY")" || { echo "ovpn-ban: ERROR: cannot read the ban history $HISTORY" >&2; return 2; }
+  [ -n "$data" ] || return 0
   while IFS= read -r line || [ -n "$line" ]; do
     IFS=$'\t' read -r ip n first last perm reason fails <<< "$line"
     [ "$perm" = "1" ] || continue
@@ -510,13 +626,19 @@ perm_entries() {
       echo "ovpn-ban: WARNING: permanent entry skipped, not a bannable address: $ip" >&2
       continue
     fi
-    removal_has "$IP" && continue
+    jr=0
+    removal_has "$IP" || jr=$?
+    case "$jr" in
+      0) continue ;;
+      1) ;;
+      *) echo "ovpn-ban: ERROR: cannot read the removal journal $REMOVALS" >&2; return 2 ;;
+    esac
     if [ "$FAM" = "6" ] && [ "$V6" != "true" ]; then
       echo "ovpn-ban: WARNING: permanent ban of $IP NOT restored: IPv6 is not enabled" >&2
       continue
     fi
     echo "$IP $FAM"
-  done < "$HISTORY"
+  done <<< "$data"
 }
 
 # fail_status REQUIRED6_FAILURES OTHER_FAILURES: 3 when a required IPv6 enforcement is missing, 1 for any other failure, else 0
@@ -530,8 +652,12 @@ fail_status() {
 # stops the others, but any failure of an enforced family is returned (see fail_status). Skipped, not failed: IPv6 entries when IPv6 is off
 # or, with OVPN_BAN_IPV6_REQUIRED=false, when the IPv6 chain cannot be created (the intentional opt-outs), entries that are not an address.
 restore_permanent() {
-  local line ip n first last perm reason fails fam chain count=0 skipped=0 failed=0 req6=0 other=0 rc
-  [ -f "$HISTORY" ] || return 0
+  local line ip n first last perm reason fails fam chain count=0 skipped=0 failed=0 req6=0 other=0 rc data jr jst=0
+  # the whole history is read, and the journal checked, BEFORE anything is restored: an unreadable file is an error (status 1), not an empty history
+  data="$(read_all "$HISTORY")" || { echo "ovpn-ban: ERROR: cannot read the ban history $HISTORY: the permanent bans are unknown, nothing restored" >&2; return 1; }
+  file_state "$REMOVALS" || jst=$?
+  [ "$jst" -ne 2 ] || { echo "ovpn-ban: ERROR: cannot read the removal journal $REMOVALS: nothing restored" >&2; return 1; }
+  [ -n "$data" ] || return 0
   while IFS= read -r line || [ -n "$line" ]; do
     IFS=$'\t' read -r ip n first last perm reason fails <<< "$line"
     [ "$perm" = "1" ] || continue
@@ -540,9 +666,15 @@ restore_permanent() {
       skipped=$((skipped + 1))
       continue
     fi
-    if removal_has "$IP"; then
+    jr=0
+    removal_has "$IP" || jr=$?
+    if [ "$jr" -eq 0 ]; then
       echo "ovpn-ban: WARNING: permanent entry of $IP skipped, its removal is pending" >&2
       skipped=$((skipped + 1))
+      continue
+    elif [ "$jr" -ne 1 ]; then
+      echo "ovpn-ban: ERROR: cannot read the removal journal $REMOVALS: $IP not restored" >&2
+      failed=$((failed + 1)); other=$((other + 1))
       continue
     fi
     fam="$FAM"
@@ -582,7 +714,7 @@ restore_permanent() {
       continue
     fi
     count=$((count + 1))
-  done < "$HISTORY"
+  done <<< "$data"
   echo "ovpn-ban: restored $count permanent ban(s)$([ "$skipped" -gt 0 ] && echo ", $skipped skipped")$([ "$failed" -gt 0 ] && echo ", $failed FAILED")" >&2
   fail_status "$req6" "$other"
 }
@@ -596,19 +728,31 @@ txn_restore() {
   return "$rc"
 }
 
-# verify_permanent: every permanent entry that is to be enforced (perm_entries) has its DROP rule and its row; 0, or the fail_status.
-# A rule that cannot be read counts as missing.
+# verify_permanent: every permanent entry that is to be enforced (perm_entries) has its DROP rule and a PERMANENT row (expires_at=0: a
+# temporary row of the address does not count, the UI could expire it); 0, or the fail_status. A rule or a row that cannot be read counts as
+# missing; a history that cannot be enumerated fails the verification (status 1).
 verify_permanent() {
-  local ip fam rc req6=0 other=0
+  local ip fam rc rk rrc why req6=0 other=0 entries
+  entries="$(perm_entries 2>/dev/null)" || { echo "ovpn-ban: ERROR: cannot enumerate the permanent bans of the history $HISTORY: enforcement not verified" >&2; return 1; }
   while read -r ip fam <&3; do
     [ -n "$ip" ] || continue
     if [ "$fam" = "6" ] && [ "$V6_REQUIRED" != "true" ] && ! jumps_ok 6; then continue; fi
     fw_has "$fam" "$ip"; rc=$?
-    if [ "$rc" -ne 0 ] || ! row_has "$ip"; then
-      echo "ovpn-ban: ERROR: expected permanent ban of $ip is not enforced$([ "$rc" -eq 2 ] && echo " (firewall unreadable)")" >&2
+    rrc=0
+    rk="$(row_kind "$ip")" || rrc=$?
+    why=""
+    [ "$rc" -eq 1 ] && why=" (no DROP rule)"
+    [ "$rc" -eq 2 ] && why=" (firewall unreadable)"
+    if [ "$rc" -eq 0 ]; then
+      if [ "$rrc" -ne 0 ]; then why=" (ban list unreadable)"
+      elif [ "$rk" = "none" ]; then why=" (no row)"
+      elif [ "$rk" != "perm" ]; then why=" (row is temporary, expires_at is not 0)"; fi
+    fi
+    if [ "$rc" -ne 0 ] || [ "$rrc" -ne 0 ] || [ "$rk" != "perm" ]; then
+      echo "ovpn-ban: ERROR: expected permanent ban of $ip is not enforced$why" >&2
       if [ "$fam" = "6" ] && [ "$V6_REQUIRED" = "true" ]; then req6=$((req6 + 1)); else other=$((other + 1)); fi
     fi
-  done 3< <(perm_entries 2>/dev/null)
+  done 3<<< "$entries"
   fail_status "$req6" "$other"
 }
 
