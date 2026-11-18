@@ -1,6 +1,6 @@
 # ovpn-admin v0.1.6 release notes
 
-**Status: not published.** Nothing is tagged, released, pushed or packaged yet. The v0.1.6 tag, the GitHub release, the GHCR images, the binaries and the chart release all need approval first.
+**Status: published.** Tag `v0.1.6`, GitHub release with amd64/arm64 binaries, GHCR images, chart release.
 
 - Candidate: branch `v0.1.6`, code SHA `04e0b864fb67e354c8ec92f15e584ed77844d911`. The commit that adds this file sits on top of it and changes only `RELEASE-v0.1.6.md`, `README.md` and `UPGRADING.md`.
 - QA: `qa-v016/REPORT.md` (card t_5b0c4dbd), verdict **SHIP** at the candidate SHA. Items 1 to 12 PASS, plus the three fail-closed recovery paths. Real OpenVPN 2.7.7 clients. Telegram was a local mock. The UI ran in local headless Chromium.

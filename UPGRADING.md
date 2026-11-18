@@ -201,7 +201,7 @@ Known limits of this upgrade: a real upgrade run was not done (QA used a fresh s
 
 ## v0.1.5 → v0.1.6
 
-Status: not published. v0.1.6 is not tagged or released yet. The steps below apply once the images are built from the v0.1.6 checkout. Details: [RELEASE-v0.1.6.md](RELEASE-v0.1.6.md).
+Status: published. v0.1.6 is tagged and released. Details: [RELEASE-v0.1.6.md](RELEASE-v0.1.6.md).
 
 1. **Note your current version** (`git describe --tags --always`, or the image tags). You need it for a rollback.
 2. **Update the checkout and the compose file.** Use the v0.1.6 `docker-compose.yaml` (or `docker-compose-slave.yaml` on a slave). It adds `OVPN_BAN_REPEAT_COUNT` (default `2`). Re-apply your own edits (network, ports, `OVPN_*`, `BASIC_*`, `OVPN_MASTER_TOKEN`, Telegram settings). If you keep your own compose file, you can skip the new variable: the default is the same in the script.
