@@ -8,6 +8,7 @@ Pick your section:
 * [v0.1.1 → v0.1.2](#v011--v012)
 * [v0.1.2 → v0.1.3](#v012--v013)
 * [v0.1.3 → v0.1.4](#v013--v014) (release candidate, not published)
+* [v0.1.4 → v0.1.5](#v014--v015) (release candidate, not published)
 * [upstream → v0.1.x](#upstream--v01x)
 
 Kubernetes/Helm deployments: see `charts/openvpn-admin/README.md`. The historical notes of the first release stay in `UPGRADING-v0.1.0.md`.
@@ -174,6 +175,28 @@ Status: release candidate. v0.1.4 is not tagged or published yet. The steps belo
 11. **Default allowlist:** `127.0.0.0/8`, `::1`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fe80::/10`. Unique-local IPv6 (`fd00::/8`, including the example compose subnet `fd00:172:20::/64`) is not on the list, so those sources can be banned. `OVPN_BAN_IGNOREIP` replaces the whole default list, so copy the entries you want to keep.
 
 Rollback: as in the Rollback section below, with `--previous-ref` set to the old tag, and keep the audit volume so the login history is kept. A downgrade with the new `openvpn.log` and `bans.tsv` files in place was not tested.
+
+## v0.1.4 → v0.1.5
+
+Status: release candidate. v0.1.5 is not tagged or published yet. The steps below apply once the images are built from the v0.1.5 checkout. Details: [RELEASE-v0.1.5.md](RELEASE-v0.1.5.md).
+
+1. **Note your current version** (`git describe --tags --always`, or the image tags). You need it for a rollback.
+2. **Update the checkout and the compose file.** Use the v0.1.5 `docker-compose.yaml` (or `docker-compose-slave.yaml` on a slave). It adds the seven `OVPN_TELEGRAM_*` variables with their defaults. Re-apply your own edits (network, ports, `OVPN_*`, `BASIC_*`, `OVPN_MASTER_TOKEN`).
+3. **Rebuild the images.** The Telegram notifier is in the `openvpn` image, so rebuild it. The `ovpn-admin` image changed only in its version string; rebuild it from the same checkout. Use `scripts/upgrade.sh --target-version v0.1.5 --previous-ref <old ref> --project-dir <dir>` (it backs up first and builds with `--pull`), or run `docker compose up -d --build` by hand.
+4. **No database migration.** `easyrsa_master/`, `ccd_master/` and `users.db` are not changed. The v0.1.4 to v0.1.5 diff has no schema or SQL change. No new files appear in the audit volume.
+5. **Notifications are off by default.** Nothing is sent after the upgrade until you set `OVPN_TELEGRAM_ENABLED=true`. The variables, all optional until you enable notifications:
+   * `OVPN_TELEGRAM_ENABLED` (`false`): `true` turns notifications on. It needs a token and a chat id.
+   * `OVPN_TELEGRAM_BOT_TOKEN` (empty): the bot token from BotFather.
+   * `OVPN_TELEGRAM_BOT_TOKEN_FILE` (empty): a file whose first line is the token. It wins over `OVPN_TELEGRAM_BOT_TOKEN`. Prefer it: mount it read-only and keep it out of the repository.
+   * `OVPN_TELEGRAM_CHAT_ID` (empty): the chat id, or `@channelname`.
+   * `OVPN_TELEGRAM_THREAD_ID` (empty): an optional forum topic id.
+   * `OVPN_TELEGRAM_API_BASE` (`https://api.telegram.org`): keep it on `https://`.
+   * `OVPN_TELEGRAM_ALLOW_HTTP` (`false`): accepts an `http://` base. For local mock tests only.
+
+   Setup steps and the message format are in the README section [Telegram notifications](README.md#telegram-notifications).
+6. **Verify.** Check the start log: `docker compose -p openvpn-master logs openvpn | grep -i telegram` should print `telegram notifications: disabled` (the default) or `telegram notifications: enabled`. A bad setting prints one `ERROR` line and the VPN still starts. Then run `curl -fsS http://127.0.0.1:8080/ping`, log in to the UI with the Basic Auth user, and check the ban engine as in the v0.1.4 section.
+
+Known limits of this upgrade: a real upgrade run was not done (QA used a fresh stack with a local mock). The real Telegram API was not called. A downgrade was not tested. Restarts can send messages again for addresses still inside the find time. See `RELEASE-v0.1.5.md`, Known limitations.
 
 ## upstream → v0.1.x
 

@@ -19,6 +19,7 @@ Simple web UI to manage OpenVPN users, their certificates & routes in Linux. Whi
 * Automatic banning of sources that make repeated failed logins or present revoked certificates, run by fail2ban inside the OpenVPN container, IPv4 and IPv6 (see [Ban engine](#ban-engine)). New in v0.1.4.
 * Read-only **Banned IPs** view in the admin UI (see [Banned IPs](#banned-ips)).
 * Mobile-first web UI: phone cards, a table on tablet and desktop, sheet dialogs (see [Mobile support](#mobile-support)). New in v0.1.4.
+* (optionally) A Telegram message for every new ban, off by default (see [Telegram notifications](#telegram-notifications)). New in v0.1.5.
 
 ### Screenshots
 
@@ -30,7 +31,7 @@ An example of dashboard made using ovpn-admin metrics:
 
 ## Installation
 
-Release notes for this version: [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md) (published with the v0.1.4 release). Earlier releases: [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md), [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0, v0.1.1, v0.1.2 or v0.1.3: [UPGRADING.md](UPGRADING.md).
+Release notes for this version: [RELEASE-v0.1.5.md](RELEASE-v0.1.5.md) (v0.1.5 is not published yet). Earlier releases: [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md), [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md), [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0 to v0.1.4: [UPGRADING.md](UPGRADING.md). Upgrading from v0.1.4 to v0.1.5: [UPGRADING.md](UPGRADING.md#v014--v015).
 
 ### 1. Docker
 
@@ -53,7 +54,7 @@ export OVPN_MASTER_TOKEN="$(openssl rand -hex 32)"
 ./start.sh
 ```
 #### 1.1
-Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.2`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`. The v0.1.2 images are published with the v0.1.2 release. The v0.1.3 images are published with the v0.1.3 release. The v0.1.4 images are published with the v0.1.4 release.
+Ready docker images are published to the GitHub Container Registry: [`ghcr.io/haumanto/ovpn-admin/ovpn-admin`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fovpn-admin) for ovpn-admin and [`ghcr.io/haumanto/ovpn-admin/openvpn`](https://github.com/haumanto/ovpn-admin/pkgs/container/ovpn-admin%2Fopenvpn) for openvpn-server. Tags are the release tags (`$VERSION`, e.g. `v0.1.2`) and `master` (the latest build of the master branch). Images are built for `linux/amd64` and `linux/arm64`. The v0.1.2 images are published with the v0.1.2 release. The v0.1.3 images are published with the v0.1.3 release. The v0.1.4 images are published with the v0.1.4 release. The v0.1.5 images are not published yet.
 
 ### 2. Building from source
 
@@ -233,6 +234,38 @@ The `openvpn` container runs fail2ban 1.1.0 (jail `ovpn-admin`). It reads `openv
 
 Full list, measured behavior and limits: [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md). Check the filter against your own log with `fail2ban-regex`, as described in [docs/hardening/README.md](docs/hardening/README.md).
 
+### Telegram notifications
+
+Off by default. With it on, every new ban sends one plain-text message to a Telegram chat or forum topic. Unban sends nothing. A failed send logs one warning and never undoes the ban. Details, limits and token notes: [RELEASE-v0.1.5.md](RELEASE-v0.1.5.md).
+
+Setup (not tested against the real Telegram API in QA):
+
+1. **Create a bot.** In Telegram, send `/newbot` to `@BotFather` and copy the token. Save it in a file outside the repo, mode 0600.
+2. **Get the chat id.** Add the bot to the chat and send a message there. Open `https://api.telegram.org/bot<BOT_TOKEN>/getUpdates` and read `chat.id` (groups and channels are negative, starting with `-100`). The URL contains the token: do not share it. Optional: the thread id of a forum topic is the second number in its message link.
+3. **Set the variables and start.** Uncomment the read-only token mount in `docker-compose.yaml` (`- /path/on/host/telegram-bot-token:/run/secrets/telegram-bot-token:ro`), then set `OVPN_TELEGRAM_ENABLED=true`, `OVPN_TELEGRAM_BOT_TOKEN_FILE=/run/secrets/telegram-bot-token` and `OVPN_TELEGRAM_CHAT_ID=<chat id>`, and run `docker compose up -d --build`. The start log should print `telegram notifications: enabled`.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `OVPN_TELEGRAM_ENABLED` | `false` | `true` turns notifications on (needs a token and a chat id) |
+| `OVPN_TELEGRAM_BOT_TOKEN` | empty | token from BotFather. Prefer the file below |
+| `OVPN_TELEGRAM_BOT_TOKEN_FILE` | empty | path inside the container to a file whose first line is the token; wins over the variable |
+| `OVPN_TELEGRAM_CHAT_ID` | empty | chat id (`-100...` for groups) or `@channelname` |
+| `OVPN_TELEGRAM_THREAD_ID` | empty | optional forum topic id |
+| `OVPN_TELEGRAM_API_BASE` | `https://api.telegram.org` | Bot API base; keep it on `https://` |
+| `OVPN_TELEGRAM_ALLOW_HTTP` | `false` | accepts an `http://` base; local mock tests only |
+
+Message example:
+
+```
+🚫 ovpn-admin: banned 203.0.113.10
+Reason: auth-failed
+Attempts: 3
+Until: 2026-11-18 03:51 UTC
+Server: <container hostname>
+```
+
+A bad setting logs one `ERROR` line at start, notifications stay off, and the VPN still starts. Restarts can send again for addresses still inside the find time.
+
 ### Banned IPs
 
 The **Banned IPs** tab of the admin UI is a read-only list: IP address, reason, attempts, banned since, expires, and a count badge that matches the number of rows. It refreshes on a timer and has no unban control. Data comes from `GET /api/bans`, which reads `bans.tsv`. It sits behind the same Basic Auth as the rest of the UI.
@@ -243,7 +276,7 @@ The admin UI is mobile-first from v0.1.4. Up to 768 px each user is a card with 
 
 ## Upgrade notes
 
-Upgrading a docker compose deployment (upstream, v0.1.0, v0.1.1, v0.1.2, v0.1.3): follow [UPGRADING.md](UPGRADING.md); `scripts/upgrade.sh` backs up first and covers the audit volume. v0.1.4 steps: [UPGRADING.md](UPGRADING.md#v013--v014).
+Upgrading a docker compose deployment (upstream, v0.1.0, v0.1.1, v0.1.2, v0.1.3): follow [UPGRADING.md](UPGRADING.md); `scripts/upgrade.sh` backs up first and covers the audit volume. v0.1.4 steps: [UPGRADING.md](UPGRADING.md#v013--v014). v0.1.5 steps: [UPGRADING.md](UPGRADING.md#v014--v015).
 
 * **openvpn-user v1.0.4 → v1.0.9** (only relevant with password authentication, `--auth.password` / `OVPN_PASSWD_AUTH=true`). openvpn-user v1.0.9 adds the columns `secret` and `app_configured` to `users.db`. The column `secret` is added without a default value, so for every user whose password was saved by openvpn-user v1.0.4 or older it is `NULL`, and `openvpn-user auth` of v1.0.9 rejects these users (`converting NULL to string is unsupported`) — they cannot connect to the VPN any more. Users created by v1.0.9 are not affected. Additionally `openvpn-user db-migrate` does nothing on a database created by v1.0.4 until `openvpn-user db-init` has created the `migrations` table, and until the database is migrated `openvpn-user create` reports success without saving the user.
   * The Docker images handle this: `setup/configure.sh` of the openvpn image and ovpn-admin itself (when started with `--auth.password` or `--auth.db-init`) run `db-init` and `db-migrate` on start and then replace `NULL` in `secret` with an empty string (the value v1.0.9 stores for new users). All steps are idempotent.
