@@ -5,6 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="theme-color" content="#ffffff">
   <title>ovpn-admin</title>
+  <!-- Theme, before any stylesheet and before the first paint. v0.1.6 injects its CSS from dist/style.min.js at the
+       start of <body>, so this block carries the canvas colour itself. Keep it dependency-free and synchronous.
+       Storage: localStorage["ovpn-theme"] = light | dark | system (missing, invalid or blocked = system). -->
+  <style>html{background:#f6f8fa;color-scheme:light}html[data-theme="dark"]{background:#0d1117;color-scheme:dark}</style>
+  <script>(function(){var d=document.documentElement,p='system',dark=false;try{p=window.localStorage.getItem('ovpn-theme')||'system'}catch(e){}if(p!=='light'&&p!=='dark'){p='system'}try{dark=p==='dark'||(p==='system'&&window.matchMedia('(prefers-color-scheme: dark)').matches)}catch(e){}d.setAttribute('data-theme',dark?'dark':'light');d.setAttribute('data-theme-pref',p);d.style.colorScheme=dark?'dark':'light';var m=document.querySelector('meta[name="theme-color"]');if(m){m.setAttribute('content',dark?'#161b22':'#ffffff')}})();</script>
 </head>
 <body>
 <script src="dist/style.min.js"></script>
@@ -27,6 +32,9 @@
   <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
   <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 5h16l-6 7v6l-4 2v-8z"/></symbol>
   <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></symbol>
+  <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></symbol>
   <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M18 14.5a6.5 6.5 0 0 1 3.5 5.5"/></symbol>
 </svg>
 <div id="app" v-cloak>
@@ -40,6 +48,7 @@
         <a class="ov-tab" href="#bans" :aria-current="view == 'bans' ? 'page' : null" :aria-label="bansTabLabel"><svg class="ov-icon" aria-hidden="true"><use href="#i-ban"/></svg>Banned IPs <span class="ov-count ov-num" :class="{'ov-count-alert': bansCount > 0}" v-if="bansCount !== null" aria-hidden="true">{{ bansCount }}</span></a>
       </nav>
       <div class="ov-bar-end">
+        <button type="button" id="theme-btn" ref="themeBtn" class="ov-btn ov-btn-ghost ov-btn-icon ov-theme-btn" aria-haspopup="menu" :aria-expanded="themeMenuOpen ? 'true' : 'false'" aria-controls="theme-menu" :aria-label="themeLabel" :title="themeLabel" @click="toggleThemeMenu()" @keydown.down.prevent="openThemeMenu()" @keydown.up.prevent="openThemeMenu()"><svg class="ov-icon" aria-hidden="true"><use :href="themeIcon"/></svg></button>
         <button type="button" class="ov-btn ov-btn-ghost ov-btn-icon" aria-label="Refresh" :disabled="view == 'bans' ? bansRefreshing : refreshing" :aria-busy="(view == 'bans' ? bansRefreshing : refreshing) ? 'true' : null" @click="refreshView()"><svg class="ov-icon" :class="{'ov-spin': view == 'bans' ? bansRefreshing : refreshing}" aria-hidden="true"><use href="#i-refresh"/></svg></button>
         <button type="button" id="add-user-btn" class="ov-btn ov-btn-primary" v-if="serverRole == 'master'" :disabled="offline" @click="openAddUser()"><svg class="ov-icon" aria-hidden="true"><use href="#i-plus"/></svg><span class="ov-add-label">Add user</span><span class="visually-hidden ov-add-sr">Add user</span></button>
       </div>
@@ -273,6 +282,10 @@
   <!-- Row action menu -->
   <app-menu v-if="menu && menuRow" :title="menuRow.Identity" :subtitle="menuSubtitle" :items="menuItems" :anchor="menuAnchor"
     @select="selectMenuItem($event)" @close="closeMenu()"></app-menu>
+
+  <!-- Theme chooser: Light / Dark / System -->
+  <app-menu v-if="themeMenuOpen" id="theme-menu" title="Theme" subtitle="Saved in this browser only" aria-label="Theme" :items="themeItems" :anchor="themeAnchor" initial-focus="checked"
+    @select="setTheme($event.id)" @close="closeThemeMenu()"></app-menu>
 
   <!-- Add user -->
   <app-dialog v-if="dialog && dialog.kind == 'add'" title="Add user" :busy="dialog.busy" @close="closeDialog()">

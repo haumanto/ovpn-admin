@@ -1,14 +1,14 @@
 /* ovpn-admin v0.1.4 UI: mobile first.
    The base rules are the phone layout (<= 480 px). Layers are added with
    min-width queries: 481 (large phone), 769 (tablet), 1025 (desktop).
-   Tokens are split in three groups (primitives, roles, component) so that a
-   dark theme can later override the roles only. */
+   Tokens are split in three groups (primitives, roles, component). The dark
+   theme (v0.1.7) overrides the roles only: html[data-theme="dark"] is set by
+   the inline script in index.html, before the first paint. */
 
-/* 1. primitives */
+/* A1. primitives (light primitives are the v0.1.6 values, unchanged) */
 :root {
   --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Liberation Sans", Arial, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-
   --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 20px; --sp-6: 24px; --sp-8: 32px;
   --radius: 6px; --radius-lg: 10px; --radius-pill: 999px;
 
@@ -18,29 +18,45 @@
   --red-600: #b42318; --red-700: #8f1c13; --red-50: #fff1f0;
   --green-bg: #dafbe1; --green-text: #116329; --green-dot: #1a7f37;
   --yellow-bg: #fff8c5; --yellow-text: #6e4500; --yellow-border: #d4a72c;
+
+  /* dark primitives (new) */
+  --dk-0: #0d1117; --dk-1: #161b22; --dk-2: #1c2129; --dk-3: #1f252d; --dk-4: #2d333b; --dk-5: #30363d;
+  --dk-gray-500: #7d8590; --dk-gray-400: #9ea7b3; --dk-gray-300: #c1c8d1; --dk-gray-100: #e6edf3;
+  --dk-blue-600: #2f6fdf; --dk-blue-700: #2760c4; --dk-blue-300: #79b8ff; --dk-blue-400: #58a6ff;
+  --dk-blue-900: #132c4d; --dk-blue-800: #1a3a63; --dk-blue-sel: #264f78;
+  --dk-red-600: #c9302c; --dk-red-700: #ad2824; --dk-red-300: #ff7b72; --dk-red-200: #ffa198;
+  --dk-red-900: #2d1214; --dk-red-850: #3a1517;
+  --dk-green-900: #12361f; --dk-green-300: #7ee2a0; --dk-green-500: #3fb950;
+  --dk-yellow-900: #33270a; --dk-yellow-400: #e3b341; --dk-yellow-700: #9e6a03;
 }
 
-/* 2. roles */
+/* A2. roles: light (default). New roles are marked "new"; their light values equal
+   the colours v0.1.6 hard-codes, so light mode does not change. */
 :root {
-  --fs-small: 13px; --lh-small: 18px;
-  --fs-base: 15px; --lh-base: 22px;
-  --fs-title: 18px; --lh-title: 24px;
-  --fs-name: 16px;
+  color-scheme: light;
 
   --c-text: var(--gray-900);
   --c-text-muted: var(--gray-600);
   --c-surface: var(--white);
   --c-surface-alt: var(--gray-100);
+  --c-surface-raised: var(--white);          /* new: toasts, popover menu */
   --c-canvas: var(--gray-100);
   --c-border: var(--gray-300);
   --c-border-control: var(--gray-500);
+  --c-input-bg: var(--white);                /* new: was #fff in .ov-input */
+  --c-row-hover: #fbfcfd;                    /* new: was hard-coded in the table rule */
 
   --c-primary: var(--blue-600);
   --c-primary-hover: var(--blue-700);
   --c-primary-subtle: var(--blue-100);
+  --c-primary-subtle-hover: #cfe2ff;         /* new: was hard-coded in .ov-chip pressed hover */
+  --c-primary-text: var(--blue-700);         /* new: primary used as text (pressed chip label) */
+  --c-on-primary: var(--white);              /* new: label on primary fill */
   --c-danger: var(--red-600);
   --c-danger-hover: var(--red-700);
   --c-danger-subtle: var(--red-50);
+  --c-danger-text: var(--red-600);           /* new: danger used as text */
+  --c-on-danger: var(--white);               /* new: label on danger fill */
 
   --c-online-bg: var(--green-bg); --c-online-text: var(--green-text); --c-online-dot: var(--green-dot);
   --c-active-bg: var(--white); --c-active-text: var(--gray-900); --c-active-border: var(--gray-500);
@@ -48,9 +64,68 @@
   --c-revoked-bg: var(--gray-200); --c-revoked-text: var(--gray-700);
   --c-ban-bg: var(--red-50); --c-ban-text: var(--red-700);
 
-  --focus-ring: 0 0 0 2px #ffffff, 0 0 0 4px #0a58ca;
+  --c-scrim: rgba(31, 35, 40, .5);           /* new: was hard-coded twice */
+  --c-skel-a: #eef1f4; --c-skel-b: #f6f8fa;  /* new: was hard-coded in .ov-skel */
+  --c-selection: #b6d4fe;                    /* new: ::selection background */
+
+  --focus-color: var(--blue-600);            /* new */
+  --focus-gap: var(--white);                 /* new */
+  --focus-ring: 0 0 0 2px var(--focus-gap), 0 0 0 4px var(--focus-color);
   --shadow-float: 0 8px 24px rgba(31, 35, 40, .16), 0 1px 3px rgba(31, 35, 40, .12);
   --shadow-sticky: 0 1px 0 var(--c-border);
+}
+
+/* A3. roles: dark. Only roles change; components never read primitives directly. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --c-text: var(--dk-gray-100);
+  --c-text-muted: var(--dk-gray-400);
+  --c-surface: var(--dk-1);
+  --c-surface-alt: var(--dk-3);
+  --c-surface-raised: var(--dk-2);
+  --c-canvas: var(--dk-0);
+  --c-border: var(--dk-5);
+  --c-border-control: var(--dk-gray-500);
+  --c-input-bg: var(--dk-0);
+  --c-row-hover: var(--dk-2);
+
+  --c-primary: var(--dk-blue-600);
+  --c-primary-hover: var(--dk-blue-700);
+  --c-primary-subtle: var(--dk-blue-900);
+  --c-primary-subtle-hover: var(--dk-blue-800);
+  --c-primary-text: var(--dk-blue-300);
+  --c-on-primary: var(--white);
+  --c-danger: var(--dk-red-600);
+  --c-danger-hover: var(--dk-red-700);
+  --c-danger-subtle: var(--dk-red-900);
+  --c-danger-text: var(--dk-red-300);
+  --c-on-danger: var(--white);
+
+  --c-online-bg: var(--dk-green-900); --c-online-text: var(--dk-green-300); --c-online-dot: var(--dk-green-500);
+  --c-active-bg: var(--dk-1); --c-active-text: var(--dk-gray-100); --c-active-border: var(--dk-gray-500);
+  --c-warn-bg: var(--dk-yellow-900); --c-warn-text: var(--dk-yellow-400); --c-warn-border: var(--dk-yellow-700);
+  --c-revoked-bg: var(--dk-4); --c-revoked-text: var(--dk-gray-300);
+  --c-ban-bg: var(--dk-red-850); --c-ban-text: var(--dk-red-200);
+
+  --c-scrim: rgba(1, 4, 9, .72);
+  --c-skel-a: var(--dk-2); --c-skel-b: var(--dk-4);
+  --c-selection: var(--dk-blue-sel);
+
+  --focus-color: var(--dk-blue-400);
+  --focus-gap: var(--dk-1);
+  --shadow-float: 0 0 0 1px var(--dk-5), 0 8px 24px rgba(1, 4, 9, .6), 0 1px 3px rgba(1, 4, 9, .5);
+}
+
+html { background: var(--c-canvas); }
+::selection { background: var(--c-selection); color: var(--c-text); }
+
+/* type scale (roles shared by both themes) */
+:root {
+  --fs-small: 13px; --lh-small: 18px;
+  --fs-base: 15px; --lh-base: 22px;
+  --fs-title: 18px; --lh-title: 24px;
+  --fs-name: 16px;
 }
 
 /* 3. component */
@@ -109,11 +184,11 @@ body.ov-scroll-locked { overflow: hidden; }
   font: 500 var(--fs-base)/1.2 var(--font-sans); white-space: nowrap; cursor: pointer; text-decoration: none;
 }
 .ov-btn:hover { background: var(--c-surface-alt); }
-.ov-btn-primary { background: var(--c-primary); border-color: var(--c-primary); color: #fff; }
+.ov-btn-primary { background: var(--c-primary); border-color: var(--c-primary); color: var(--c-on-primary); }
 .ov-btn-primary:hover { background: var(--c-primary-hover); border-color: var(--c-primary-hover); }
-.ov-btn-danger { background: var(--c-danger); border-color: var(--c-danger); color: #fff; }
+.ov-btn-danger { background: var(--c-danger); border-color: var(--c-danger); color: var(--c-on-danger); }
 .ov-btn-danger:hover { background: var(--c-danger-hover); border-color: var(--c-danger-hover); }
-.ov-btn-danger-outline { color: var(--c-danger); border-color: var(--c-danger); }
+.ov-btn-danger-outline { color: var(--c-danger-text); border-color: var(--c-danger-text); }
 .ov-btn-danger-outline:hover { background: var(--c-danger-subtle); }
 .ov-btn-ghost { border-color: transparent; background: transparent; }
 .ov-btn-ghost:hover { background: var(--c-revoked-bg); }
@@ -127,34 +202,34 @@ body.ov-scroll-locked { overflow: hidden; }
   outline: none; box-shadow: var(--focus-ring);
 }
 #main:focus { outline: none; }
-.vgt-table th.sortable button:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--c-primary); }
+.vgt-table th.sortable button:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--focus-color); }
 
 .ov-input {
   display: block; width: 100%; min-height: var(--control-h); padding: 0 var(--sp-3);
   border: 1px solid var(--c-border-control); border-radius: var(--radius);
   font: 400 16px var(--font-sans); /* 16 px: no zoom-on-focus on iOS */
-  color: var(--c-text); background: #fff;
+  color: var(--c-text); background: var(--c-input-bg);
 }
 .ov-input::placeholder { color: var(--c-text-muted); opacity: 1; }
 .ov-input[readonly] { background: var(--c-surface-alt); }
-.ov-input[aria-invalid="true"] { border-color: var(--c-danger); }
+.ov-input[aria-invalid="true"] { border-color: var(--c-danger-text); }
 @media (min-width: 1025px) { .ov-input { font-size: var(--fs-base); } }
 
 .ov-field { display: flex; flex-direction: column; gap: var(--sp-1); margin-bottom: var(--sp-4); }
 .ov-label { display: block; font-weight: 600; margin: 0; }
 .ov-help { color: var(--c-text-muted); font-size: var(--fs-small); line-height: var(--lh-small); }
-.ov-error { color: var(--c-danger); font-size: var(--fs-small); line-height: var(--lh-small); }
+.ov-error { color: var(--c-danger-text); font-size: var(--fs-small); line-height: var(--lh-small); }
 .ov-pw-row { display: flex; gap: var(--sp-2); }
 .ov-pw-row .ov-input { flex: 1; min-width: 0; }
 
 .ov-alert {
-  background: var(--c-danger-subtle); color: var(--c-danger); border: 1px solid var(--c-danger);
+  background: var(--c-danger-subtle); color: var(--c-danger-text); border: 1px solid var(--c-danger-text);
   border-radius: var(--radius); padding: var(--sp-2) var(--sp-3); margin-top: var(--sp-3);
 }
 .ov-impact {
   border: 1px solid var(--c-border); border-radius: var(--radius); padding: var(--sp-3); background: var(--c-surface-alt);
 }
-.ov-impact strong { color: var(--c-danger); }
+.ov-impact strong { color: var(--c-danger-text); }
 .ov-bullets { margin: 0 0 var(--sp-3); padding-left: var(--sp-6); }
 
 /* ---- badges and counts ---- */
@@ -167,13 +242,13 @@ body.ov-scroll-locked { overflow: hidden; }
 .ov-badge-active { background: var(--c-active-bg); color: var(--c-active-text); border-color: var(--c-active-border); }
 .ov-badge-expired { background: var(--c-warn-bg); color: var(--c-warn-text); border-color: var(--c-warn-border); }
 .ov-badge-revoked { background: var(--c-revoked-bg); color: var(--c-revoked-text); height: auto; min-height: 24px; padding-top: 3px; padding-bottom: 3px; white-space: normal; }
-.ov-badge-permanent { background: var(--c-danger); color: #fff; }
+.ov-badge-permanent { background: var(--c-danger); color: var(--c-on-danger); }
 .ov-badge-reason { background: var(--c-ban-bg); color: var(--c-ban-text); height: auto; min-height: 24px; padding-top: 3px; padding-bottom: 3px; white-space: normal; border-radius: 12px; }
 .ov-count {
   display: inline-flex; align-items: center; justify-content: center; min-width: 22px; height: 22px; padding: 0 6px;
   border-radius: var(--radius-pill); background: var(--c-revoked-bg); color: var(--c-text); font: 600 12px/1 var(--font-sans);
 }
-.ov-count-alert { background: var(--c-danger); color: #fff; }
+.ov-count-alert { background: var(--c-danger); color: var(--c-on-danger); }
 
 /* ---- header (sticky at every width) ---- */
 .ov-header {
@@ -183,7 +258,7 @@ body.ov-scroll-locked { overflow: hidden; }
 }
 .ov-header-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0 var(--sp-2); min-height: 48px; }
 .ov-brand { display: flex; align-items: center; gap: var(--sp-2); font-weight: 700; font-size: 17px; margin-right: auto; }
-.ov-brand-mark { width: 28px; height: 28px; border-radius: var(--radius); background: var(--c-primary); color: #fff; display: grid; place-items: center; }
+.ov-brand-mark { width: 28px; height: 28px; border-radius: var(--radius); background: var(--c-primary); color: var(--c-on-primary); display: grid; place-items: center; }
 .ov-brand-mark .ov-icon { width: 18px; height: 18px; }
 .ov-bar-end { display: flex; gap: var(--sp-2); }
 .ov-add-label { display: none; }
@@ -221,10 +296,10 @@ body.ov-scroll-locked { overflow: hidden; }
 .ov-chip::after { content: ""; position: absolute; inset: -4px 0; } /* 44 px hit area */
 .ov-chip:hover { background: var(--c-surface-alt); }
 .ov-chip[aria-pressed="true"] {
-  background: var(--c-primary-subtle); border-color: var(--c-primary); color: var(--c-primary-hover); font-weight: 600;
+  background: var(--c-primary-subtle); border-color: var(--c-primary); color: var(--c-primary-text); font-weight: 600;
   box-shadow: inset 0 0 0 1px var(--c-primary);
 }
-.ov-chip[aria-pressed="true"]:hover { background: #cfe2ff; }
+.ov-chip[aria-pressed="true"]:hover { background: var(--c-primary-subtle-hover); }
 .ov-chip[aria-pressed="true"]:focus-visible { box-shadow: inset 0 0 0 1px var(--c-primary), var(--focus-ring); }
 .ov-chip .ov-icon { width: 16px; height: 16px; }
 .ov-chip[aria-pressed="true"] .ov-icon { stroke-width: 2.5; }
@@ -237,7 +312,7 @@ body.ov-scroll-locked { overflow: hidden; }
   font-size: var(--fs-small); line-height: var(--lh-small);
 }
 .ov-banner-warn { background: var(--c-warn-bg); border-color: var(--c-warn-border); color: var(--c-warn-text); }
-.ov-banner-error { background: var(--c-danger-subtle); border-color: var(--c-danger); color: var(--c-danger); margin-bottom: 0; }
+.ov-banner-error { background: var(--c-danger-subtle); border-color: var(--c-danger-text); color: var(--c-danger-text); margin-bottom: 0; }
 .ov-banner .ov-btn { margin-left: auto; min-height: 36px; flex: 0 0 auto; }
 .ov-state {
   display: flex; flex-direction: column; align-items: center; gap: var(--sp-3); text-align: center; padding: var(--sp-8) var(--sp-4);
@@ -248,7 +323,7 @@ body.ov-scroll-locked { overflow: hidden; }
 .ov-table-wrap .ov-state { border: 0; border-radius: 0; }
 .ov-skel {
   height: 96px; margin-bottom: var(--sp-2); border-radius: var(--radius-lg);
-  background: linear-gradient(90deg, #eef1f4 0, #f6f8fa 50%, #eef1f4 100%); background-size: 200% 100%; animation: ov-shimmer 1.4s linear infinite;
+  background: linear-gradient(90deg, var(--c-skel-a) 0, var(--c-skel-b) 50%, var(--c-skel-a) 100%); background-size: 200% 100%; animation: ov-shimmer 1.4s linear infinite;
 }
 .ov-note { display: flex; gap: var(--sp-2); align-items: flex-start; margin: var(--sp-4) 0 0; color: var(--c-text-muted); font-size: var(--fs-small); line-height: var(--lh-small); }
 .ov-note .ov-icon { width: 16px; height: 16px; margin-top: 1px; }
@@ -295,7 +370,7 @@ table.ov-table td, table.vgt-table.ov-users tbody td {
   padding: var(--sp-3); border: 0; border-bottom: 1px solid var(--c-border); vertical-align: top; text-align: left; color: var(--c-text);
 }
 table.ov-table tbody tr:last-child td, table.vgt-table.ov-users tbody tr:last-child td { border-bottom: 0; }
-table.ov-table tbody tr:hover td, table.vgt-table.ov-users tbody tr:hover td { background: #fbfcfd; }
+table.ov-table tbody tr:hover td, table.vgt-table.ov-users tbody tr:hover td { background: var(--c-row-hover); }
 .ov-users .c-name, .ov-table .c-name { font-weight: 600; overflow-wrap: anywhere; min-width: 140px; }
 .ov-users .ov-name { max-width: 280px; }
 table.vgt-table.ov-users tbody td { height: 80px; } /* one row height whether or not a cell has a second line */
@@ -320,9 +395,9 @@ table.vgt-table.ov-users tbody td { height: 80px; } /* one row height whether or
 .ov-ban.ov-ban-expired { border-left-color: var(--c-border-control); } /* no opacity: faded text would fall below 4.5:1 */
 
 /* ---- action menu: bottom sheet on phones, popover from 769 px ---- */
-.ov-scrim { position: fixed; inset: 0; z-index: var(--menu-z); background: rgba(31, 35, 40, .5); }
+.ov-scrim { position: fixed; inset: 0; z-index: var(--menu-z); background: var(--c-scrim); }
 .ov-menu {
-  position: fixed; left: 0; right: 0; bottom: 0; z-index: calc(var(--menu-z) + 1); background: var(--c-surface);
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: calc(var(--menu-z) + 1); background: var(--c-surface-raised);
   border-radius: 14px 14px 0 0; box-shadow: var(--shadow-float);
   padding: var(--sp-2) 0 calc(var(--sp-2) + env(safe-area-inset-bottom)); max-height: 85vh; overflow: auto; overscroll-behavior: contain;
   animation: ov-sheet-in var(--dur) var(--ease);
@@ -337,13 +412,23 @@ table.vgt-table.ov-users tbody td { height: 80px; } /* one row height whether or
 }
 .ov-menu-item:hover { background: var(--c-surface-alt); }
 .ov-menu-item .ov-icon { color: var(--c-text-muted); }
-.ov-menu-item:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--c-primary); background: var(--c-surface-alt); }
+.ov-menu-item:focus-visible { outline: none; box-shadow: inset 0 0 0 2px var(--focus-color); background: var(--c-surface-alt); }
 .ov-menu-item[disabled] { color: var(--c-text-muted); cursor: default; }
-.ov-menu-danger, .ov-menu-danger .ov-icon { color: var(--c-danger); }
+.ov-menu-danger, .ov-menu-danger .ov-icon { color: var(--c-danger-text); }
 .ov-menu-cancel { justify-content: center; font-weight: 600; border-top: 1px solid var(--c-border); margin-top: var(--sp-1); }
 
+/* ---- theme selector (v0.1.7) ---- */
+.ov-theme-btn[aria-expanded="true"] { background: var(--c-revoked-bg); }
+.ov-menu-item[role="menuitemradio"] .ov-menu-text { flex: 1 1 auto; display: flex; flex-direction: column; gap: 2px; }
+.ov-menu-item .ov-menu-sub { color: var(--c-text-muted); font-size: var(--fs-small); line-height: var(--lh-small); font-weight: 400; }
+.ov-menu-item .ov-check { visibility: hidden; color: var(--c-primary-text); stroke-width: 2.25; }
+.ov-menu-item[aria-checked="true"] { font-weight: 600; }
+.ov-menu-item[aria-checked="true"] .ov-check { visibility: visible; }
+.ov-menu-item[aria-checked="true"] > .ov-icon:first-child { color: var(--c-text); }
+@media (forced-colors: active) { :focus-visible { outline: 2px solid CanvasText; outline-offset: 2px; } }
+
 /* ---- dialogs: full-height sheet on phones, centered modal from 769 px ---- */
-.ov-backdrop { position: fixed; inset: 0; z-index: var(--dialog-z); background: rgba(31, 35, 40, .5); display: flex; align-items: stretch; justify-content: center; }
+.ov-backdrop { position: fixed; inset: 0; z-index: var(--dialog-z); background: var(--c-scrim); display: flex; align-items: stretch; justify-content: center; }
 .ov-dialog { width: 100%; height: 100%; display: flex; flex-direction: column; background: var(--c-surface); animation: ov-sheet-in var(--dur) var(--ease); }
 .ov-dialog-head {
   display: flex; align-items: flex-start; gap: var(--sp-2); flex: 0 0 auto;
@@ -401,7 +486,7 @@ table.ov-routes { width: 100%; border-collapse: collapse; }
 .ov-hist-l1 > :first-child { font-weight: 500; }
 .ov-hist-l2 { display: flex; flex-wrap: wrap; gap: 0 var(--sp-4); }
 .ov-hist-l2, .ov-hist-l3 { margin-top: 2px; overflow-wrap: anywhere; }
-.ov-ev-fail { color: var(--c-danger); font-weight: 600; }
+.ov-ev-fail { color: var(--c-danger-text); font-weight: 600; }
 .ov-ev-connect { font-weight: 600; }
 .ov-none { color: var(--c-text-muted); }
 table.ov-hist { width: 100%; border-collapse: collapse; }
@@ -430,12 +515,12 @@ table.ov-hist { width: 100%; border-collapse: collapse; }
 }
 .vue-notification-wrapper { margin-bottom: var(--sp-2); }
 .ov-toast {
-  display: flex; gap: var(--sp-3); align-items: flex-start; background: #fff; color: var(--c-text);
+  display: flex; gap: var(--sp-3); align-items: flex-start; background: var(--c-surface-raised); color: var(--c-text);
   border: 1px solid var(--c-border-control); border-radius: var(--radius); padding: var(--sp-3) var(--sp-4); text-align: left;
   box-shadow: var(--shadow-float);
 }
-.ov-toast-error { border-color: var(--c-danger); }
-.ov-toast-error .ov-toast-title { color: var(--c-danger); }
+.ov-toast-error { border-color: var(--c-danger-text); }
+.ov-toast-error .ov-toast-title { color: var(--c-danger-text); }
 .ov-toast-main { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
 .ov-toast-title { font-weight: 600; }
 .ov-toast-text { margin-top: 2px; color: var(--c-text-muted); font-size: var(--fs-small); line-height: var(--lh-small); }
@@ -486,6 +571,7 @@ table.ov-hist { width: 100%; border-collapse: collapse; }
   }
   .ov-menu-head, .ov-menu-cancel { display: none; }
   .ov-menu-item { min-height: 40px; }
+  .ov-menu-item[role="menuitemradio"] { min-height: 48px; }
   /* centered modal */
   .ov-backdrop { align-items: flex-start; padding: 64px var(--sp-4); }
   .ov-dialog { height: auto; max-height: calc(100vh - 128px); max-height: calc(100dvh - 128px); max-width: var(--dialog-w-sm); border-radius: var(--radius-lg); box-shadow: var(--shadow-float); }

@@ -657,12 +657,17 @@ var PasswordField = {
 // Action menu of a user row: bottom sheet on phones, popover anchored to the
 // opener from 769 px (see style.css). role=menu, Up/Down/Home/End, Escape and
 // a tap on the scrim close it, focus goes back to the opener.
+// An item with a boolean `checked` is a radio item (role=menuitemradio,
+// aria-checked, optional second line `sub`): the theme chooser uses them.
 var AppMenu = {
   props: {
     title: { type: String, required: true },
     subtitle: { type: String, default: '' },
     items: { type: Array, required: true },
-    anchor: { default: null }
+    anchor: { default: null },
+    ariaLabel: { type: String, default: '' },
+    // which item takes the focus on open: 'first' or the 'checked' one
+    initialFocus: { type: String, default: 'first' }
   },
   emits: ['select', 'close'],
   data() {
@@ -670,14 +675,18 @@ var AppMenu = {
   },
   template: '<div class="ov-menu-layer">' +
     '<div class="ov-scrim" @click="$emit(\'close\')"></div>' +
-    '<div class="ov-menu" role="menu" ref="menu" :aria-label="\'Actions for \' + title" :style="menuStyle">' +
+    '<div class="ov-menu" role="menu" ref="menu" :aria-label="ariaLabel || (\'Actions for \' + title)" :style="menuStyle">' +
     '<div class="ov-menu-head"><p class="ov-menu-title">{{ title }}</p><span class="ov-small ov-muted" v-if="subtitle">{{ subtitle }}</span></div>' +
     '<ul class="ov-menu-list" role="none">' +
     '<template v-for="(item, index) in items" :key="item.id">' +
     '<li role="separator" class="ov-menu-sep" v-if="item.danger && index > 0 && !items[index - 1].danger"></li>' +
-    '<li role="none"><button type="button" role="menuitem" class="ov-menu-item" :class="{\'ov-menu-danger\': item.danger}" ' +
+    '<li role="none"><button type="button" :role="typeof item.checked === \'boolean\' ? \'menuitemradio\' : \'menuitem\'" class="ov-menu-item" :class="{\'ov-menu-danger\': item.danger}" ' +
+    ':aria-checked="typeof item.checked === \'boolean\' ? (item.checked ? \'true\' : \'false\') : null" ' +
     ':disabled="item.disabled" @click="$emit(\'select\', item)">' +
-    '<svg class="ov-icon" aria-hidden="true"><use :href="\'#\' + item.icon"/></svg>{{ item.label }}</button></li>' +
+    '<svg class="ov-icon" aria-hidden="true"><use :href="\'#\' + item.icon"/></svg>' +
+    '<template v-if="typeof item.checked === \'boolean\'"><span class="ov-menu-text">{{ item.label }}<span class="ov-menu-sub" v-if="item.sub">{{ item.sub }}</span></span>' +
+    '<svg class="ov-icon ov-check" aria-hidden="true"><use href="#i-check"/></svg></template>' +
+    '<template v-else>{{ item.label }}</template></button></li>' +
     '</template>' +
     '<li role="none"><button type="button" role="menuitem" class="ov-menu-item ov-menu-cancel" @click="$emit(\'close\')">Cancel</button></li>' +
     '</ul></div></div>',
@@ -687,8 +696,12 @@ var AppMenu = {
     window.addEventListener('resize', this.position);
     this.position();
     var items = this.visibleItems();
-    if (items.length) {
-      items[0].focus();
+    var first = items[0];
+    if (this.initialFocus === 'checked') {
+      first = items.filter(function(el) { return el.getAttribute('aria-checked') === 'true'; })[0] || first;
+    }
+    if (first) {
+      first.focus();
     }
   },
   beforeUnmount() {
@@ -705,12 +718,15 @@ var AppMenu = {
         return;
       }
       var r = this.anchor.getBoundingClientRect();
+      // measure against the fixed layer, not window.innerWidth: a classic scrollbar
+      // (scrollbar-gutter: stable) would shift the popover by the scrollbar width
+      var box = this.$el.querySelector('.ov-scrim').getBoundingClientRect();
       var menuH = this.$refs.menu ? this.$refs.menu.offsetHeight : 0;
       var top = r.bottom + 4;
       if (menuH && top + menuH > window.innerHeight - 8) {
         top = Math.max(8, r.top - 4 - menuH);
       }
-      this.menuStyle = { '--menu-top': top + 'px', '--menu-right': Math.max(8, window.innerWidth - r.right) + 'px' };
+      this.menuStyle = { '--menu-top': top + 'px', '--menu-right': Math.max(8, box.right - r.right) + 'px' };
     },
     visibleItems() {
       var nodes = this.$refs.menu.querySelectorAll('.ov-menu-item');
@@ -749,6 +765,35 @@ var AppMenu = {
     }
   }
 };
+
+// Theme: the inline script in index.html has already applied the saved choice
+// (data-theme on <html>, color-scheme, meta theme-color) before the first paint.
+// This is the same rule for later changes. localStorage["ovpn-theme"] holds
+// light | dark | system; a blocked storage keeps the choice in memory only.
+var THEME_KEY = 'ovpn-theme';
+var THEME_LABELS = { light: 'Light', dark: 'Dark', system: 'System' };
+var THEME_ICONS = { light: '#i-sun', dark: '#i-moon', system: '#i-monitor' };
+var THEME_COLORS = { light: '#ffffff', dark: '#161b22' };
+function validTheme(value) {
+  return value === 'light' || value === 'dark' || value === 'system' ? value : 'system';
+}
+function readThemePref() {
+  try {
+    return validTheme(window.localStorage.getItem(THEME_KEY));
+  } catch (e) {
+    return validTheme(document.documentElement.getAttribute('data-theme-pref'));
+  }
+}
+function applyTheme(resolved, pref) {
+  var root = document.documentElement;
+  root.setAttribute('data-theme', resolved);
+  root.setAttribute('data-theme-pref', pref);
+  root.style.colorScheme = resolved;
+  var meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) {
+    meta.setAttribute('content', THEME_COLORS[resolved]);
+  }
+}
 
 // Centered state block of a list: loading skeleton, error, empty, no match.
 var AppState = {
@@ -857,6 +902,11 @@ const app = createApp({
       // action menu of a row: {username, row key} or null (the opener element is kept out of the reactive state)
       menu: null,
       menuAnchor: null,
+      // theme: light | dark | system, the OS preference, the chooser
+      themePref: validTheme(document.documentElement.getAttribute('data-theme-pref')),
+      osDark: !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches),
+      themeMenuOpen: false,
+      themeAnchor: null,
       // banned IPs
       bans: [],
       bansLoaded: false,
@@ -888,6 +938,29 @@ const app = createApp({
     } else if (this.mql.addListener) {
       this.mql.addListener(this.onMql);
     }
+
+    // theme: follow the OS while System is selected, and another tab's choice
+    this.themeMql = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+    this.onThemeMql = function(event) {
+      _this.osDark = event.matches;
+      _this.applyTheme();
+    };
+    this.onThemeStorage = function(event) {
+      if (event.key === THEME_KEY || event.key === null) {
+        _this.themePref = readThemePref();
+        _this.applyTheme();
+      }
+    };
+    if (this.themeMql) {
+      if (this.themeMql.addEventListener) {
+        this.themeMql.addEventListener('change', this.onThemeMql);
+      } else if (this.themeMql.addListener) {
+        this.themeMql.addListener(this.onThemeMql);
+      }
+    }
+    window.addEventListener('storage', this.onThemeStorage);
+    this.osDark = !!(this.themeMql && this.themeMql.matches);
+    this.applyTheme();
 
     // view <-> hash, tab visibility and connectivity
     this.onHashChange = function() {
@@ -943,6 +1016,12 @@ const app = createApp({
     document.removeEventListener('visibilitychange', this.onVisibility);
     window.removeEventListener('online', this.onOnline);
     window.removeEventListener('offline', this.onOffline);
+    window.removeEventListener('storage', this.onThemeStorage);
+    if (this.themeMql && this.themeMql.removeEventListener) {
+      this.themeMql.removeEventListener('change', this.onThemeMql);
+    } else if (this.themeMql && this.themeMql.removeListener) {
+      this.themeMql.removeListener(this.onThemeMql);
+    }
     if (this.mql && this.mql.removeEventListener) {
       this.mql.removeEventListener('change', this.onMql);
     }
@@ -1107,6 +1186,24 @@ const app = createApp({
     tzLabel: function() {
       return offsetLabel();
     },
+    themeResolved: function() {
+      return this.themePref === 'system' ? (this.osDark ? 'dark' : 'light') : this.themePref;
+    },
+    themeLabel: function() {
+      return 'Theme: ' + THEME_LABELS[this.themePref] + (this.themePref === 'system' ? ' (' + THEME_LABELS[this.themeResolved] + ')' : '');
+    },
+    themeIcon: function() {
+      return THEME_ICONS[this.themePref];
+    },
+    themeItems: function() {
+      var pref = this.themePref;
+      return [
+        { id: 'light', label: THEME_LABELS.light, icon: 'i-sun', checked: pref === 'light' },
+        { id: 'dark', label: THEME_LABELS.dark, icon: 'i-moon', checked: pref === 'dark' },
+        { id: 'system', label: THEME_LABELS.system, icon: 'i-monitor', checked: pref === 'system',
+          sub: 'Follows this device, now ' + (this.osDark ? THEME_LABELS.dark : THEME_LABELS.light) }
+      ];
+    },
   },
   methods: {
     // ---- layout, views, menu ----
@@ -1163,6 +1260,42 @@ const app = createApp({
     },
     iconFor: function(action) {
       return '#' + action.icon;
+    },
+
+    // ---- theme ----
+    applyTheme: function() {
+      applyTheme(this.themeResolved, this.themePref);
+    },
+    openThemeMenu: function() {
+      if (this.themeMenuOpen || this.menu || this.dialog) {
+        return;
+      }
+      this.themeAnchor = markRaw(this.$refs.themeBtn);
+      this.themeMenuOpen = true;
+    },
+    toggleThemeMenu: function() {
+      if (this.themeMenuOpen) {
+        this.closeThemeMenu();
+      } else {
+        this.openThemeMenu();
+      }
+    },
+    closeThemeMenu: function() {
+      this.themeMenuOpen = false;
+      var anchor = this.themeAnchor;
+      if (anchor && anchor.isConnected) {
+        anchor.focus();
+      }
+    },
+    setTheme: function(pref) {
+      this.themePref = validTheme(pref);
+      try {
+        window.localStorage.setItem(THEME_KEY, this.themePref);
+      } catch (e) {
+        // blocked storage (private mode): the choice lasts until the page closes
+      }
+      this.applyTheme();
+      this.closeThemeMenu();
     },
 
     // ---- banned IPs ----
