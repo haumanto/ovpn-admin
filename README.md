@@ -21,6 +21,7 @@ Simple web UI to manage OpenVPN users, their certificates & routes in Linux. Whi
 * Mobile-first web UI: phone cards, a table on tablet and desktop, sheet dialogs (see [Mobile support](#mobile-support)). New in v0.1.4.
 * (optionally) A Telegram message for every new ban, off by default (see [Telegram notifications](#telegram-notifications)). New in v0.1.5.
 * Permanent bans for repeat offenders (the Nth ban of an address, `OVPN_BAN_REPEAT_COUNT`, default 2) and manual ban/unban on the master (see [Permanent bans and manual control](#permanent-bans-and-manual-control)). New in v0.1.6.
+* Light, Dark and System themes, chosen with the theme button in the top bar and saved per browser (see [Theme](#theme)). New in v0.1.7.
 
 ### Screenshots
 
@@ -32,7 +33,7 @@ An example of dashboard made using ovpn-admin metrics:
 
 ## Installation
 
-Release notes for this version: [RELEASE-v0.1.6.md](RELEASE-v0.1.6.md) (published with the v0.1.6 release). Earlier releases: [RELEASE-v0.1.5.md](RELEASE-v0.1.5.md), [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md), [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md), [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0 to v0.1.4: [UPGRADING.md](UPGRADING.md). Upgrading from v0.1.4 to v0.1.5: [UPGRADING.md](UPGRADING.md#v014--v015). Upgrading from v0.1.5 to v0.1.6: [UPGRADING.md](UPGRADING.md#v015--v016).
+Release notes for this version: [RELEASE-v0.1.7.md](RELEASE-v0.1.7.md) (not yet published). Earlier releases: [RELEASE-v0.1.6.md](RELEASE-v0.1.6.md) (published with the v0.1.6 release), [RELEASE-v0.1.5.md](RELEASE-v0.1.5.md), [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md), [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md), [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0 to v0.1.4: [UPGRADING.md](UPGRADING.md). Upgrading from v0.1.4 to v0.1.5: [UPGRADING.md](UPGRADING.md#v014--v015). Upgrading from v0.1.5 to v0.1.6: [UPGRADING.md](UPGRADING.md#v015--v016). Upgrading from v0.1.6 to v0.1.7: [UPGRADING.md](UPGRADING.md#v016--v017).
 
 ### 1. Docker
 
@@ -288,9 +289,17 @@ The **Banned IPs** tab of the admin UI is a list: IP address, reason, attempts, 
 
 The admin UI is mobile-first from v0.1.4. Up to 768 px each user is a card with its actions; from 769 px up it is a table. Dialogs are sheets on phones and centered dialogs on desktop. Touch targets are 44 px on phones and tablets (per the design spec; target sizes were not measured). Tested in QA on the candidate UI (frontend unchanged since `e3233a9`) at 390 × 844 (phone emulation) and 1280 px (desktop). Tablet widths 769 to 1024 px and real devices were not tested. Details: [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md).
 
+## Theme
+
+ovpn-admin has three themes: **Light**, **Dark** and **System**. **System** is the default. It follows the light or dark setting of your device, and it updates while the page is open.
+
+To change the theme, press the theme button in the top bar. It is the button just left of **Refresh**, with a sun, moon or monitor icon. Pick **Light**, **Dark** or **System**.
+
+The choice is saved in your browser only. The server does not store it, so each browser and device keeps its own choice. Details and limits: [RELEASE-v0.1.7.md](RELEASE-v0.1.7.md).
+
 ## Upgrade notes
 
-Upgrading a docker compose deployment (upstream, v0.1.0, v0.1.1, v0.1.2, v0.1.3): follow [UPGRADING.md](UPGRADING.md); `scripts/upgrade.sh` backs up first and covers the audit volume. v0.1.4 steps: [UPGRADING.md](UPGRADING.md#v013--v014). v0.1.5 steps: [UPGRADING.md](UPGRADING.md#v014--v015). v0.1.6 steps: [UPGRADING.md](UPGRADING.md#v015--v016).
+Upgrading a docker compose deployment (upstream, v0.1.0, v0.1.1, v0.1.2, v0.1.3): follow [UPGRADING.md](UPGRADING.md); `scripts/upgrade.sh` backs up first and covers the audit volume. v0.1.4 steps: [UPGRADING.md](UPGRADING.md#v013--v014). v0.1.5 steps: [UPGRADING.md](UPGRADING.md#v014--v015). v0.1.6 steps: [UPGRADING.md](UPGRADING.md#v015--v016). v0.1.7 steps: [UPGRADING.md](UPGRADING.md#v016--v017).
 
 * **openvpn-user v1.0.4 → v1.0.9** (only relevant with password authentication, `--auth.password` / `OVPN_PASSWD_AUTH=true`). openvpn-user v1.0.9 adds the columns `secret` and `app_configured` to `users.db`. The column `secret` is added without a default value, so for every user whose password was saved by openvpn-user v1.0.4 or older it is `NULL`, and `openvpn-user auth` of v1.0.9 rejects these users (`converting NULL to string is unsupported`) — they cannot connect to the VPN any more. Users created by v1.0.9 are not affected. Additionally `openvpn-user db-migrate` does nothing on a database created by v1.0.4 until `openvpn-user db-init` has created the `migrations` table, and until the database is migrated `openvpn-user create` reports success without saving the user.
   * The Docker images handle this: `setup/configure.sh` of the openvpn image and ovpn-admin itself (when started with `--auth.password` or `--auth.db-init`) run `db-init` and `db-migrate` on start and then replace `NULL` in `secret` with an empty string (the value v1.0.9 stores for new users). All steps are idempotent.
