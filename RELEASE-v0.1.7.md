@@ -1,6 +1,6 @@
 # ovpn-admin v0.1.7 release notes
 
-**Status: not published.** Release candidate. There is no tag, GitHub release, GHCR image, binary or chart release for v0.1.7. Publishing needs a human decision.
+**Status: published.** Tag `v0.1.7`, GitHub release with amd64/arm64 binaries, GHCR images, chart release.
 
 - Candidate: branch `v0.1.7`, code SHA `a650881a7c8226083cc1097cd81596c2eefdb520`. It is two commits on top of v0.1.6 (`8fc3f23`): `550d2bc` (themes) and `a650881` (version bump). The commit that adds this file sits on top of `a650881` and changes only `RELEASE-v0.1.7.md`, `README.md` and `UPGRADING.md`.
 - QA: `qa-v017/REPORT.md` (card `t_3fbeb6b9`), verdict **SHIP** at `a650881`. Items 1 to 13 PASS. Chromium 156, headless.

@@ -223,10 +223,10 @@ Known limits of this upgrade: no real upgrade run was done. QA used a fresh stac
 
 ## v0.1.6 → v0.1.7
 
-Status: release candidate. v0.1.7 is not tagged or published yet. The steps below apply once the `ovpn-admin` image is built from the v0.1.7 checkout. Details: [RELEASE-v0.1.7.md](RELEASE-v0.1.7.md).
+Status: published. v0.1.7 is tagged and released. The steps below apply now. Details: [RELEASE-v0.1.7.md](RELEASE-v0.1.7.md).
 
 1. **Note your current version** (`git describe --tags --always`, or the image tags). You need it for a rollback.
-2. **Update the checkout.** Use `git fetch --tags && git checkout v0.1.7` once the tag exists. The compose files (`docker-compose.yaml`, `docker-compose-slave.yaml`) do not change in v0.1.7. Keep your own edits (network, ports, `OVPN_*`, `BASIC_*`, `OVPN_MASTER_TOKEN`, Telegram settings).
+2. **Update the checkout.** Use `git fetch --tags && git checkout v0.1.7`. The compose files (`docker-compose.yaml`, `docker-compose-slave.yaml`) do not change in v0.1.7. Keep your own edits (network, ports, `OVPN_*`, `BASIC_*`, `OVPN_MASTER_TOKEN`, Telegram settings).
 3. **Rebuild the `ovpn-admin` image only.** The `openvpn` image has no source change since v0.1.6, so it does not need a rebuild.
    ```bash
    docker compose -p openvpn-master build --pull ovpn-admin
