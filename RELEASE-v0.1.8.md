@@ -1,6 +1,6 @@
 # ovpn-admin v0.1.8 release notes
 
-**Status: not published.** No tag, GitHub release, GHCR image, binary or chart release has been made for v0.1.8. This file is a draft until a human approves publishing.
+**Status: published.** Tag `v0.1.8`, GitHub release with amd64/arm64 binaries, GHCR images, chart release.
 
 - Candidate: branch `v0.1.8`, code SHA `e94a24b4c7a02bf40c24be4074efab9c2d824e76` (`chore(release): bump version to v0.1.8`). It is two commits on top of v0.1.7 (`a66404b`): `9da577c` (component inventory, scan workflow, Dependabot) and `e94a24b` (version bump). The commit that adds this file sits on top of `e94a24b` and changes only `RELEASE-v0.1.8.md`, `README.md` and `UPGRADING.md`.
 - QA: `qa-v018/REPORT.md` (card `t_1b00509a`), verdict **SHIP** at `e94a24b`. Items 1 to 12 PASS. Items 4 and 5 (workflow and Dependabot on GitHub) are checked only statically, see [Known limitations](#known-limitations).
