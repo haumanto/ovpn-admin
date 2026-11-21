@@ -2,7 +2,7 @@
 
 What ships in the two container images, where each component comes from and how to bump it. Use it to answer "are we affected by CVE-X?" and "which file do I change?".
 
-Measured on `linux/amd64` builds of the v0.1.8 branch (Dockerfiles unchanged since v0.1.7), 2026-11-21. Versions in the tables are what the built images report, not what the Dockerfiles ask for: `alpine:3.23` and `golang:1.26-alpine` are floating tags and `apk add` takes the newest package of the Alpine branch, so a rebuild on another day can ship newer patch versions. Refresh the file with the commands at the end whenever a base image, an apk package or a dependency is bumped, and at every release.
+Measured on `linux/amd64` builds of the v0.1.9 branch, 2026-11-21 (the openvpn-user rows and "Known findings" are from the build that replaced the prebuilt openvpn-user binary; the Alpine and apk rows were measured the same day on the v0.1.8 build and the Trivy scan of the rebuilt images reports the same Alpine 3.23.8 and 3.24.4). Versions in the tables are what the built images report, not what the Dockerfiles ask for: `alpine:3.23` and `golang:1.26-alpine` are floating tags and `apk add` takes the newest package of the Alpine branch, so a rebuild on another day can ship newer patch versions. Refresh the file with the commands at the end whenever a base image, an apk package or a dependency is bumped, and at every release.
 
 Neither image contains PHP or nginx (nginx only appears as an example reverse proxy in [docs/hardening](docs/hardening/README.md)).
 
@@ -27,7 +27,7 @@ OpenVPN, easy-rsa and sqlite in this image are **not the running VPN server**. T
 | sqlite | 3.53.4 (apk `sqlite-3.53.4-r0`) | apk `sqlite` (explicit). CLI used to repair `users.db`. | Rebuild with `--pull`. |
 | bash | 5.3.3 (apk `bash-5.3.3-r1`) | apk `bash` (explicit) | Rebuild with `--pull`. |
 | coreutils | 9.8 (apk `coreutils-9.8-r1`) | apk `coreutils` (explicit) | Rebuild with `--pull`. |
-| openvpn-user | v1.0.9 | Prebuilt release binary from `github.com/pashcovich/openvpn-user`, downloaded in the Dockerfile, SHA-256 pinned per architecture. A Go binary built with **Go 1.19.3** and `golang.org/x/crypto v0.2.0` (see "Known findings"). | Edit the version in the URL and both SHA-256 values in `Dockerfile.ovpn-admin` **and** `Dockerfile.openvpn`. The binary must come from a new upstream release or from a rebuild; there is no `go get` for it. |
+| openvpn-user | v1.0.9, upstream commit `5eefd1b` | Vendored upstream source in `third_party/openvpn-user/` (Go files unmodified, see its README), compiled by the stage `openvpn-user-builder` of `Dockerfile.ovpn-admin` (`golang:1.26-alpine` plus `gcc musl-dev`, `CGO_ENABLED=1`, static, Go 1.26.11) and copied to `/usr/local/bin/openvpn-user`. Modules: `github.com/mattn/go-sqlite3` v1.14.53, `golang.org/x/crypto` v0.59.0 (details in the table below). Nothing is downloaded as a binary. | Modules: `cd third_party/openvpn-user && go get <module>@<version> && go mod tidy`. Standard library: rebuild with `--pull`. Edit `Dockerfile.ovpn-admin` **and** `Dockerfile.openvpn` only to change the build stage. Rules and checks: [third_party/openvpn-user/README.md](third_party/openvpn-user/README.md). |
 | apk packages, total | 40 | `apk info` in the final image | n/a |
 
 ### Go build and Go modules (compiled into `/app/ovpn-admin`)
@@ -44,6 +44,20 @@ OpenVPN, easy-rsa and sqlite in this image are **not the running VPN server**. T
 | `k8s.io/client-go` | v0.37.2 | Go module (direct) | same as above |
 | `golang.org/x/net`, `golang.org/x/sys` (transitive, examples) | v0.62.0, v0.49.0 | Go modules (indirect) | `go get golang.org/x/net@<version> && go mod tidy` |
 | Go modules in the binary, total | 56 | `go version -m /app/ovpn-admin` | n/a |
+
+### Go modules compiled into `/usr/local/bin/openvpn-user` (both images)
+
+Separate Go module `third_party/openvpn-user` (vendored upstream source plus our `go.mod` and `go.sum`), built by the stage `openvpn-user-builder` with Go 1.26.11 (`golang:1.26-alpine`). Versions from `go version -m` of the built binary. Upstream v1.0.9 pinned `go-sqlite3` v1.14.16 and `golang.org/x/crypto` v0.2.0 and was built with Go 1.19.3.
+
+| Component | Version | Where it comes from | How to bump |
+|---|---|---|---|
+| Go toolchain (standard library, linked in) | 1.26.11 | Build stage image `golang:1.26-alpine` | Rebuild with `--pull`. |
+| `golang.org/x/crypto` (bcrypt) | v0.59.0 | `third_party/openvpn-user/go.mod` (direct) | `cd third_party/openvpn-user && go get golang.org/x/crypto@<version> && go mod tidy` |
+| `github.com/mattn/go-sqlite3` (cgo, bundles SQLite) | v1.14.53 | same (direct) | `go get github.com/mattn/go-sqlite3@<version> && go mod tidy` |
+| `github.com/dgryski/dgoogauth` | v0.0.0-20190221195224-5a805980a5f3 | same (direct, unchanged from upstream) | `go get github.com/dgryski/dgoogauth@<version> && go mod tidy` |
+| `gopkg.in/alecthomas/kingpin.v2` | v2.2.6 | same (direct, unchanged from upstream) | `go get gopkg.in/alecthomas/kingpin.v2@<version> && go mod tidy` |
+| `github.com/alecthomas/template`, `github.com/alecthomas/units` (transitive) | v0.0.0-20190718012654-fb15b899a751, v0.0.0-20201120081800-1786d5ef83d4 | same (indirect) | follow kingpin |
+| Go modules in the binary, total | 6 | `go version -m /usr/local/bin/openvpn-user` | n/a |
 
 ### Web UI (webpack bundle served by the Go binary, built in a `node:24-alpine` stage)
 
@@ -80,12 +94,12 @@ The VPN server (`openvpn`), PKI tooling, the firewall and the fail2ban ban engin
 | easy-rsa | 3.2.5 (apk `easy-rsa-3.2.5-r0`) | apk `easy-rsa` (explicit). Symlinked to `/usr/local/bin/easyrsa`. | Rebuild with `--pull`. |
 | sqlite | 3.53.4 (apk `sqlite-3.53.4-r0`, `sqlite-libs-3.53.4-r0`) | apk `sqlite` (explicit) | Rebuild with `--pull`. |
 | bash | 5.3.9 (apk `bash-5.3.9-r1`) | apk `bash` (explicit) | Rebuild with `--pull`. |
-| openvpn-user | v1.0.9 | The same prebuilt binary as in the `ovpn-admin` image (identical SHA-256 of the extracted file on both images). Go 1.19.3, `golang.org/x/crypto v0.2.0`. | See the `ovpn-admin` table. |
+| openvpn-user | v1.0.9, upstream commit `5eefd1b` | The same vendored source as in the `ovpn-admin` image (`third_party/openvpn-user/`), built by the stage `openvpn-user-builder` of `Dockerfile.openvpn` with the same command. Go 1.26.11, `golang.org/x/crypto` v0.59.0, `go-sqlite3` v1.14.53. | See the `ovpn-admin` table. |
 | apk packages, total | 59 | `apk info` in the final image | n/a |
 
 ## Known findings at measurement time
 
-Trivy 0.70.0 (`--severity CRITICAL,HIGH --ignore-unfixed=false`) on both images: **0 findings in the Alpine packages and 0 in `/app/ovpn-admin`**, and 58 findings (54 HIGH, 4 CRITICAL) in `usr/local/bin/openvpn-user`, identical in both images: 45 against the Go standard library 1.19.3 and 13 against `golang.org/x/crypto v0.2.0`. They come from the prebuilt openvpn-user v1.0.9 release binary, not from code in this repository. Fixing them needs a rebuilt openvpn-user (newer Go and `x/crypto`), which means changing the pinned download in both Dockerfiles. Until then the `scan` job of the security workflow fails on master, tags and the weekly run (pull requests stay green). `govulncheck ./...` (v1.10.0) reports no vulnerabilities in this repository and `npm audit --omit=dev --audit-level=high` reports 0.
+Trivy 0.70.0 (`--severity CRITICAL,HIGH --ignore-unfixed=false`) on both rebuilt `linux/amd64` images: **0 findings in the Alpine packages, 0 in `/app/ovpn-admin` and 0 in `usr/local/bin/openvpn-user`** (gate run exit code 0 for both images). Before openvpn-user was built from source, the prebuilt v1.0.9 release binary (Go 1.19.3, `golang.org/x/crypto v0.2.0`) carried 129 findings in each image (4 CRITICAL, 54 HIGH, 66 MEDIUM, 4 LOW, 1 UNKNOWN); the 58 CRITICAL and HIGH ones failed the `scan` job on master, tags and the weekly run. With all severities, the only finding left in either image is one MEDIUM, CVE-2026-4738 in the Alpine package `zlib` 1.3.2-r1 (fixed in 1.4-r0), which a rebuild with `--pull` picks up once the Alpine branch carries it. `govulncheck ./...` (v1.10.0) reports no vulnerabilities in this repository, and none in the vendored module `third_party/openvpn-user` (source mode and on the built binary). `npm audit --omit=dev --audit-level=high` reported 0 at the v0.1.8 measurement; the frontend is unchanged.
 
 ## How to refresh this file
 
@@ -107,7 +121,7 @@ done
 docker run --rm --entrypoint sh openvpn:scan -c \
   'python3 --version; fail2ban-client --version | head -1; iptables --version; iptables-legacy --version'
 
-# 3. Go modules of the Go binaries (ovpn-admin and the prebuilt openvpn-user)
+# 3. Go modules of the Go binaries (ovpn-admin and the openvpn-user built from third_party/openvpn-user)
 mkdir -p /tmp/bins
 c=$(docker create ovpn-admin:scan)
 docker cp "$c:/app/ovpn-admin" /tmp/bins/ovpn-admin

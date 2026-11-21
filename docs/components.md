@@ -10,7 +10,7 @@ The versions that ship in the `ovpn-admin` and `openvpn` images are listed in [C
 | Trivy scan of each image (`CRITICAL,HIGH`, unfixed included) | Job `scan` | same | Table in the job log. Pull requests never fail on findings. Master, tags and the weekly run fail the job. SARIF goes to the Security tab (code scanning) from master and the weekly run. |
 | `govulncheck ./...` | Job `go-vuln` | same | Reports only vulnerabilities in code the binary can actually reach. |
 | `npm audit --omit=dev --audit-level=high` | Job `npm-audit` | same | Production npm dependencies only. |
-| Update pull requests | [dependabot.yml](../.github/dependabot.yml) | weekly | Go modules, npm (`/frontend`), Dockerfile base images, GitHub Actions, Helm chart dependencies. Minor and patch updates are grouped, majors come separately, 5 open PRs at most per ecosystem. |
+| Update pull requests | [dependabot.yml](../.github/dependabot.yml) | weekly | Go modules (`/` and `/third_party/openvpn-user`), npm (`/frontend`), Dockerfile base images, GitHub Actions, Helm chart dependencies. Minor and patch updates are grouped, majors come separately, 5 open PRs at most per ecosystem. |
 
 The four jobs are independent, so one red job does not hide the others.
 
@@ -40,7 +40,7 @@ Open an SBOM to answer "do we ship package X at all?": `jq '.packages[] | select
 | Go standard library (`stdlib`) in `ovpn-admin` | `app/ovpn-admin (gobinary)` | `Dockerfile.ovpn-admin` (`golang:1.26-alpine`) and `go` in `go.mod` | Rebuild with `--pull` for a patch release; change the tag and `go.mod` for a new minor. |
 | Go module in `ovpn-admin` | `app/ovpn-admin (gobinary)` | `go.mod`, `go.sum` | `go get <module>@<fixed-version> && go mod tidy`, run `go test ./...`. |
 | npm package (production) | `npm audit` output | `frontend/package.json`, `frontend/package-lock.json` | `cd frontend && npm install <package>@<fixed-version>` or `npm audit fix --omit=dev`, then rebuild the UI. |
-| openvpn-user binary | `usr/local/bin/openvpn-user (gobinary)` | `Dockerfile.ovpn-admin` **and** `Dockerfile.openvpn` (URL and both SHA-256 values) | Needs a new upstream release or a rebuilt binary of `pashcovich/openvpn-user`. See COMPONENTS.md, "Known findings". |
+| openvpn-user binary (built from vendored source) | `usr/local/bin/openvpn-user (gobinary)` | `third_party/openvpn-user/go.mod` and `go.sum` (Go modules), `Dockerfile.ovpn-admin` **and** `Dockerfile.openvpn` (stage `openvpn-user-builder`: Go toolchain, `golang:1.26-alpine`) | Modules: `cd third_party/openvpn-user && go get <module>@<fixed-version> && go mod tidy`. Standard library: rebuild with `--pull`. Do not edit the vendored `.go` files; see [third_party/openvpn-user/README.md](../third_party/openvpn-user/README.md) for the update rules and the checks to repeat. |
 | GitHub Action used by CI | n/a | `.github/workflows/*.yaml` | Dependabot opens the PR. Actions pinned to a commit SHA keep the `# vX.Y.Z` comment next to it. |
 | Helm chart dependency | n/a | `charts/openvpn-admin/Chart.yaml` | Dependabot opens the PR (none today). |
 
@@ -56,6 +56,7 @@ Open an SBOM to answer "do we ship package X at all?": `jq '.packages[] | select
 
 ## Known limits
 
-* Dependabot cannot update the Alpine tag in `Dockerfile.openvpn` (it is behind `ARG ALPINE_VERSION`), apk package versions, the pinned `openvpn-user` download, or `GOVULNCHECK_VERSION` in the workflow. Bump those by hand.
+* Dependabot cannot update the Alpine tag in `Dockerfile.openvpn` (it is behind `ARG ALPINE_VERSION`), apk package versions, or `GOVULNCHECK_VERSION` in the workflow. Bump those by hand. The Go modules of the vendored openvpn-user (`/third_party/openvpn-user`) have their own Dependabot entry; a Dependabot pull request there changes only `go.mod` and `go.sum`, and still needs the old-versus-new command check from the README of that directory.
+* `govulncheck ./...` of the `go-vuln` job runs in the repository root, and `third_party/openvpn-user` is a separate Go module, so it is not covered by that job. The Trivy scan of the images does cover the `openvpn-user` binary (the gate). To run `govulncheck` on the vendored module by hand: `cd third_party/openvpn-user && govulncheck ./...`.
 * Trivy and Syft scan the `linux/amd64` images. The arm64 images use the same Dockerfiles and package names but are not scanned separately.
 * Uploading SARIF to code scanning needs code scanning to be available for the repository (public repositories, or GitHub Advanced Security for private ones).

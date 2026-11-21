@@ -22,6 +22,21 @@ updates:
           - "minor"
           - "patch"
 
+  # Go modules of the vendored openvpn-user in /third_party/openvpn-user/go.mod and go.sum: golang.org/x/crypto,
+  # github.com/mattn/go-sqlite3, dgoogauth, kingpin.v2. A separate Go module (not part of the root go.mod),
+  # compiled by the openvpn-user-builder stage of both Dockerfiles into /usr/local/bin/openvpn-user (both images).
+  # Dependabot changes only go.mod and go.sum; the vendored .go files stay as upstream (see third_party/openvpn-user/README.md).
+  - package-ecosystem: "gomod"
+    directory: "/third_party/openvpn-user"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      gomod-openvpn-user-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
   # npm packages in /frontend/package.json and /frontend/package-lock.json: Vue, axios, bootstrap,
   # vue-good-table-next, @kyvg/vue3-notification and the webpack build toolchain.
   # Bundled into the web UI of the ovpn-admin image at build time (there is no npm or node in the final image).
@@ -40,7 +55,7 @@ updates:
   # whose name contains "Dockerfile"): node:24-alpine, golang:1.26-alpine, alpine:3.23 (admin runtime).
   # Limitation: the OpenVPN image uses "alpine:${ALPINE_VERSION}" (an ARG default), which Dependabot
   # cannot resolve, so bump that ARG by hand (see COMPONENTS.md).
-  # Dependabot cannot see apk package versions or the pinned openvpn-user release; those are bumped by hand.
+  # Dependabot cannot see apk package versions; those are bumped by hand. The Go modules of openvpn-user are tracked by the gomod block above.
   - package-ecosystem: "docker"
     directory: "/"
     schedule:

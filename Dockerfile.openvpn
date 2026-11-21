@@ -1,20 +1,22 @@
 ARG ALPINE_VERSION=3.24
+
+# openvpn-user: vendored upstream source (pashcovich/openvpn-user v1.0.9, commit 5eefd1b) built here, see third_party/openvpn-user/README.md.
+# CGO is required by mattn/go-sqlite3. The build runs natively on every platform (buildx provides a builder per architecture).
+FROM golang:1.26-alpine AS openvpn-user-builder
+RUN apk add --no-cache gcc musl-dev
+WORKDIR /src
+COPY third_party/openvpn-user/go.mod third_party/openvpn-user/go.sum ./
+RUN go mod download
+COPY third_party/openvpn-user/ ./
+RUN CGO_ENABLED=1 go build -trimpath -ldflags "-linkmode external -extldflags -static -s -w" -o /out/openvpn-user .
+
 FROM alpine:${ALPINE_VERSION}
-ARG TARGETARCH
 # "iptables" (nft backend) also provides the ip6tables commands, "ip6tables" is listed to make the dependency explicit
 # sqlite: configure.sh fixes users.db rows migrated from openvpn-user <= 1.0.4 (secret IS NULL)
 # fail2ban: bans repeated auth failures and revoked-certificate attempts (jail ovpn-admin, started by configure.sh)
 RUN apk add --update bash openvpn easy-rsa iptables iptables-legacy ip6tables sqlite fail2ban && \
     ln -s /usr/share/easy-rsa/easyrsa /usr/local/bin && \
-    case "${TARGETARCH}" in \
-      amd64) OPENVPN_USER_SHA256=aa121e391ec206f48256b7b9828b72c010f6f2402c3a6d0205084a3c5803bb82 ;; \
-      arm64) OPENVPN_USER_SHA256=2e03e8b81acc953ef00b770fa7ce16b8774e302a3f5c7fb0d445e12d18af3793 ;; \
-      *) echo "no pinned openvpn-user v1.0.9 checksum for TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
-    esac && \
-    wget -q https://github.com/pashcovich/openvpn-user/releases/download/v1.0.9/openvpn-user-linux-${TARGETARCH}.tar.gz -O /tmp/openvpn-user.tar.gz && \
-    echo "${OPENVPN_USER_SHA256}  /tmp/openvpn-user.tar.gz" | sha256sum -c - && \
-    tar xzf /tmp/openvpn-user.tar.gz -C /usr/local/bin && \
     rm -rf /tmp/* /var/tmp/* /var/cache/apk/* /var/cache/distfiles/*
-RUN if [ -f "/usr/local/bin/openvpn-user-${TARGETARCH}" ]; then ln -s /usr/local/bin/openvpn-user-${TARGETARCH} /usr/local/bin/openvpn-user; fi
+COPY --from=openvpn-user-builder /out/openvpn-user /usr/local/bin/openvpn-user
 COPY setup/ /etc/openvpn/setup
 RUN chmod +x /etc/openvpn/setup/*.sh
