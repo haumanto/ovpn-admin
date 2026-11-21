@@ -15,14 +15,38 @@ ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath -buildvcs=false -ldflags '-s -w' -o ovpn-admin
 
 # openvpn-user: vendored upstream source (pashcovich/openvpn-user v1.0.9, commit 5eefd1b) built here, see third_party/openvpn-user/README.md.
-# CGO is required by mattn/go-sqlite3. The build runs natively on every platform (buildx provides a builder per architecture).
-FROM golang:1.26-alpine AS openvpn-user-builder
+# CGO is required by mattn/go-sqlite3. The stage runs on the build host (no emulation). When the target architecture
+# equals the build architecture it uses the native gcc; otherwise (e.g. linux/arm64 on an amd64 host) it cross-compiles
+# with the zig C compiler, because gcc segfaults intermittently under qemu. The native build is retried up to 3 times
+# and falls back to zig if it keeps failing. Same source and Go flags: only the C toolchain differs. The zig path adds
+# "-s" to the external linker (zig ld does not strip on its own, the binary would be 14 MB instead of 6 MB) and
+# "-fno-sanitize=undefined" (zig cc enables UBSan traps by default, gcc does not).
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS openvpn-user-builder
+ARG BUILDARCH
+ARG TARGETARCH
 RUN apk add --no-cache gcc musl-dev
 WORKDIR /src
 COPY third_party/openvpn-user/go.mod third_party/openvpn-user/go.sum ./
 RUN go mod download
 COPY third_party/openvpn-user/ ./
-RUN CGO_ENABLED=1 go build -trimpath -ldflags "-linkmode external -extldflags -static -s -w" -o /out/openvpn-user .
+RUN set -eu; \
+    export CGO_ENABLED=1 GOOS=linux GOARCH="${TARGETARCH}"; \
+    LDFLAGS='-linkmode external -extldflags -static -s -w'; \
+    built=0; \
+    if [ "${BUILDARCH}" = "${TARGETARCH}" ]; then \
+      for attempt in 1 2 3; do \
+        echo "openvpn-user: native gcc build ${BUILDARCH}->${TARGETARCH}, attempt ${attempt}/3"; \
+        if go build -trimpath -ldflags "${LDFLAGS}" -o /out/openvpn-user .; then built=1; break; fi; \
+        echo "openvpn-user: native gcc build attempt ${attempt}/3 failed"; sleep 5; \
+      done; \
+    fi; \
+    if [ "${built}" = 0 ]; then \
+      case "${TARGETARCH}" in amd64) zt=x86_64 ;; arm64) zt=aarch64 ;; *) echo "unsupported TARGETARCH ${TARGETARCH}" >&2; exit 1 ;; esac; \
+      echo "openvpn-user: zig cc cross build ${BUILDARCH}->${TARGETARCH} (${zt}-linux-musl)"; \
+      apk add --no-cache zig; \
+      export CC="zig cc -target ${zt}-linux-musl" CGO_CFLAGS='-O2 -fno-sanitize=undefined'; \
+      go build -trimpath -ldflags '-linkmode external -extldflags "-static -s" -s -w' -o /out/openvpn-user .; \
+    fi
 
 FROM alpine:3.23
 WORKDIR /app

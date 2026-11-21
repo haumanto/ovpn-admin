@@ -26,13 +26,18 @@ The Go source (`openvpn-user.go`, `src/*.go`) is **unmodified**. The only change
 
 ## How it is built
 
-`Dockerfile.ovpn-admin` and `Dockerfile.openvpn` have a stage `openvpn-user-builder` (`golang:1.26-alpine` plus `gcc musl-dev`; CGO is required by `go-sqlite3`) that runs, in this directory:
+`Dockerfile.ovpn-admin` and `Dockerfile.openvpn` have a stage `openvpn-user-builder` (`FROM --platform=$BUILDPLATFORM golang:1.26-alpine`, plus `gcc musl-dev`; CGO is required by `go-sqlite3`) that runs, in this directory:
 
 ```sh
-CGO_ENABLED=1 go build -trimpath -ldflags "-linkmode external -extldflags -static -s -w" -o /out/openvpn-user .
+CGO_ENABLED=1 GOOS=linux GOARCH=$TARGETARCH go build -trimpath -ldflags "-linkmode external -extldflags -static -s -w" -o /out/openvpn-user .
 ```
 
-The final stages copy `/out/openvpn-user` to `/usr/local/bin/openvpn-user`. The result is a static binary built natively for each platform (buildx runs the stage once per architecture). Nothing is downloaded as a prebuilt binary.
+The stage runs on the build host, never under emulation. Which C compiler it uses depends on the target:
+
+- Target architecture equals build architecture (for example amd64 on amd64, or a native arm64 builder): native `gcc`. The build is retried up to 3 times (5 s apart, every attempt is logged). If all 3 fail, the stage falls back to the zig path.
+- Target differs from the build architecture (for example `linux/arm64` on an amd64 host): `CC="zig cc -target aarch64-linux-musl"` (zig from the Alpine package `zig`, installed only on this path; `x86_64-linux-musl` for amd64 targets). Reason: `gcc` segfaults intermittently when run under qemu, which broke multi-arch builds on amd64 runners. Only the C toolchain changes; the Go source and the module versions stay the same. The zig path adds `-s` to the external linker flags (zig's linker does not strip on its own: without it the arm64 binary is 14 MB instead of 6 MB) and `CGO_CFLAGS='-O2 -fno-sanitize=undefined'` (zig cc turns on UBSan traps by default, gcc does not).
+
+The final stages copy `/out/openvpn-user` to `/usr/local/bin/openvpn-user`. The result is a static binary for the target platform. Nothing is downloaded as a prebuilt binary.
 
 The module `third_party/openvpn-user` is a separate Go module. It is not part of the module in the repository root, so `go build ./...`, `go test ./...` and `govulncheck ./...` in the root do not touch it. [Dependabot](../../.github/dependabot.yml) tracks it with its own `gomod` entry.
 
