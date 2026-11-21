@@ -299,7 +299,7 @@
         <div class="ov-error" id="f-username-err" v-if="fieldError('username')">{{ fieldError('username') }}</div>
       </div>
       <password-field v-if="modulesEnabled.includes('passwdAuth')" id="f-password" label="Password"
-        help="At least 6 characters." v-model="dialog.password" :error="fieldError('password')"></password-field>
+        help="6 characters minimum, 72 bytes maximum." v-model="dialog.password" :error="fieldError('password')"></password-field>
     </form>
     <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
     <template #footer>
@@ -350,7 +350,7 @@
   <app-dialog v-if="dialog && dialog.kind == 'password'" :title="'Set password for ' + dialog.username" :busy="dialog.busy" @close="closeDialog()">
     <form id="dialog-form" novalidate @submit.prevent="changeUserPassword()">
       <password-field id="f-password" label="New password"
-        help="At least 6 characters. The user's current VPN session is not affected."
+        help="6 characters minimum, 72 bytes maximum. The user's current VPN session is not affected."
         v-model="dialog.password" :error="fieldError('password')"></password-field>
     </form>
     <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
@@ -402,7 +402,7 @@
     <p>A new certificate is issued and {{ dialog.username }} becomes Active again. The old config file stops working. Download the new config and send it to {{ dialog.username }}.</p>
     <form id="dialog-form" novalidate @submit.prevent="rotateUser()">
       <password-field v-if="modulesEnabled.includes('passwdAuth')" id="f-password" label="New password"
-        help="At least 6 characters. Replaces the old password." v-model="dialog.password" :error="fieldError('password')"></password-field>
+        help="6 characters minimum, 72 bytes maximum. Replaces the old password." v-model="dialog.password" :error="fieldError('password')"></password-field>
     </form>
     <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
     <template #footer>

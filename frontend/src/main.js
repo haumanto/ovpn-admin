@@ -510,7 +510,11 @@ var validateUsername = function(name) {
 };
 
 var validatePassword = function(password) {
-  return Array.from(password).length < 6 ? 'Use at least 6 characters.' : '';
+  if (Array.from(password).length < 6) {
+    return 'Use at least 6 characters.';
+  }
+  // the password hash takes at most 72 bytes, a multi-byte character counts for 2 to 4
+  return new TextEncoder().encode(password).length > 72 ? 'Use at most 72 bytes (a non-ASCII character takes 2 to 4).' : '';
 };
 
 var trimPeriod = function(message) {

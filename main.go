@@ -48,6 +48,7 @@ var templateFiles embed.FS
 const (
 	usernameRegexp         = `^([a-zA-Z0-9_.\-@])+$`
 	passwordMinLength      = 6
+	passwordMaxBytes       = 72 // bcrypt hashes at most 72 bytes; golang.org/x/crypto >= 0.5 returns an error above that
 	certsArchiveFileName   = "certs.tar.gz"
 	ccdArchiveFileName     = "ccd.tar.gz"
 	indexTxtDateLayout     = "060102150405Z"
@@ -969,9 +970,13 @@ func usernameIsPathSafe(username string) bool {
 func validatePassword(password string) error {
 	if utf8.RuneCountInString(password) < passwordMinLength {
 		return errors.New(fmt.Sprintf("Password too short, password length must be greater or equal %d", passwordMinLength))
-	} else {
-		return nil
 	}
+	// openvpn-user ignores the error of bcrypt.GenerateFromPassword, so a longer password would be
+	// reported as saved while no hash is stored. The limit is in bytes, not characters.
+	if len(password) > passwordMaxBytes {
+		return errors.New(fmt.Sprintf("Password too long, the hash accepts at most %d bytes", passwordMaxBytes))
+	}
+	return nil
 }
 
 // checkUserExist reports whether username is a user: a certificate with CN=username in index.txt
@@ -1339,6 +1344,14 @@ func (oAdmin *OvpnAdmin) revokeBeforeReplace(username string) error {
 
 func (oAdmin *OvpnAdmin) userRotate(username, newPassword string) (error, string) {
 	if usernameIsPathSafe(username) && checkUserExist(username) {
+		// checked before anything is changed: userCreate below validates it again, but by then the old
+		// password row is already deleted
+		if *authByPassword {
+			if err := validatePassword(newPassword); err != nil {
+				log.Warningf("userRotate: %s", err.Error())
+				return err, err.Error()
+			}
+		}
 		if err := oAdmin.revokeBeforeReplace(username); err != nil {
 			return err, err.Error()
 		}
