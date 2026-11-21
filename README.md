@@ -98,6 +98,10 @@ Step-by-step guide with a ready nginx config and fail2ban jails: [docs/hardening
 * **Slave compose file (known issue).** `docker-compose-slave.yaml` refuses to start unless Basic Auth, the sync token and the master credentials are set in the environment, and it publishes its admin port on `127.0.0.1:8081`. It still targets `http://172.20.0.1:8080`, which the loopback binding of the master no longer serves: put a TLS reverse proxy in between. The slave runtime is not verified yet. See `RELEASE-v0.1.2.md` and `RELEASE-v0.1.1.md`.
 * **Chart upgrade notes:** `ovpnAdmin.tag` and `openvpn.tag` are new and default to the chart `appVersion` (the images were `:master`); no value was renamed. The Role is narrowed to `secrets` (get, list, create, update) and `services` (get) in the release namespace.
 
+## Components and CVE tracking
+
+[COMPONENTS.md](COMPONENTS.md) lists every component that ships in the `ovpn-admin` and `openvpn` images (Alpine, OpenVPN, OpenSSL, easy-rsa, Go modules, npm packages), where it comes from and how to bump it. The `Security scan` workflow writes an SBOM per image, runs Trivy, `govulncheck` and `npm audit` on every merge to master, every tag and weekly, and Dependabot opens weekly update pull requests. How to read a finding and what to change: [docs/components.md](docs/components.md).
+
 ## Notes
 * This tool uses external calls for `bash`, `coreutils` and `easy-rsa`, thus **Linux systems only are supported** at the moment.
 * To enable additional password authentication, provide `--auth.password` and `--auth.db="/etc/easyrsa/pki/users.db"` flags and install [openvpn-user](https://github.com/pashcovich/openvpn-user/releases/tag/v1.0.9) v1.0.9 and `sqlite3` (needed to upgrade a `users.db` created by openvpn-user v1.0.4 or older, see [Upgrade notes](#upgrade-notes)). Both should be available in your `$PATH` and be executable (`+x`). Two-factor authentication (TOTP) of openvpn-user is not supported by ovpn-admin.

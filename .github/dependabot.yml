@@ -1,25 +1,81 @@
 version: 2
+
+# Every ecosystem below follows the same policy:
+#   - weekly schedule
+#   - minor and patch updates are grouped into ONE pull request per ecosystem
+#   - major updates are NOT grouped: each major bump gets its own pull request
+#   - at most 5 open pull requests per ecosystem
+# What each block tracks is listed in COMPONENTS.md ("Where it comes from" and "How to bump" columns).
+# Dependabot adds the "dependencies" label itself (used by .github/release.yml for the changelog).
+
 updates:
-  # Dependencies listed in go.mod
+  # Go modules in /go.mod and /go.sum: kingpin, uuid, prometheus/client_golang, logrus, k8s.io/{api,apimachinery,client-go}.
+  # Ships in the ovpn-admin image only (compiled into the /app/ovpn-admin binary).
   - package-ecosystem: "gomod"
-    directory: "/" # Location of package manifests
-    schedule:
-      interval: "weekly"
-
-  # Dependencies listed in .github/workflows/*.yml
-  - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      gomod-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
 
-  # Dependencies listed in Dockerfile
-  - package-ecosystem: "docker"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-
-  # Dependencies listed in frontend/package.json
+  # npm packages in /frontend/package.json and /frontend/package-lock.json: Vue, axios, bootstrap,
+  # vue-good-table-next, @kyvg/vue3-notification and the webpack build toolchain.
+  # Bundled into the web UI of the ovpn-admin image at build time (there is no npm or node in the final image).
   - package-ecosystem: "npm"
     directory: "/frontend"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Base images named in Dockerfile.ovpn-admin and Dockerfile.openvpn (Dependabot reads every file in "/"
+  # whose name contains "Dockerfile"): node:24-alpine, golang:1.26-alpine, alpine:3.23 (admin runtime).
+  # Limitation: the OpenVPN image uses "alpine:${ALPINE_VERSION}" (an ARG default), which Dependabot
+  # cannot resolve, so bump that ARG by hand (see COMPONENTS.md).
+  # Dependabot cannot see apk package versions or the pinned openvpn-user release; those are bumped by hand.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      docker-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Actions used by .github/workflows/*.yml and *.yaml (checkout, setup-*, docker/*, werf, anchore/sbom-action,
+  # aquasecurity/trivy-action, ...). Actions pinned to a full commit SHA with a "# vX.Y.Z" comment are updated
+  # in place, including the comment.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      actions-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Helm chart dependencies declared in charts/openvpn-admin/Chart.yaml (dependencies: block).
+  # The chart has no subchart dependencies today, so this block is idle until one is added; it does NOT
+  # bump image tags in values.yaml (those follow the chart appVersion, set at release time).
+  - package-ecosystem: "helm"
+    directory: "/charts/openvpn-admin"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      helm-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"

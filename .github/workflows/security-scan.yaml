@@ -1,0 +1,197 @@
+name: Security scan (SBOM, CVE, dependencies)
+
+# Tracks the components that ship in the two images (see COMPONENTS.md):
+#   sbom      builds both images (linux/amd64, local only, nothing is pushed) and writes SPDX-JSON SBOMs
+#   scan      Trivy CVE scan of both images (OS packages and Go binary)
+#   go-vuln   govulncheck on the Go module graph (reachable vulnerabilities only)
+#   npm-audit npm audit on the production dependencies of the frontend
+# The four jobs are independent: one failing job does not stop or hide the others.
+#
+# Gating:
+#   pull_request                      report only, the job stays green
+#   push to master, tags v*, weekly   a finding at the configured severity fails the job
+on:
+  push:
+    tags:
+      - v*
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  schedule:
+    # Mondays 03:17 UTC. New CVEs land without any commit, so the default branch is rescanned weekly.
+    - cron: "17 3 * * 1"
+
+# Least privilege by default; jobs that need more declare it themselves.
+permissions:
+  contents: read
+
+concurrency:
+  group: security-scan-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Set to "true" on pull requests: findings are reported but do not fail the job.
+  REPORT_ONLY: ${{ github.event_name == 'pull_request' && 'true' || 'false' }}
+  # Pinned govulncheck release. It is not tracked by Dependabot: bump it by hand with the Go version.
+  GOVULNCHECK_VERSION: v1.10.0
+
+jobs:
+  sbom:
+    name: SBOM (${{ matrix.image }})
+    runs-on: ubuntu-24.04
+    # contents: write is only used to attach the SBOMs to a release on tag builds.
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ovpn-admin
+            dockerfile: Dockerfile.ovpn-admin
+          - image: openvpn
+            dockerfile: Dockerfile.openvpn
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      # Local build only: the image stays in the runner's Docker daemon, nothing is pushed anywhere.
+      - name: Build image (linux/amd64, no push)
+        run: docker build --platform linux/amd64 -f "${{ matrix.dockerfile }}" -t "scan/${{ matrix.image }}:ci" .
+
+      # anchore/sbom-action v0.24.3 (syft)
+      - name: Generate SBOM (SPDX JSON)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: scan/${{ matrix.image }}:ci
+          format: spdx-json
+          output-file: sbom-${{ matrix.image }}.spdx.json
+          artifact-name: sbom-${{ matrix.image }}.spdx.json
+          upload-artifact: true
+          upload-artifact-retention: 90
+          # Release attachment is done by the explicit step below (works on tag push, not only on release events).
+          upload-release-assets: false
+
+      - name: Attach SBOM to the release (tag builds only)
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          SBOM_FILE: sbom-${{ matrix.image }}.spdx.json
+        run: |
+          # The release is usually created together with the tag, so it may not exist yet: wait up to 5 minutes.
+          tries=30
+          while [ "$tries" -gt 0 ]; do
+            tries=$((tries - 1))
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release upload "$TAG" "$SBOM_FILE" --repo "$GITHUB_REPOSITORY" --clobber
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::warning::No release found for tag $TAG after 5 minutes; the SBOM stays available as a workflow artifact only."
+
+  scan:
+    name: Trivy (${{ matrix.image }})
+    runs-on: ubuntu-24.04
+    # security-events: write is only used to upload SARIF to code scanning (never on pull requests).
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ovpn-admin
+            dockerfile: Dockerfile.ovpn-admin
+          - image: openvpn
+            dockerfile: Dockerfile.openvpn
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Build image (linux/amd64, no push)
+        run: docker build --platform linux/amd64 -f "${{ matrix.dockerfile }}" -t "scan/${{ matrix.image }}:ci" .
+
+      # aquasecurity/trivy-action v0.36.0 (immutable release, pinned to the commit)
+      # Gate: exit-code 0 on pull requests (report only), 1 on master, tags and the weekly run.
+      - name: Trivy scan (table, gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: scan/${{ matrix.image }}:ci
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          exit-code: ${{ github.event_name == 'pull_request' && '0' || '1' }}
+
+      # Runs even when the gate step failed, so code scanning always receives the findings.
+      # Only from the default branch (push to master and the weekly schedule), never on pull requests.
+      - name: Trivy scan (SARIF)
+        if: ${{ always() && github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: scan/${{ matrix.image }}:ci
+          format: sarif
+          output: trivy-${{ matrix.image }}.sarif
+          severity: CRITICAL,HIGH
+          limit-severities-for-sarif: true
+          ignore-unfixed: false
+          exit-code: "0"
+          skip-setup-trivy: true
+
+      - name: Upload SARIF to code scanning
+        if: ${{ always() && github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-${{ matrix.image }}.sarif
+          category: trivy-${{ matrix.image }}
+
+  go-vuln:
+    name: govulncheck
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      # Run in the same Go toolchain image the Dockerfile builds with (golang:1.26-alpine).
+      # govulncheck exits 3 when it finds a reachable vulnerability; pull requests report only.
+      - name: govulncheck ./...
+        run: |
+          set +e
+          docker run --rm -v "$PWD:/src" -w /src -e GOVULNCHECK_VERSION golang:1.26-alpine \
+            sh -c 'go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" && /go/bin/govulncheck ./...'
+          rc=$?
+          if [ "$rc" -ne 0 ] && [ "$REPORT_ONLY" = "true" ]; then
+            echo "::warning::govulncheck exited $rc (pull request: report only)"
+            exit 0
+          fi
+          exit "$rc"
+
+  npm-audit:
+    name: npm audit (frontend)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      # Same Node major as the frontend build stage in Dockerfile.ovpn-admin (node:24-alpine).
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      # Production dependencies only; build tooling (webpack and friends) is not shipped in the image.
+      - name: npm audit --omit=dev --audit-level=high
+        run: |
+          set +e
+          npm audit --omit=dev --audit-level=high
+          rc=$?
+          if [ "$rc" -ne 0 ] && [ "$REPORT_ONLY" = "true" ]; then
+            echo "::warning::npm audit exited $rc (pull request: report only)"
+            exit 0
+          fi
+          exit "$rc"
