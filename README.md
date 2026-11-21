@@ -33,7 +33,7 @@ An example of dashboard made using ovpn-admin metrics:
 
 ## Installation
 
-Release notes for this version: [RELEASE-v0.1.7.md](RELEASE-v0.1.7.md) (published with the v0.1.7 release). Earlier releases: [RELEASE-v0.1.6.md](RELEASE-v0.1.6.md) (published with the v0.1.6 release), [RELEASE-v0.1.5.md](RELEASE-v0.1.5.md), [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md), [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md), [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0 to v0.1.4: [UPGRADING.md](UPGRADING.md). Upgrading from v0.1.4 to v0.1.5: [UPGRADING.md](UPGRADING.md#v014--v015). Upgrading from v0.1.5 to v0.1.6: [UPGRADING.md](UPGRADING.md#v015--v016). Upgrading from v0.1.6 to v0.1.7: [UPGRADING.md](UPGRADING.md#v016--v017).
+Release notes for this version: [RELEASE-v0.1.8.md](RELEASE-v0.1.8.md) (not yet published). Earlier releases: [RELEASE-v0.1.7.md](RELEASE-v0.1.7.md) (published with the v0.1.7 release), [RELEASE-v0.1.6.md](RELEASE-v0.1.6.md) (published with the v0.1.6 release), [RELEASE-v0.1.5.md](RELEASE-v0.1.5.md), [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md), [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md), [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0 to v0.1.4: [UPGRADING.md](UPGRADING.md). Upgrading from v0.1.4 to v0.1.5: [UPGRADING.md](UPGRADING.md#v014--v015). Upgrading from v0.1.5 to v0.1.6: [UPGRADING.md](UPGRADING.md#v015--v016). Upgrading from v0.1.6 to v0.1.7: [UPGRADING.md](UPGRADING.md#v016--v017). Upgrading from v0.1.7 to v0.1.8: [UPGRADING.md](UPGRADING.md#v017--v018).
 
 ### 1. Docker
 
@@ -98,9 +98,15 @@ Step-by-step guide with a ready nginx config and fail2ban jails: [docs/hardening
 * **Slave compose file (known issue).** `docker-compose-slave.yaml` refuses to start unless Basic Auth, the sync token and the master credentials are set in the environment, and it publishes its admin port on `127.0.0.1:8081`. It still targets `http://172.20.0.1:8080`, which the loopback binding of the master no longer serves: put a TLS reverse proxy in between. The slave runtime is not verified yet. See `RELEASE-v0.1.2.md` and `RELEASE-v0.1.1.md`.
 * **Chart upgrade notes:** `ovpnAdmin.tag` and `openvpn.tag` are new and default to the chart `appVersion` (the images were `:master`); no value was renamed. The Role is narrowed to `secrets` (get, list, create, update) and `services` (get) in the release namespace.
 
-## Components and CVE tracking
+## Keeping dependencies current
 
-[COMPONENTS.md](COMPONENTS.md) lists every component that ships in the `ovpn-admin` and `openvpn` images (Alpine, OpenVPN, OpenSSL, easy-rsa, Go modules, npm packages), where it comes from and how to bump it. The `Security scan` workflow writes an SBOM per image, runs Trivy, `govulncheck` and `npm audit` on every merge to master, every tag and weekly, and Dependabot opens weekly update pull requests. How to read a finding and what to change: [docs/components.md](docs/components.md).
+[COMPONENTS.md](COMPONENTS.md) lists every component that ships in the `ovpn-admin` and `openvpn` images (Alpine packages, OpenVPN, OpenSSL, easy-rsa, Go modules, npm packages), where each one comes from and how to bump it. How to read a scan finding and what to change: [docs/components.md](docs/components.md).
+
+The `Security scan` workflow (`.github/workflows/security-scan.yaml`) builds both images, writes an SBOM for each, and runs Trivy, `govulncheck` and `npm audit`. It runs every Monday at 03:17 UTC, on every push to master, on every tag, and on every pull request. A pull request only reports findings. On master, on tags and in the weekly run, a critical or high Trivy finding fails the Trivy jobs.
+
+[Dependabot](.github/dependabot.yml) opens update pull requests every week for Go modules, npm packages in `frontend/`, Docker base images, GitHub Actions and the Helm chart.
+
+Until the prebuilt `openvpn-user` binary is rebuilt, the Trivy jobs fail on master, tags and weekly runs. See [RELEASE-v0.1.8.md](RELEASE-v0.1.8.md#known-limitations).
 
 ## Notes
 * This tool uses external calls for `bash`, `coreutils` and `easy-rsa`, thus **Linux systems only are supported** at the moment.
@@ -303,7 +309,7 @@ The choice is saved in your browser only. The server does not store it, so each 
 
 ## Upgrade notes
 
-Upgrading a docker compose deployment (upstream, v0.1.0, v0.1.1, v0.1.2, v0.1.3): follow [UPGRADING.md](UPGRADING.md); `scripts/upgrade.sh` backs up first and covers the audit volume. v0.1.4 steps: [UPGRADING.md](UPGRADING.md#v013--v014). v0.1.5 steps: [UPGRADING.md](UPGRADING.md#v014--v015). v0.1.6 steps: [UPGRADING.md](UPGRADING.md#v015--v016). v0.1.7 steps: [UPGRADING.md](UPGRADING.md#v016--v017).
+Upgrading a docker compose deployment (upstream, v0.1.0, v0.1.1, v0.1.2, v0.1.3): follow [UPGRADING.md](UPGRADING.md); `scripts/upgrade.sh` backs up first and covers the audit volume. v0.1.4 steps: [UPGRADING.md](UPGRADING.md#v013--v014). v0.1.5 steps: [UPGRADING.md](UPGRADING.md#v014--v015). v0.1.6 steps: [UPGRADING.md](UPGRADING.md#v015--v016). v0.1.7 steps: [UPGRADING.md](UPGRADING.md#v016--v017). v0.1.8 steps: [UPGRADING.md](UPGRADING.md#v017--v018).
 
 * **openvpn-user v1.0.4 → v1.0.9** (only relevant with password authentication, `--auth.password` / `OVPN_PASSWD_AUTH=true`). openvpn-user v1.0.9 adds the columns `secret` and `app_configured` to `users.db`. The column `secret` is added without a default value, so for every user whose password was saved by openvpn-user v1.0.4 or older it is `NULL`, and `openvpn-user auth` of v1.0.9 rejects these users (`converting NULL to string is unsupported`) — they cannot connect to the VPN any more. Users created by v1.0.9 are not affected. Additionally `openvpn-user db-migrate` does nothing on a database created by v1.0.4 until `openvpn-user db-init` has created the `migrations` table, and until the database is migrated `openvpn-user create` reports success without saving the user.
   * The Docker images handle this: `setup/configure.sh` of the openvpn image and ovpn-admin itself (when started with `--auth.password` or `--auth.db-init`) run `db-init` and `db-migrate` on start and then replace `NULL` in `secret` with an empty string (the value v1.0.9 stores for new users). All steps are idempotent.

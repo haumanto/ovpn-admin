@@ -11,6 +11,7 @@ Pick your section:
 * [v0.1.4 → v0.1.5](#v014--v015)
 * [v0.1.5 → v0.1.6](#v015--v016)
 * [v0.1.6 → v0.1.7](#v016--v017)
+* [v0.1.7 → v0.1.8](#v017--v018)
 * [upstream → v0.1.x](#upstream--v01x)
 
 Kubernetes/Helm deployments: see `charts/openvpn-admin/README.md`. The historical notes of the first release stay in `UPGRADING-v0.1.0.md`.
@@ -244,6 +245,32 @@ Status: published. v0.1.7 is tagged and released. The steps below apply now. Det
 6. **Verify.** Run `curl -fsS http://127.0.0.1:8080/ping`, log in to the UI with the Basic Auth user, and check the theme button in the top bar. Hover over it or focus it: its tooltip reads `Theme: System (Light)` or `Theme: System (Dark)`, depending on the device setting.
 
 Known limits of this upgrade: no in-place upgrade from a running v0.1.6 with data was run. QA used a fresh stack. The Helm chart was not re-run; it has only its version changed. Firefox and Safari were not tested. A rollback was not tested. v0.1.6 does not read the browser's theme choice, so a rollback leaves that choice unused. See `RELEASE-v0.1.7.md`, Known limitations.
+
+## v0.1.7 → v0.1.8
+
+Status: not published. v0.1.8 is not tagged or released yet. The steps below apply once the `ovpn-admin` image is built from the v0.1.8 checkout. Details: [RELEASE-v0.1.8.md](RELEASE-v0.1.8.md).
+
+1. **Note your current version** (`git describe --tags --always`, or the image tags). You need it for a rollback.
+2. **Update the checkout.** Use `git fetch --tags && git checkout v0.1.8` once the tag exists. The compose files (`docker-compose.yaml`, `docker-compose-slave.yaml`) do not change in v0.1.8. Keep your own edits (network, ports, `OVPN_*`, `BASIC_*`, `OVPN_MASTER_TOKEN`, Telegram settings).
+3. **Rebuild the `ovpn-admin` image only.** The `openvpn` image has no source change since v0.1.7, so it does not need a rebuild.
+   ```bash
+   docker compose -p openvpn-master build --pull ovpn-admin
+   docker compose -p openvpn-master up -d --no-deps ovpn-admin
+   curl -fsS http://127.0.0.1:8080/ping
+   ```
+   Registry users: once the v0.1.8 images are published, change the `ovpn-admin` `image:` line to `ghcr.io/haumanto/ovpn-admin/ovpn-admin:v0.1.8` and run `docker compose -p openvpn-master pull ovpn-admin` instead of `build`.
+4. **Nothing to configure.** There is no runtime or config change in v0.1.8. **No database migration.** `easyrsa_master/`, `ccd_master/`, `users.db` and `audit_master/` are not changed by v0.1.8. Back up before you upgrade anyway, as always:
+   ```bash
+   mkdir -p -m 700 backups
+   tar -czf backups/pre-v0.1.8-$(date -u +%Y%m%dT%H%M%SZ).tar.gz easyrsa_master ccd_master audit_master
+   sha256sum backups/pre-v0.1.8-*.tar.gz
+   ```
+5. **Scans run weekly from now on.** The security scan workflow runs every Monday at 03:17 UTC on master, and on every tag and pull request. It runs on GitHub, not on your server, so it does not change a running deployment. Its results are in the repository's Actions and Security tabs. How to read them: [docs/components.md](docs/components.md).
+6. **Verify.** Run `curl -fsS http://127.0.0.1:8080/ping`, then log in to the UI with the Basic Auth user.
+
+Helm: the chart moves to version 0.1.8 with `appVersion` v0.1.8, and its default image tags follow `appVersion`. Helm was not re-run for this release. See `charts/openvpn-admin/README.md`.
+
+Known limits of this upgrade: no in-place upgrade from a running v0.1.7 with data was run. QA used a fresh stack. A rollback was not tested. The scan jobs of the security workflow are red on master, on tags and in the weekly run until the prebuilt `openvpn-user` binary is rebuilt. That does not affect the running deployment. See `RELEASE-v0.1.8.md`, Known limitations.
 
 ## upstream → v0.1.x
 
