@@ -105,7 +105,7 @@ var (
 	certsArchivePath = "/tmp/" + certsArchiveFileName
 	ccdArchivePath   = "/tmp/" + ccdArchiveFileName
 
-	version = "0.1.9"
+	version = "0.1.10"
 )
 
 var logLevels = map[string]log.Level{
