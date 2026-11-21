@@ -38,7 +38,10 @@ FROM alpine:${ALPINE_VERSION}
 # "iptables" (nft backend) also provides the ip6tables commands, "ip6tables" is listed to make the dependency explicit
 # sqlite: configure.sh fixes users.db rows migrated from openvpn-user <= 1.0.4 (secret IS NULL)
 # fail2ban: bans repeated auth failures and revoked-certificate attempts (jail ovpn-admin, started by configure.sh)
+# "apk upgrade zlib": the base image snapshot can carry a zlib older than the branch (CVE-2026-4738, fixed in 1.4-r0) and
+# "apk add" does not upgrade a package that is already installed. Upgrading only the named package changes nothing else.
 RUN apk add --update bash openvpn easy-rsa iptables iptables-legacy ip6tables sqlite fail2ban && \
+    apk upgrade zlib && \
     ln -s /usr/share/easy-rsa/easyrsa /usr/local/bin && \
     rm -rf /tmp/* /var/tmp/* /var/cache/apk/* /var/cache/distfiles/*
 COPY --from=openvpn-user-builder /out/openvpn-user /usr/local/bin/openvpn-user

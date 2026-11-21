@@ -20,7 +20,16 @@ func (oUser *OpenvpnUser) InitDb() {
 	fmt.Println("Database initialized")
 }
 
+// LOCAL PATCH (ovpn-admin), the only local modification to the upstream Go source, see third_party/openvpn-user/README.md.
+// bcrypt only hashes the first 72 bytes and golang.org/x/crypto/bcrypt returns an error for a longer password; upstream
+// ignores that error (hash, _ :=), so create and change-password reported success while storing an empty hash.
+// The guard below refuses a password over 72 bytes with a non-zero exit before anything is written.
+var errPasswordTooLong = fmt.Errorf("password is longer than 72 bytes (bcrypt limit)")
+
 func (oUser *OpenvpnUser) CreateUser(username, password string) (string, error) {
+	if len(password) > 72 { // LOCAL PATCH (ovpn-admin): bcrypt limit
+		return "", errPasswordTooLong
+	}
 	if !oUser.CheckUserExistent(username) {
 		hash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
 		_, err := oUser.Database.Exec("INSERT INTO users(username, password, secret, revoked, deleted, app_configured) VALUES ($1, $2, $3, 0, 0, 0)", username, string(hash), "")
@@ -172,6 +181,9 @@ func (oUser *OpenvpnUser) PrintUsers(all bool) {
 }
 
 func (oUser *OpenvpnUser) ChangeUserPassword(username, password string) (string, error) {
+	if len(password) > 72 { // LOCAL PATCH (ovpn-admin): bcrypt limit
+		return "", errPasswordTooLong
+	}
 	hash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
 	_, err := oUser.Database.Exec("UPDATE users SET password = $1 WHERE username = $2", hash, username)
 	if err != nil {

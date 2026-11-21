@@ -52,7 +52,10 @@ FROM alpine:3.23
 WORKDIR /app
 COPY --from=backend-builder /app/ovpn-admin /app
 # sqlite: ovpn-admin fixes users.db rows migrated from openvpn-user <= 1.0.4 (secret IS NULL) at startup
+# "apk upgrade zlib": the base image snapshot can carry a zlib older than the branch (CVE-2026-4738, fixed in 1.4-r0) and
+# "apk add" does not upgrade a package that is already installed. Upgrading only the named package changes nothing else.
 RUN apk add --update bash easy-rsa openssl openvpn coreutils sqlite && \
+    apk upgrade zlib && \
     ln -s /usr/share/easy-rsa/easyrsa /usr/local/bin && \
     rm -rf /tmp/* /var/tmp/* /var/cache/apk/* /var/cache/distfiles/*
 COPY --from=openvpn-user-builder /out/openvpn-user /usr/local/bin/openvpn-user

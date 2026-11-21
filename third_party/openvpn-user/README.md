@@ -13,7 +13,7 @@ Command line tool that keeps the password database (`users.db`, SQLite) of the O
 
 Vendored: `openvpn-user.go`, `src/`, `go.mod`, `go.sum`, `LICENSE`. Everything else of the upstream repository (scripts, upstream Dockerfile, CI workflows, README) is not needed to build and is not copied.
 
-The Go source (`openvpn-user.go`, `src/*.go`) is **unmodified**. The only change against upstream is the dependency versions in `go.mod` and `go.sum`, because upstream pins versions from 2022 with known vulnerabilities:
+The Go source (`openvpn-user.go`, `src/*.go`) is **unmodified, except for one local patch** (next section). The other change against upstream is the dependency versions in `go.mod` and `go.sum`, because upstream pins versions from 2022 with known vulnerabilities:
 
 | Module | Upstream v1.0.9 | Here |
 |---|---|---|
@@ -23,6 +23,20 @@ The Go source (`openvpn-user.go`, `src/*.go`) is **unmodified**. The only change
 | `github.com/dgryski/dgoogauth`, `gopkg.in/alecthomas/kingpin.v2` | unchanged | unchanged |
 
 `go.mod` and `go.sum` were produced with `go get github.com/mattn/go-sqlite3@<version> golang.org/x/crypto@<version> && go mod tidy`. The `go.mod` file keeps the upstream module path `github.com/pashcovich/openvpn-user`, which the source imports (`github.com/pashcovich/openvpn-user/src`).
+
+## Local patch (carry it forward)
+
+There is exactly **one local modification to the upstream Go source**: a 72-byte password guard in `src/commands.go`. Upstream base: commit `5eefd1b4d304810718246d352912c0667232fbb3` (tag `v1.0.9`). Every other `.go` file and `LICENSE` is byte-identical to that commit.
+
+| | |
+|---|---|
+| File | `src/commands.go` only (`+12` lines, nothing removed) |
+| Change | New `var errPasswordTooLong`, and `if len(password) > 72 { return "", errPasswordTooLong }` at the top of `CreateUser` and `ChangeUserPassword`. Both sites carry the marker `LOCAL PATCH (ovpn-admin)`; `grep -rn "LOCAL PATCH" src/` finds all of them. |
+| Why | bcrypt hashes at most 72 bytes. `golang.org/x/crypto/bcrypt` returns `ErrPasswordTooLong` for a longer password, and upstream drops that error (`hash, _ := bcrypt.GenerateFromPassword(...)`), so a direct `openvpn-user create --password=<73+ bytes>` reported "User created" with an empty hash stored, and `change-password` reported "Password changed" and replaced the existing hash with NULL (measured on the unpatched binary, exit code 0 both times). Now the command exits 1 with `openvpn-user: error: password is longer than 72 bytes (bcrypt limit)` and writes nothing. |
+| Behaviour for 72 bytes or less | Unchanged. |
+| Also enforced by | `ovpn-admin` itself (HTTP 400 for a password under 8 or over 72 bytes, `password_test.go`); the patch closes the direct command line path. |
+
+If upstream fixes this itself, drop the patch. Until then, **a new upstream import must re-apply it**: after step 2 of "How to update", check that `grep -rn "LOCAL PATCH" src/` still finds the three markers, and run the guard check (73 bytes must exit non-zero and leave `users.db` unchanged, 72 bytes must succeed). To list the whole difference against upstream, diff this directory against a fresh clone of the base commit: expected are `src/commands.go` (the patch), `go.mod`, `go.sum`, and this README; the upstream files that are not vendored (scripts, Dockerfile, CI) do not exist here.
 
 ## How it is built
 
@@ -57,6 +71,6 @@ Then run the old-versus-new command comparison and `govulncheck ./...` as in the
 New upstream release (none exists after v1.0.9 at the time of writing):
 
 1. Check out the upstream tag, note the full commit id.
-2. Replace `openvpn-user.go`, `src/` and `LICENSE` with the upstream files. Keep (and re-bump) our `go.mod` and `go.sum`.
+2. Replace `openvpn-user.go`, `src/` and `LICENSE` with the upstream files, then re-apply the "Local patch" above (the replacement removes it). Keep (and re-bump) our `go.mod` and `go.sum`.
 3. Update the version and commit id in this file and in COMPONENTS.md.
-4. Re-run the checks above. Review the diff to upstream; do not carry local code changes silently.
+4. Re-run the checks above. Review the diff to upstream; the only local code change is the "Local patch" above, do not carry any other silently.
