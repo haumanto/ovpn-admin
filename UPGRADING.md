@@ -12,6 +12,8 @@ Pick your section:
 * [v0.1.5 → v0.1.6](#v015--v016)
 * [v0.1.6 → v0.1.7](#v016--v017)
 * [v0.1.7 → v0.1.8](#v017--v018)
+* [v0.1.8 → v0.1.9](#v018--v019)
+* [v0.1.9 → v0.1.10](#v019--v0110)
 * [upstream → v0.1.x](#upstream--v01x)
 
 Kubernetes/Helm deployments: see `charts/openvpn-admin/README.md`. The historical notes of the first release stay in `UPGRADING-v0.1.0.md`.
@@ -298,6 +300,34 @@ Status: candidate, not published. The steps below apply once v0.1.9 is tagged an
 8. **Verify.** Run `curl -fsS http://127.0.0.1:8080/ping`, then log in to the UI with the Basic Auth user.
 
 Known limits of this upgrade: no in-place upgrade of a running v0.1.8 deployment with live data was run. QA used fresh stacks and databases written by each binary. A rollback was not part of QA. The refusal status codes are 422 (create), 500 (change-password) and 400 (rotate). See `RELEASE-v0.1.9.md`, Known limitations.
+
+## v0.1.9 → v0.1.10
+
+Status: candidate, not published. The steps below apply once v0.1.10 is tagged and released. Details: [RELEASE-v0.1.10.md](RELEASE-v0.1.10.md).
+
+1. **Note your current version** (`git describe --tags --always`, or the image tags). You need it for a rollback.
+2. **Update the checkout** once the `v0.1.10` tag exists: `git fetch --tags && git checkout v0.1.10`. The compose files (`docker-compose.yaml`, `docker-compose-slave.yaml`) and `setup/` do not change in v0.1.10. Keep your own edits.
+3. **Rebuild both images.** Both images change: `ovpn-admin` (zlib 1.4-r0 and the Go code) and `openvpn` (zlib 1.4-r0 and the `openvpn-user` binary, which now refuses passwords over 72 bytes):
+   ```bash
+   docker compose -p openvpn-master build --pull ovpn-admin openvpn
+   docker compose -p openvpn-master up -d --no-deps ovpn-admin openvpn
+   curl -fsS http://127.0.0.1:8080/ping
+   ```
+   Restarting the `openvpn` container drops connected VPN clients. Do this in a quiet window.
+   Registry users: once the v0.1.10 images are published, change the `image:` lines to the `:v0.1.10` tags and run `docker compose -p openvpn-master pull` instead of `build`.
+4. **No config change, no data migration.** The release adds no flag, no environment variable and no schema change. The start-up steps `db-init` and `db-migrate` still run as before. Back up before you upgrade:
+   ```bash
+   mkdir -p -m 700 backups
+   tar -czf backups/pre-v0.1.10-$(date -u +%Y%m%dT%H%M%SZ).tar.gz easyrsa_master ccd_master audit_master
+   sha256sum backups/pre-v0.1.10-*.tar.gz
+   ```
+5. **Rotate works for active, revoked and expired users.** A rotate answers HTTP 200, revokes the old certificate and gives a new valid certificate with the new password you enter. A failed rotate keeps the old certificate and password. The warning "do not rotate an Active user" from v0.1.9 no longer applies after this upgrade, but see the next step.
+6. **Check users that v0.1.9 left Revoked.** A failed rotate under v0.1.9 could leave a user Revoked and locked out. This was not tested on v0.1.10. After the upgrade, check these users in the UI before you rely on them.
+7. **Passwords.** A password over 72 bytes is refused on create, change-password and rotate, with HTTP 400 and a clear message. A direct `openvpn-user create` or `change-password` with more than 72 bytes exits 1 and writes nothing. Passwords set under v0.1.9 keep working.
+8. **Helm.** The chart's `version` and `appVersion` move to v0.1.10 (`charts/openvpn-admin/Chart.yaml`). No chart template changed in this release.
+9. **Verify.** Run `curl -fsS http://127.0.0.1:8080/ping`, then log in to the UI with the Basic Auth user.
+
+Known limits of this upgrade: no in-place upgrade of a running v0.1.9 deployment with live data was run. QA used fresh stacks. A rollback was not tested. arm64 images were not tested. Do not rotate a user on the `kubernetes.secrets` backend until it is tested. See `RELEASE-v0.1.10.md`, Known limitations.
 
 ## upstream → v0.1.x
 
