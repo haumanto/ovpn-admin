@@ -1184,7 +1184,8 @@ func (oAdmin *OvpnAdmin) userChangePassword(username, password string) (error, s
 		return nil, "Password changed"
 	}
 
-	return fmt.Errorf("user %q not found", username), fmt.Sprintf("User \"%s\" not found", username)
+	// a user that does not exist is a refused request (HTTP 400), like a bad password
+	return inputError{fmt.Sprintf("user %q not found", username)}, fmt.Sprintf("User \"%s\" not found", username)
 }
 
 // runOpenvpnUser runs an openvpn-user command against --auth.db. Values are passed as

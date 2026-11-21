@@ -568,6 +568,39 @@ func TestPasswordInputErrorsAreBadRequests(t *testing.T) {
 	}
 }
 
+// change-password for a user that does not exist (unknown, malformed or empty name) is a refused request:
+// HTTP 400 with the "not found" message, and nothing is created or changed.
+func TestChangePasswordUnknownUserIsBadRequest(t *testing.T) {
+	oAdmin, _ := setupFakeEasyrsa(t)
+	db := setupFakeOpenvpnUser(t)
+	mustCreate(t, oAdmin, "alice", "Old-pass-1")
+	dbBefore := readDB(t, db)
+	indexBefore := fRead(*indexTxtPath)
+
+	for _, name := range []string{"qa-ghost", "bad name!", "a/b", ""} {
+		for _, password := range []string{"Valid-pass-2", strings.Repeat("b", 72)} {
+			rec := postForm(oAdmin.userChangePasswordHandler, "/api/user/change-password", url.Values{"username": {name}, "password": {password}})
+			var body map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatalf("user %q body %q: %v", name, rec.Body.String(), err)
+			}
+			want := fmt.Sprintf("User \"%s\" not found", name)
+			if rec.Code != http.StatusBadRequest || body["status"] != "error" || body["message"] != want {
+				t.Errorf("user %q: %d %v, want 400 %q", name, rec.Code, body, want)
+			}
+		}
+	}
+	if got := readDB(t, db); got != dbBefore {
+		t.Errorf("users.db changed: %q, was %q", got, dbBefore)
+	}
+	if got := fRead(*indexTxtPath); got != indexBefore {
+		t.Errorf("index.txt changed: %q, was %q", got, indexBefore)
+	}
+	if checkCommonNameExist("qa-ghost") {
+		t.Error("change-password created a certificate")
+	}
+}
+
 // The status codes that are not input errors are unchanged: a user that does not exist is not a 5xx
 // of create, a failing issue stays 422.
 func TestCreateFailureStatusCodes(t *testing.T) {
