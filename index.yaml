@@ -2,6 +2,26 @@ apiVersion: v1
 entries:
   openvpn-admin:
   - apiVersion: v1
+    appVersion: v0.1.10
+    created: "2026-11-21T13:55:54.748253477Z"
+    description: Simple web UI to manage OpenVPN users, their certificates & routes
+      in Linux. While backend is written in Go, frontend is based on Vue.js.
+    digest: cf36c2977b6ae00faab231306e904f16bcbb533211a930153f384fb375ab6f68
+    keywords:
+    - kubernetes
+    - openvpn
+    kubeVersion: '>=1.14.0-0'
+    maintainers:
+    - email: max.nabokih@gmail.com
+      name: nabokihms
+      url: github.com/nabokihms
+    name: openvpn-admin
+    sources:
+    - https://github.com/haumanto/ovpn-admin
+    urls:
+    - https://github.com/haumanto/ovpn-admin/releases/download/openvpn-admin-0.1.10/openvpn-admin-0.1.10.tgz
+    version: 0.1.10
+  - apiVersion: v1
     appVersion: v0.1.9
     created: "2026-11-21T08:40:29.558976838Z"
     description: Simple web UI to manage OpenVPN users, their certificates & routes
@@ -181,4 +201,4 @@ entries:
     urls:
     - https://github.com/haumanto/ovpn-admin/releases/download/openvpn-admin-0.1.1/openvpn-admin-0.1.1.tgz
     version: 0.1.1
-generated: "2026-11-21T08:40:29.55900571Z"
+generated: "2026-11-21T13:55:54.748275605Z"
