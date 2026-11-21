@@ -272,6 +272,33 @@ Helm: the chart moves to version 0.1.8 with `appVersion` v0.1.8, and its default
 
 Known limits of this upgrade: no in-place upgrade from a running v0.1.7 with data was run. QA used a fresh stack. A rollback was not tested. The scan jobs of the security workflow are red on master, on tags and in the weekly run until the prebuilt `openvpn-user` binary is rebuilt. That does not affect the running deployment. See `RELEASE-v0.1.8.md`, Known limitations.
 
+## v0.1.8 → v0.1.9
+
+Status: candidate, not published. The steps below apply once v0.1.9 is tagged and released. Details: [RELEASE-v0.1.9.md](RELEASE-v0.1.9.md).
+
+1. **Note your current version** (`git describe --tags --always`, or the image tags). You need it for a rollback.
+2. **Update the checkout.** Use `git fetch --tags && git checkout v0.1.9`. The compose files (`docker-compose.yaml`, `docker-compose-slave.yaml`) and `setup/` do not change in v0.1.9. Keep your own edits.
+3. **Rebuild both images.** Unlike v0.1.8, the `openvpn` image changes in this release: it now carries the `openvpn-user` binary built from vendored source. Rebuild `ovpn-admin` and `openvpn`:
+   ```bash
+   docker compose -p openvpn-master build --pull ovpn-admin openvpn
+   docker compose -p openvpn-master up -d --no-deps ovpn-admin openvpn
+   curl -fsS http://127.0.0.1:8080/ping
+   ```
+   Restarting the `openvpn` container drops connected VPN clients. Do this in a quiet window.
+   Registry users: once the v0.1.9 images are published, change the `image:` lines to the `:v0.1.9` tags and run `docker compose -p openvpn-master pull` instead of `build`.
+4. **No config change, no data migration.** `users.db` has no schema change in v0.1.9 and no migration is added. The start-up steps `db-init` and `db-migrate` still run as before, so the file is not byte-for-byte untouched. Back up before you upgrade:
+   ```bash
+   mkdir -p -m 700 backups
+   tar -czf backups/pre-v0.1.9-$(date -u +%Y%m%dT%H%M%SZ).tar.gz easyrsa_master ccd_master audit_master
+   sha256sum backups/pre-v0.1.9-*.tar.gz
+   ```
+5. **Passwords.** A password over 72 bytes is now refused with a clear message on create, change-password and rotate in ovpn-admin. Passwords set under v0.1.8 keep working after the upgrade. Login still reads only the first 72 bytes of a password.
+6. **Do not rotate an Active user.** A valid rotate fails in v0.1.9 (and in v0.1.8). The certificate is revoked and the password row is deleted, so the user cannot connect and shows as Revoked. This is not fixed in v0.1.9. See `RELEASE-v0.1.9.md`, Known limitations.
+7. **Helm.** The chart's version fields move to 0.1.9 (`charts/openvpn-admin/Chart.yaml`). No chart template changed in this release. The chart was not deployed in QA.
+8. **Verify.** Run `curl -fsS http://127.0.0.1:8080/ping`, then log in to the UI with the Basic Auth user.
+
+Known limits of this upgrade: no in-place upgrade of a running v0.1.8 deployment with live data was run. QA used fresh stacks and databases written by each binary. A rollback was not part of QA. The refusal status codes are 422 (create), 500 (change-password) and 400 (rotate). See `RELEASE-v0.1.9.md`, Known limitations.
+
 ## upstream → v0.1.x
 
 For deployments started with upstream `./start.sh` (images built locally with `docker compose up -d --build`) or with the upstream registry images.
