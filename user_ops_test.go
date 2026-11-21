@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"os"
@@ -59,11 +58,20 @@ func fakeEasyrsa(t *testing.T, args []string) error {
 				return fmt.Errorf("%s already exists", f)
 			}
 		}
-		serial, cert := writeTestCert(t, name, int64(0x1000+len(lines)), x509.ExtKeyUsageClientAuth)
+		serial, cert, key, req := writeTestClient(t, name, int64(0x1000+len(lines)))
+		// ".fake-fail-build": "clean" fails before anything is written, "partial" fails after the
+		// request and the key are written (easyrsa gen-req is done, sign-req fails)
+		if mode, err := os.ReadFile(".fake-fail-build"); err == nil {
+			if strings.TrimSpace(string(mode)) == "partial" {
+				_ = os.WriteFile("pki/private/"+name+".key", key, 0600)
+				_ = os.WriteFile("pki/reqs/"+name+".req", req, 0600)
+			}
+			return errors.New("injected build failure")
+		}
 		files := map[string][]byte{
 			"issued/" + name + ".crt":            cert,
-			"private/" + name + ".key":           []byte("key " + serial),
-			"reqs/" + name + ".req":              []byte("req " + serial),
+			"private/" + name + ".key":           key,
+			"reqs/" + name + ".req":              req,
 			"certs_by_serial/" + serial + ".pem": cert,
 		}
 		for f, data := range files {
@@ -78,16 +86,23 @@ func fakeEasyrsa(t *testing.T, args []string) error {
 		if answer, _ := bufio.NewReader(os.Stdin).ReadString('\n'); strings.TrimSpace(answer) != "yes" {
 			return errors.New("not confirmed")
 		}
+		// ".fake-layout" = "keep": easy-rsa 3.2 (the one of the ovpn-admin image) moves only the certificate
+		// and leaves private/<user>.key and reqs/<user>.req where they are
+		_, statErr := os.Stat(".fake-layout")
+		keepKeyAndReq := statErr == nil
 		found := false
 		for i, line := range lines {
 			f := strings.Split(line, "\t")
-			if len(f) == 6 && f[5] == "/CN="+name && f[0] == "V" {
+			if len(f) == 6 && f[5] == "/CN="+name && (f[0] == "V" || f[0] == "E") {
 				serial := f[3]
 				lines[i] = strings.Join([]string{"R", f[1], "260101000000Z", serial, f[4], f[5]}, "\t")
 				moves := [][2]string{
 					{"issued/" + name + ".crt", "revoked/certs_by_serial/" + serial + ".crt"},
-					{"private/" + name + ".key", "revoked/private_by_serial/" + serial + ".key"},
-					{"reqs/" + name + ".req", "revoked/reqs_by_serial/" + serial + ".req"},
+				}
+				if !keepKeyAndReq {
+					moves = append(moves,
+						[2]string{"private/" + name + ".key", "revoked/private_by_serial/" + serial + ".key"},
+						[2]string{"reqs/" + name + ".req", "revoked/reqs_by_serial/" + serial + ".req"})
 				}
 				for _, m := range moves {
 					if err := os.Rename("pki/"+m[0], "pki/"+m[1]); err != nil {

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/x509"
@@ -13,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
@@ -274,7 +276,7 @@ func (oAdmin *OvpnAdmin) userCreateHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	_ = r.ParseForm()
-	userCreated, userCreateStatus := oAdmin.userCreate(r.FormValue("username"), r.FormValue("password"))
+	userCreated, userCreateStatus, status := oAdmin.userCreateStatus(r.FormValue("username"), r.FormValue("password"))
 
 	if userCreated {
 		oAdmin.clients = oAdmin.usersList()
@@ -282,7 +284,7 @@ func (oAdmin *OvpnAdmin) userCreateHandler(w http.ResponseWriter, r *http.Reques
 		fmt.Fprint(w, userCreateStatus)
 		return
 	} else {
-		http.Error(w, userCreateStatus, http.StatusUnprocessableEntity)
+		http.Error(w, userCreateStatus, status)
 	}
 }
 func (oAdmin *OvpnAdmin) userRotateHandler(w http.ResponseWriter, r *http.Request) {
@@ -376,6 +378,9 @@ func (oAdmin *OvpnAdmin) userChangePasswordHandler(w http.ResponseWriter, r *htt
 		status, code := "ok", http.StatusOK
 		if err != nil {
 			status, code = "error", http.StatusInternalServerError
+			if isInputError(err) {
+				code = http.StatusBadRequest
+			}
 		}
 		body, _ := json.Marshal(map[string]string{"status": status, "message": msg})
 		w.Header().Set("Content-Type", "application/json")
@@ -956,8 +961,19 @@ func validateUsername(username string) error {
 	if validUsername.MatchString(username) && usernameIsPathSafe(username) {
 		return nil
 	} else {
-		return errors.New(fmt.Sprintf("Username can only contains %s and must not be \".\" or \"..\"", usernameRegexp))
+		return inputError{fmt.Sprintf("Username can only contains %s and must not be \".\" or \"..\"", usernameRegexp)}
 	}
+}
+
+// inputError is a value of the request that is refused (user name, password): the handlers answer
+// it with HTTP 400 and its message.
+type inputError struct{ msg string }
+
+func (e inputError) Error() string { return e.msg }
+
+func isInputError(err error) bool {
+	var ie inputError
+	return errors.As(err, &ie)
 }
 
 // usernameIsPathSafe reports whether username can be used as a file name
@@ -969,12 +985,12 @@ func usernameIsPathSafe(username string) bool {
 
 func validatePassword(password string) error {
 	if utf8.RuneCountInString(password) < passwordMinLength {
-		return errors.New(fmt.Sprintf("Password too short, password length must be greater or equal %d", passwordMinLength))
+		return inputError{fmt.Sprintf("Password too short, password length must be greater or equal %d", passwordMinLength)}
 	}
 	// openvpn-user ignores the error of bcrypt.GenerateFromPassword, so a longer password would be
 	// reported as saved while no hash is stored. The limit is in bytes, not characters.
 	if len(password) > passwordMaxBytes {
-		return errors.New(fmt.Sprintf("Password too long, the hash accepts at most %d bytes", passwordMaxBytes))
+		return inputError{fmt.Sprintf("Password too long, the hash accepts at most %d bytes", passwordMaxBytes)}
 	}
 	return nil
 }
@@ -1072,6 +1088,13 @@ func (oAdmin *OvpnAdmin) usersList() []OpenvpnClient {
 }
 
 func (oAdmin *OvpnAdmin) userCreate(username, password string) (bool, string) {
+	created, msg, _ := oAdmin.userCreateStatus(username, password)
+	return created, msg
+}
+
+// userCreateStatus is userCreate with the HTTP status of the answer: 400 for a refused value (user
+// name, password, a name that is taken), 422 when the user could not be created for another reason.
+func (oAdmin *OvpnAdmin) userCreateStatus(username, password string) (bool, string, int) {
 	ucErr := fmt.Sprintf("User \"%s\" created", username)
 
 	oAdmin.createUserMutex.Lock()
@@ -1080,18 +1103,18 @@ func (oAdmin *OvpnAdmin) userCreate(username, password string) (bool, string) {
 	if checkCommonNameExist(username) {
 		ucErr = fmt.Sprintf("User \"%s\" already exists\n", username)
 		log.Debugf("userCreate: checkCommonNameExist():  %s", ucErr)
-		return false, ucErr
+		return false, ucErr, http.StatusBadRequest
 	}
 
 	if err := validateUsername(username); err != nil {
 		log.Debugf("userCreate: validateUsername(): %s", err.Error())
-		return false, err.Error()
+		return false, err.Error(), http.StatusBadRequest
 	}
 
 	if *authByPassword {
 		if err := validatePassword(password); err != nil {
 			log.Debugf("userCreate: authByPassword(): %s", err.Error())
-			return false, err.Error()
+			return false, err.Error(), http.StatusBadRequest
 		}
 	}
 
@@ -1102,7 +1125,7 @@ func (oAdmin *OvpnAdmin) userCreate(username, password string) (bool, string) {
 		// so the row is checked afterwards
 		if _, err := runOpenvpnUser("create", "--user="+username, "--password="+password); err != nil || !ovpnUserExistsInDb(username) {
 			log.Errorf("userCreate: saving the password of user %s failed: %v", username, err)
-			return false, fmt.Sprintf("Failed to save the password of user \"%s\"", username)
+			return false, fmt.Sprintf("Failed to save the password of user \"%s\"", username), http.StatusUnprocessableEntity
 		}
 	}
 	rollbackPassword := func() {
@@ -1118,13 +1141,13 @@ func (oAdmin *OvpnAdmin) userCreate(username, password string) (bool, string) {
 		if err != nil {
 			log.Error(err)
 			rollbackPassword()
-			return false, err.Error()
+			return false, err.Error(), http.StatusUnprocessableEntity
 		}
 	} else {
 		if _, err := runCommand(*easyrsaDirPath, "", *easyrsaBinPath, "--batch", "build-client-full", username, "nopass"); err != nil {
 			log.Errorf("userCreate: %v", err)
 			rollbackPassword()
-			return false, fmt.Sprintf("Failed to issue certificate for user \"%s\"", username)
+			return false, fmt.Sprintf("Failed to issue certificate for user \"%s\"", username), http.StatusUnprocessableEntity
 		}
 	}
 
@@ -1132,7 +1155,7 @@ func (oAdmin *OvpnAdmin) userCreate(username, password string) (bool, string) {
 
 	//oAdmin.clients = oAdmin.usersList()
 
-	return true, ucErr
+	return true, ucErr, http.StatusOK
 }
 
 func (oAdmin *OvpnAdmin) userChangePassword(username, password string) (error, string) {
@@ -1343,89 +1366,416 @@ func (oAdmin *OvpnAdmin) revokeBeforeReplace(username string) error {
 }
 
 func (oAdmin *OvpnAdmin) userRotate(username, newPassword string) (error, string) {
-	if usernameIsPathSafe(username) && checkUserExist(username) {
-		// checked before anything is changed: userCreate below validates it again, but by then the old
-		// password row is already deleted
-		if *authByPassword {
-			if err := validatePassword(newPassword); err != nil {
-				log.Warningf("userRotate: %s", err.Error())
-				return err, err.Error()
-			}
+	if !(usernameIsPathSafe(username) && checkUserExist(username)) {
+		return fmt.Errorf("user %q not found", username), fmt.Sprintf("{\"msg\":\"User \"%s\" not found\"}", username)
+	}
+	// checked before anything is changed: a refused password must not cost the user its certificate
+	if *authByPassword {
+		if err := validatePassword(newPassword); err != nil {
+			log.Warningf("userRotate: %s", err.Error())
+			return err, err.Error()
 		}
+	}
+
+	if *storageBackend == "kubernetes.secrets" {
 		if err := oAdmin.revokeBeforeReplace(username); err != nil {
 			return err, err.Error()
 		}
-		if *storageBackend == "kubernetes.secrets" {
-			err := app.easyrsaRotate(username, newPassword)
-			if err != nil {
-				log.Error(err)
-			}
-		} else {
-
-			var oldUserIndex, newUserIndex int
-			var oldUserSerial string
-
-			uniqHash := strings.Replace(uuid.New().String(), "-", "", -1)
-
-			usersFromIndexTxt := indexTxtParser(fRead(*indexTxtPath))
-			for i := range usersFromIndexTxt {
-				if usersFromIndexTxt[i].DistinguishedName == "/CN="+username {
-					oldUserSerial = usersFromIndexTxt[i].SerialNumber
-					usersFromIndexTxt[i].DistinguishedName = "/CN=REVOKED-" + username + "-" + uniqHash
-					oldUserIndex = i
-					break
-				}
-			}
-			err := fWrite(*indexTxtPath, renderIndexTxt(usersFromIndexTxt))
-			if err != nil {
-				log.Error(err)
-			}
-
-			if *authByPassword {
-				if _, err := runOpenvpnUser("delete", "--force", "--user="+username); err != nil {
-					log.Errorf("userRotate: %v", err)
-				}
-			}
-
-			userCreated, userCreateMessage := oAdmin.userCreate(username, newPassword)
-			if !userCreated {
-				usersFromIndexTxt = indexTxtParser(fRead(*indexTxtPath))
-				for i := range usersFromIndexTxt {
-					if usersFromIndexTxt[i].SerialNumber == oldUserSerial {
-						usersFromIndexTxt[i].DistinguishedName = "/CN=" + username
-						break
-					}
-				}
-				err = fWrite(*indexTxtPath, renderIndexTxt(usersFromIndexTxt))
-				if err != nil {
-					log.Error(err)
-				}
-				return errors.New(fmt.Sprintf("error rotaing user due:  %s", userCreateMessage)), userCreateMessage
-			}
-
-			usersFromIndexTxt = indexTxtParser(fRead(*indexTxtPath))
-			for i := range usersFromIndexTxt {
-				if usersFromIndexTxt[i].DistinguishedName == "/CN="+username {
-					newUserIndex = i
-				}
-				if usersFromIndexTxt[i].SerialNumber == oldUserSerial {
-					oldUserIndex = i
-				}
-			}
-			usersFromIndexTxt[oldUserIndex], usersFromIndexTxt[newUserIndex] = usersFromIndexTxt[newUserIndex], usersFromIndexTxt[oldUserIndex]
-
-			err = fWrite(*indexTxtPath, renderIndexTxt(usersFromIndexTxt))
-			if err != nil {
-				log.Error(err)
-			}
-
-			easyrsaGenCrl()
+		if err := app.easyrsaRotate(username, newPassword); err != nil {
+			log.Error(err)
 		}
-		crlFix()
-		oAdmin.clients = oAdmin.usersList()
-		return nil, fmt.Sprintf("{\"msg\":\"User %s successfully rotated\"}", username)
+	} else if err, msg := oAdmin.rotateFilesystem(username, newPassword); err != nil {
+		return err, msg
 	}
-	return errors.New(fmt.Sprintf("user \"%s\" not found", username)), fmt.Sprintf("{\"msg\":\"User \"%s\" not found\"}", username)
+
+	crlFix()
+	oAdmin.clients = oAdmin.usersList()
+	return nil, fmt.Sprintf("{\"msg\":\"User %s successfully rotated\"}", username)
+}
+
+// rotation holds what userRotate needs to put a user back as it was. The filesystem backend replaces a
+// certificate in several steps (revoke, move the old request and key away, issue, replace the password)
+// and a failing step must never leave the user revoked, without a password or without files.
+type rotation struct {
+	username   string
+	serial     string // serial of the certificate that is replaced
+	index      []byte // index.txt before the first change
+	wasRevoked bool   // the certificate was revoked before the rotation
+	row        ovpnUserRow
+	files      []rotationFile
+	inline     map[string][]byte // inline files, easyrsa revoke deletes them
+}
+
+// rotationFile is a file of the user that easy-rsa refuses to overwrite (live) and the place where
+// easy-rsa keeps it once its certificate is revoked (archive).
+type rotationFile struct {
+	live, archive             string
+	liveBefore, archiveBefore bool
+}
+
+// ovpnUserRow is the state of a user in the openvpn-user database.
+type ovpnUserRow struct{ exists, revoked bool }
+
+func pkiFile(parts ...string) string {
+	return path.Join(append([]string{*easyrsaDirPath, "pki"}, parts...)...)
+}
+
+func newRotation(username string) (*rotation, error) {
+	raw, err := os.ReadFile(*indexTxtPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read index.txt: %w", err)
+	}
+	r := &rotation{username: username, index: raw, inline: map[string][]byte{}}
+	found := false
+	for _, line := range indexTxtParser(string(raw)) {
+		if line.DistinguishedName == "/CN="+username {
+			r.serial, r.wasRevoked, found = line.SerialNumber, line.Flag == "R", true
+			break
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("user %q not found", username)
+	}
+	r.files = []rotationFile{
+		{live: pkiFile("issued", username+".crt"), archive: pkiFile("revoked", "certs_by_serial", r.serial+".crt")},
+		{live: pkiFile("private", username+".key"), archive: pkiFile("revoked", "private_by_serial", r.serial+".key")},
+		{live: pkiFile("reqs", username+".req"), archive: pkiFile("revoked", "reqs_by_serial", r.serial+".req")},
+	}
+	for i := range r.files {
+		r.files[i].liveBefore = fExist(r.files[i].live)
+		r.files[i].archiveBefore = fExist(r.files[i].archive)
+	}
+	for _, p := range []string{pkiFile("inline", username+".inline"), pkiFile("inline", "private", username+".inline")} {
+		if data, err := os.ReadFile(p); err == nil {
+			r.inline[p] = data
+		}
+	}
+	if *authByPassword {
+		out, err := runOpenvpnUser("list", "--all")
+		if err != nil {
+			return nil, fmt.Errorf("cannot read the password database: %w", err)
+		}
+		r.row = ovpnUserListRow(out, username)
+	}
+	return r, nil
+}
+
+// ovpnUserListRow finds username in the output of "openvpn-user list --all" (see ovpnUserListHasUser).
+func ovpnUserListRow(out, username string) ovpnUserRow {
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Split(line, "|")
+		if len(fields) < 3 {
+			continue
+		}
+		if _, err := strconv.ParseUint(strings.TrimSpace(fields[0]), 10, 64); err != nil {
+			continue
+		}
+		if strings.TrimSpace(fields[1]) == username {
+			return ovpnUserRow{exists: true, revoked: strings.TrimSpace(fields[2]) == "true"}
+		}
+	}
+	return ovpnUserRow{}
+}
+
+func pemBlocks(data []byte) []*pem.Block {
+	var blocks []*pem.Block
+	for {
+		var b *pem.Block
+		b, data = pem.Decode(data)
+		if b == nil {
+			return blocks
+		}
+		blocks = append(blocks, b)
+	}
+}
+
+func serialMatches(serial *big.Int, hexSerial string) bool {
+	want, ok := new(big.Int).SetString(hexSerial, 16)
+	return ok && serial.Cmp(want) == 0
+}
+
+// oldCertificate reads the certificate that is replaced, wherever easy-rsa has it by now.
+func (r *rotation) oldCertificate() *x509.Certificate {
+	for _, p := range []string{
+		pkiFile("issued", r.username+".crt"),
+		pkiFile("revoked", "certs_by_serial", r.serial+".crt"),
+		pkiFile("certs_by_serial", r.serial+".pem"),
+	} {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		for _, b := range pemBlocks(data) {
+			if b.Type != "CERTIFICATE" {
+				continue
+			}
+			if c, err := x509.ParseCertificate(b.Bytes); err == nil && serialMatches(c.SerialNumber, r.serial) {
+				return c
+			}
+		}
+	}
+	return nil
+}
+
+// belongsTo reports whether the certificate, the request or the private key in file is the one of cert.
+func belongsTo(file string, cert *x509.Certificate) bool {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return false
+	}
+	samePublicKey := func(pub crypto.PublicKey) bool {
+		k, ok := pub.(interface{ Equal(crypto.PublicKey) bool })
+		return ok && k.Equal(cert.PublicKey)
+	}
+	for _, b := range pemBlocks(data) {
+		switch {
+		case b.Type == "CERTIFICATE":
+			if c, err := x509.ParseCertificate(b.Bytes); err == nil && c.Equal(cert) {
+				return true
+			}
+		case strings.HasSuffix(b.Type, "CERTIFICATE REQUEST"):
+			if csr, err := x509.ParseCertificateRequest(b.Bytes); err == nil && samePublicKey(csr.PublicKey) {
+				return true
+			}
+		case strings.HasSuffix(b.Type, "PRIVATE KEY"):
+			var key any
+			if k, err := x509.ParsePKCS8PrivateKey(b.Bytes); err == nil {
+				key = k
+			} else if k, err := x509.ParsePKCS1PrivateKey(b.Bytes); err == nil {
+				key = k
+			} else if k, err := x509.ParseECPrivateKey(b.Bytes); err == nil {
+				key = k
+			}
+			if s, ok := key.(interface{ Public() crypto.PublicKey }); ok && samePublicKey(s.Public()) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// archiveStaleFiles moves the files easy-rsa leaves behind when it revokes a certificate (easy-rsa 3.2 keeps
+// private/<user>.key and reqs/<user>.req) to the place where it keeps the files of a revoked certificate,
+// so build-client-full does not abort with "Request file already exists". A file is moved only when it
+// belongs to the certificate with the serial of the revoked entry, and never over another file.
+func (r *rotation) archiveStaleFiles() error {
+	var cert *x509.Certificate
+	for _, f := range r.files {
+		if !fExist(f.live) {
+			continue
+		}
+		if cert == nil {
+			cert = r.oldCertificate()
+		}
+		if cert == nil || !belongsTo(f.live, cert) {
+			return fmt.Errorf("%s is still there and does not belong to the certificate %s that is replaced, it is not touched", f.live, r.serial)
+		}
+		if fExist(f.archive) {
+			return fmt.Errorf("%s exists already, %s is not moved over it", f.archive, f.live)
+		}
+		if err := os.MkdirAll(path.Dir(f.archive), 0755); err != nil {
+			return err
+		}
+		if err := os.Rename(f.live, f.archive); err != nil {
+			return fmt.Errorf("moving %s: %w", f.live, err)
+		}
+	}
+	return nil
+}
+
+// retireIndexEntry renames the replaced certificate in index.txt, so the name is free for the new one.
+func (r *rotation) retireIndexEntry() error {
+	lines := indexTxtParser(fRead(*indexTxtPath))
+	for i := range lines {
+		if lines[i].SerialNumber == r.serial && lines[i].DistinguishedName == "/CN="+r.username {
+			lines[i].DistinguishedName = "/CN=REVOKED-" + r.username + "-" + strings.Replace(uuid.New().String(), "-", "", -1)
+			return fWrite(*indexTxtPath, renderIndexTxt(lines))
+		}
+	}
+	return fmt.Errorf("certificate %s of %q is not in index.txt", r.serial, r.username)
+}
+
+// putNewCertificateFirst gives the new certificate the place of the old one in index.txt.
+func (r *rotation) putNewCertificateFirst() error {
+	lines := indexTxtParser(fRead(*indexTxtPath))
+	oldIndex, newIndex := -1, -1
+	for i := range lines {
+		if lines[i].SerialNumber == r.serial {
+			oldIndex = i
+		} else if lines[i].DistinguishedName == "/CN="+r.username {
+			newIndex = i
+		}
+	}
+	if oldIndex < 0 || newIndex < 0 {
+		return fmt.Errorf("index.txt has no new certificate for %q", r.username)
+	}
+	lines[oldIndex], lines[newIndex] = lines[newIndex], lines[oldIndex]
+	return fWrite(*indexTxtPath, renderIndexTxt(lines))
+}
+
+// replacePassword stores the new password in the row the user has already, or in a new one. The old
+// password stays in the database until the very last step: a failing step leaves it untouched.
+func (r *rotation) replacePassword(password string) error {
+	// the state now, not the one before: revoking the certificate has revoked the row as well
+	out, err := runOpenvpnUser("list", "--all")
+	if err != nil {
+		return err
+	}
+	if current := ovpnUserListRow(out, r.username); !current.exists {
+		if _, err := runOpenvpnUser("create", "--user="+r.username, "--password="+password); err != nil {
+			return err
+		}
+	} else {
+		if current.revoked {
+			if _, err := runOpenvpnUser("restore", "--user="+r.username); err != nil {
+				return err
+			}
+		}
+		if _, err := runOpenvpnUser("change-password", "--user="+r.username, "--password="+password); err != nil {
+			return err
+		}
+	}
+	// openvpn-user exits with 0 also when the statement fails, the row is checked
+	out, err = runOpenvpnUser("list", "--all")
+	if err != nil {
+		return err
+	}
+	if row := ovpnUserListRow(out, r.username); !row.exists || row.revoked {
+		return fmt.Errorf("the password row of %q is %+v after the change", r.username, row)
+	}
+	return nil
+}
+
+// rollback puts index.txt, the files, the CRL and the password row back as they were before the rotation.
+func (r *rotation) rollback() error {
+	var failed []string
+	fail := func(what string, err error) {
+		log.Errorf("userRotate rollback: %s: %v", what, err)
+		failed = append(failed, fmt.Sprintf("%s: %v", what, err))
+	}
+
+	// the new serials go away with the index entry, drop their copies
+	known := map[string]bool{}
+	for _, line := range indexTxtParser(string(r.index)) {
+		known[line.SerialNumber] = true
+	}
+	for _, line := range indexTxtParser(fRead(*indexTxtPath)) {
+		if !known[line.SerialNumber] {
+			if err := os.Remove(pkiFile("certs_by_serial", line.SerialNumber+".pem")); err != nil && !os.IsNotExist(err) {
+				fail("removing the copy of the new certificate", err)
+			}
+		}
+	}
+
+	for _, f := range r.files {
+		archived := fExist(f.archive) && !f.archiveBefore
+		if (archived || !f.liveBefore) && fExist(f.live) {
+			// created by the failed issue (the old file is in the archive, or there was none)
+			if err := os.Remove(f.live); err != nil {
+				fail("removing "+f.live, err)
+			}
+		}
+		if archived && !fExist(f.live) {
+			if err := os.Rename(f.archive, f.live); err != nil {
+				fail("restoring "+f.live, err)
+			}
+		}
+	}
+	for p, data := range r.inline {
+		if !fExist(p) {
+			err := os.MkdirAll(path.Dir(p), 0755)
+			if err == nil {
+				err = os.WriteFile(p, data, 0600)
+			}
+			if err != nil {
+				fail("restoring "+p, err)
+			}
+		}
+	}
+	if err := os.WriteFile(*indexTxtPath, r.index, 0644); err != nil {
+		fail("restoring index.txt", err)
+	}
+	if fExist(r.files[0].live) && !fExist(pkiFile("certs_by_serial", r.serial+".pem")) {
+		if err := fCopy(r.files[0].live, pkiFile("certs_by_serial", r.serial+".pem")); err != nil {
+			fail("restoring certs_by_serial", err)
+		}
+	}
+	if !r.wasRevoked {
+		easyrsaGenCrl()
+		crlFix()
+	}
+
+	if *authByPassword {
+		out, err := runOpenvpnUser("list", "--all")
+		if err != nil {
+			fail("reading the password database", err)
+		} else if now := ovpnUserListRow(out, r.username); now.exists != r.row.exists {
+			if now.exists {
+				if _, err := runOpenvpnUser("delete", "--force", "--user="+r.username); err != nil {
+					fail("removing the new password row", err)
+				}
+			}
+		} else if now.exists && now.revoked != r.row.revoked {
+			command := "restore"
+			if r.row.revoked {
+				command = "revoke"
+			}
+			if _, err := runOpenvpnUser(command, "--user="+r.username); err != nil {
+				fail("openvpn-user "+command, err)
+			}
+		}
+	}
+	if len(failed) > 0 {
+		return errors.New(strings.Join(failed, "; "))
+	}
+	return nil
+}
+
+// rotateFilesystem replaces the certificate of username (easy-rsa on the filesystem) and its password.
+// It is all or nothing: when a step fails the old certificate, index entry, files and password are back.
+func (oAdmin *OvpnAdmin) rotateFilesystem(username, newPassword string) (error, string) {
+	oAdmin.createUserMutex.Lock()
+	defer oAdmin.createUserMutex.Unlock()
+
+	r, err := newRotation(username)
+	if err != nil {
+		log.Errorf("userRotate: %v", err)
+		return err, fmt.Sprintf("Failed to rotate user \"%s\": %v", username, err)
+	}
+
+	failed := func(err error) (error, string) {
+		log.Errorf("userRotate: %v", err)
+		msg := fmt.Sprintf("Failed to rotate user \"%s\", the certificate and the password are as before", username)
+		if rbErr := r.rollback(); rbErr != nil {
+			msg = fmt.Sprintf("Failed to rotate user \"%s\" and the previous state could not be restored completely, check the admin log", username)
+		}
+		oAdmin.clients = oAdmin.usersList()
+		return errors.New(msg), msg
+	}
+
+	if err := oAdmin.revokeBeforeReplace(username); err != nil {
+		return failed(err)
+	}
+	if err := r.archiveStaleFiles(); err != nil {
+		return failed(err)
+	}
+	if err := r.retireIndexEntry(); err != nil {
+		return failed(err)
+	}
+	if _, err := runCommand(*easyrsaDirPath, "", *easyrsaBinPath, "--batch", "build-client-full", username, "nopass"); err != nil {
+		return failed(err)
+	}
+	if *authByPassword {
+		if err := r.replacePassword(newPassword); err != nil {
+			return failed(err)
+		}
+	}
+	if err := r.putNewCertificateFirst(); err != nil {
+		return failed(err)
+	}
+	easyrsaGenCrl()
+	log.Infof("Certificate for user %s rotated", username)
+	return nil, ""
 }
 
 func (oAdmin *OvpnAdmin) userDelete(username string) (error, string) {
