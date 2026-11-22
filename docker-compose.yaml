@@ -114,8 +114,10 @@ services:
       OVPN_INDEX_PATH: "/mnt/easyrsa/pki/index.txt"
       OVPN_AUTH: "true"
       OVPN_AUTH_DB_PATH: "/mnt/easyrsa/pki/users.db"
-      # master/slave sync token, shared with the slave (docker-compose-slave.yaml); generate it with: openssl rand -hex 32
-      OVPN_MASTER_TOKEN: "${OVPN_MASTER_TOKEN:?set OVPN_MASTER_TOKEN}"
+      # master/slave sync token, shared with the slave (docker-compose-slave.yaml). Optional: unset or empty = sync off, the master
+      # serves no PKI or CCD archive (/api/data/certs/download and /api/data/ccd/download answer 403 to every request).
+      # To run a slave, set it (generate with: openssl rand -hex 32); the example values TOKEN and VerySecureToken are refused at start.
+      OVPN_MASTER_TOKEN: "${OVPN_MASTER_TOKEN:-}"
       OVPN_AUDIT_PATH: "/mnt/audit/audit.tsv"
       LOG_LEVEL: "debug"
     network_mode: service:openvpn

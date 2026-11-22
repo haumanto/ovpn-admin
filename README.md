@@ -43,7 +43,7 @@ Requirements:
 You need [Docker](https://docs.docker.com/get-docker/) and [Docker Compose v2](https://docs.docker.com/compose/install/) (`docker compose`) installed.
 The example enables IPv6 for the containers, which needs a Docker Engine with IPv6 support (27.0+ recommended) and IPv6 enabled in the host kernel (see [IPv6 with Docker Compose](#docker-compose) to turn it off).
 
-Compose refuses to start unless `BASIC_USERNAME`, `BASIC_PASSWORD` and `OVPN_MASTER_TOKEN` are set (see [Secure deployment](#secure-deployment)).
+Compose refuses to start unless `BASIC_USERNAME` and `BASIC_PASSWORD` are set (see [Secure deployment](#secure-deployment)). `OVPN_MASTER_TOKEN` is optional: it enables the master/slave sync, and without it the master serves no PKI archive at all.
 
 Commands to execute:
 
@@ -52,7 +52,8 @@ git clone https://github.com/haumanto/ovpn-admin.git
 cd ovpn-admin
 export BASIC_USERNAME=admin
 export BASIC_PASSWORD='<a long random password>'
-export OVPN_MASTER_TOKEN="$(openssl rand -hex 32)"
+# optional, only to run a slave: setting a token turns the master/slave sync on
+# export OVPN_MASTER_TOKEN="$(openssl rand -hex 32)"
 ./start.sh
 ```
 #### 1.1
@@ -87,14 +88,15 @@ You can also download and use prebuilt binaries from the [releases](https://gith
 
 Step-by-step guide with a ready nginx config and fail2ban jails: [docs/hardening/README.md](docs/hardening/README.md). fail2ban can watch both the OpenVPN audit log (`audit_master/audit.tsv`) and the reverse proxy's access log.
 
-* **Basic Auth is mandatory.** `docker-compose.yaml` and the Helm chart refuse to start without credentials: compose needs `BASIC_USERNAME`, `BASIC_PASSWORD` and `OVPN_MASTER_TOKEN` (generate the token with `openssl rand -hex 32`), `start.sh` passes your environment through; the chart fails to render until `ingress.basicAuth.user` and `ingress.basicAuth.password` are set (the old `admin`/`changeme` defaults are rejected).
+* **Basic Auth is mandatory.** `docker-compose.yaml` and the Helm chart refuse to start without credentials: compose needs `BASIC_USERNAME` and `BASIC_PASSWORD`, `start.sh` passes your environment through; the chart fails to render until `ingress.basicAuth.user` and `ingress.basicAuth.password` are set (the old `admin`/`changeme` defaults are rejected).
 * **Scope of Basic Auth.** It covers the web UI, the API and `/metrics`. `/ping` stays open without credentials; the Helm chart's readiness and liveness probes use it.
 * **Failed logins are logged.** A request with wrong credentials writes one warn line, `auth failed remote=<address> path=<path>` (no credentials, no `X-Forwarded-For`); a request without an `Authorization` header writes nothing. Behind a reverse proxy `remote` is the proxy address: use the line for detection, not for banning.
 * **Terminate TLS in a reverse proxy** in front of the admin UI. Basic Auth over plain HTTP exposes the credentials.
 * **Block direct access to the backend** (port 8080 / 8000) with a firewall or NetworkPolicy, only the proxy may reach it.
 * **Compose binds the admin port to loopback** (`127.0.0.1:8080`); the VPN port 7777 stays on all interfaces. Publish the admin UI only through the proxy.
 * **Cross-host master/slave sync only over HTTPS** (`--master.host=https://...`, plus `--master.basic-auth.user/password`).
-* **Sync token.** Generate it with `openssl rand -hex 32`. The example values `TOKEN` and `VerySecureToken` and the former built-in default are refused at startup.
+* **Sync is off by default.** `OVPN_MASTER_TOKEN` is optional and enabling: with no token (unset or empty) the master serves no PKI or CCD archive, `/api/data/certs/download` and `/api/data/ccd/download` answer `403` to every request, and no token value is accepted, the empty one included. Set a token only when you run a slave (`docker-compose-slave.yaml` still requires it, with the same value).
+* **Sync token.** Only needed to enable the sync. Generate it with `openssl rand -hex 32`. The example values `TOKEN` and `VerySecureToken` and the former built-in default are refused at startup.
 * **Slave compose file (known issue).** `docker-compose-slave.yaml` refuses to start unless Basic Auth, the sync token and the master credentials are set in the environment, and it publishes its admin port on `127.0.0.1:8081`. It still targets `http://172.20.0.1:8080`, which the loopback binding of the master no longer serves: put a TLS reverse proxy in between. The slave runtime is not verified yet. See `RELEASE-v0.1.2.md` and `RELEASE-v0.1.1.md`.
 * **Chart upgrade notes:** `ovpnAdmin.tag` and `openvpn.tag` are new and default to the chart `appVersion` (the images were `:master`); no value was renamed. The Role is narrowed to `secrets` (get, list, create, update) and `services` (get) in the release namespace.
 
