@@ -1,0 +1,16 @@
+{{ template "chart.header" . }}
+{{ template "chart.deprecationWarning" . }}
+{{ template "chart.badgesSection" . }}
+
+{{ template "chart.description" . }}
+
+> **Not hardened to the Docker Compose level.** Missing: `duplicate-cn` and `client-to-client` are on (`templates/configmap.yaml`), no password authentication, no ban engine (the container runs `/entrypoint.sh`, not `configure.sh`), the cipher is `AES-128-CBC`, the Ingress is always created even with `ingress.enabled: false`, the admin password is stored as `{PLAIN}` in the Secret, and the Role can get, list, create and update every Secret in the namespace. Do not use it for an internet-facing VPN until these are fixed. Templates are unchanged in this release.
+
+{{ template "chart.homepageLine" . }}
+{{ template "chart.maintainersSection" . }}
+
+{{ template "chart.sourcesSection" . }}
+
+{{ template "chart.requirementsSection" . }}
+{{ template "chart.valuesSection" . }}
+{{ template "helm-docs.versionFooter" . }}
