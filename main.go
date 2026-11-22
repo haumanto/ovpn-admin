@@ -2278,12 +2278,14 @@ func pemBodies(data []byte) [][]byte {
 
 // encryptedKeyBlock reports whether b is an encrypted private key that cannot be parsed without its
 // passphrase: an "ENCRYPTED PRIVATE KEY" block whose body is a well formed PKCS #8 EncryptedPrivateKeyInfo
-// (an algorithm and the encrypted data), or a legacy PEM block that declares itself encrypted.
+// (an algorithm and the encrypted data), or a legacy PEM block that declares its encryption: Proc-Type
+// "4,ENCRYPTED" and a DEK-Info of a cipher legacy OpenSSL uses for PEM keys with an IV of that cipher's block
+// size. Nothing is decrypted, so the body of a legacy block is not inspected.
 func encryptedKeyBlock(b *pem.Block) bool {
 	if len(b.Bytes) == 0 {
 		return false
 	}
-	if strings.Contains(b.Headers["Proc-Type"], "ENCRYPTED") {
+	if legacyEncryptionDeclared(b.Headers) {
 		return true
 	}
 	if b.Type != "ENCRYPTED PRIVATE KEY" {
@@ -2295,6 +2297,30 @@ func encryptedKeyBlock(b *pem.Block) bool {
 	}
 	rest, err := asn1.Unmarshal(b.Bytes, &info)
 	return err == nil && len(rest) == 0 && len(info.Data) > 0
+}
+
+// legacyPEMCipherIVSize is the set of ciphers legacy OpenSSL writes into the DEK-Info header of an encrypted
+// PEM key, with the IV size in bytes, which is the block size of the cipher.
+var legacyPEMCipherIVSize = map[string]int{
+	"DES-EDE3-CBC": 8,
+	"AES-128-CBC":  16,
+	"AES-192-CBC":  16,
+	"AES-256-CBC":  16,
+}
+
+// legacyEncryptionDeclared reports whether the PEM headers declare an encrypted legacy key: Proc-Type exactly
+// "4,ENCRYPTED" and DEK-Info "<CIPHER>,<HEX IV>" with a cipher of legacyPEMCipherIVSize and an IV of its size.
+func legacyEncryptionDeclared(headers map[string]string) bool {
+	if strings.TrimSpace(headers["Proc-Type"]) != "4,ENCRYPTED" {
+		return false
+	}
+	cipher, iv, ok := strings.Cut(strings.TrimSpace(headers["DEK-Info"]), ",")
+	size, known := legacyPEMCipherIVSize[strings.TrimSpace(cipher)]
+	if !ok || !known {
+		return false
+	}
+	raw, err := hex.DecodeString(strings.TrimSpace(iv))
+	return err == nil && len(raw) == size
 }
 
 // parsePrivateKeyDER returns the public key of a DER encoded private key (PKCS #8, PKCS #1 or SEC 1).
