@@ -18,7 +18,7 @@ OVPN_SRV_PORT="${OVPN_SERVER_PORT:-1194}"
 # Ban engine (fail2ban, see start_fail2ban below). Every value is validated here, before anything is changed:
 # a bad value stops the container at startup instead of producing a broken fail2ban config.
 BAN_ENABLED="${OVPN_BAN_ENABLED:-true}"
-BAN_REQUIRED="${OVPN_BAN_REQUIRED:-false}"
+BAN_REQUIRED="${OVPN_BAN_REQUIRED:-true}"
 BAN_MAXRETRY="${OVPN_BAN_MAXRETRY:-3}"
 BAN_FINDTIME="${OVPN_BAN_FINDTIME:-600}"
 BAN_BANTIME="${OVPN_BAN_BANTIME:-3600}"
@@ -35,8 +35,8 @@ BAN_IPV6_REQUIRED="${OVPN_BAN_IPV6_REQUIRED:-true}"
 LOG_MAX_BYTES="${OVPN_LOG_MAX_BYTES:-10485760}"
 LOG_KEEP="${OVPN_LOG_KEEP:-3}"
 LOG_ROTATE_INTERVAL="${OVPN_LOG_ROTATE_INTERVAL:-60}"
-# hosts and networks that are never banned (Docker bridge and private source addresses by default)
-BAN_IGNOREIP="${OVPN_BAN_IGNOREIP:-127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fe80::/10}"
+# hosts and networks that are never banned: loopback and the Docker bridge subnet of the compose files, nothing else by default
+BAN_IGNOREIP="${OVPN_BAN_IGNOREIP:-127.0.0.0/8 ::1 172.20.0.0/24}"
 for ban_bool in OVPN_BAN_ENABLED:"${BAN_ENABLED}" OVPN_BAN_REQUIRED:"${BAN_REQUIRED}" OVPN_BAN_IPV6_REQUIRED:"${BAN_IPV6_REQUIRED}"; do
   if [ "${ban_bool#*:}" != "true" ] && [ "${ban_bool#*:}" != "false" ]; then
     echo "ERROR: ${ban_bool%%:*} must be true or false, got \"${ban_bool#*:}\"" >&2
@@ -234,10 +234,33 @@ command -v "$IPTABLES_BIN" >/dev/null 2>&1 || {
     ! -d "${OVPN_SRV_NET}/${OVPN_SRV_MASK}" \
     -j MASQUERADE
 
+# Admin panel fence (audit H1). ovpn-admin shares this network namespace (network_mode: service:openvpn) and listens on all
+# interfaces, so without this rule every connected VPN client reaches the panel through the tunnel (no TLS, no rate limit, no
+# ban). Drop TCP to the admin port that arrives on a tun device. Nothing else is touched: loopback (the host's published port
+# and the nginx upstream arrive on lo or on the bridge, never on tun) and the bridge interface keep working. The rule is
+# inserted at position 1, only when it is not there yet (restart safe, no duplicates). admin_fence_ok is the startup check:
+# the container refuses to run when the rule is missing, see the call before "exec openvpn" below.
+ADMIN_FENCE_ARGS=(-i "tun+" -p tcp --dport "${ADMIN_PORT}" -j DROP)
+admin_fence_add() {
+  "$1" -C INPUT "${ADMIN_FENCE_ARGS[@]}" >/dev/null 2>&1 || "$1" -I INPUT 1 "${ADMIN_FENCE_ARGS[@]}"
+}
+admin_fence_ok() {
+  "$1" -C INPUT "${ADMIN_FENCE_ARGS[@]}" >/dev/null 2>&1
+}
+admin_fence_add "$IPTABLES_BIN"
+
 # IPv6 counterpart of the selector above (default ip6tables; ip6tables-legacy together with iptables-legacy)
 IP6TABLES_BIN="${OVPN_IP6TABLES_BIN:-ip6tables}"
 
 OVPN_IPV6_ARGS=()
+# IPv6 capable listener (tcp6/udp6) without an IPv6 pool: the panel also listens on IPv6, so the rule is required there too
+if [ -z "${OVPN_SRV_NET6}" ] && [[ "${OVPN_SRV_PROTO}" == *6* ]]; then
+  command -v "$IP6TABLES_BIN" >/dev/null 2>&1 || {
+    echo "ERROR: ip6tables binary not found: $IP6TABLES_BIN" >&2
+    exit 1
+  }
+  admin_fence_add "$IP6TABLES_BIN"
+fi
 if [ -n "${OVPN_SRV_NET6}" ]; then
   command -v "$IP6TABLES_BIN" >/dev/null 2>&1 || {
     echo "ERROR: ip6tables binary not found: $IP6TABLES_BIN" >&2
@@ -245,6 +268,7 @@ if [ -n "${OVPN_SRV_NET6}" ]; then
   }
   "$IP6TABLES_BIN" -t nat -D POSTROUTING -s "${OVPN_SRV_NET6}" ! -d "${OVPN_SRV_NET6}" -j MASQUERADE || true
   "$IP6TABLES_BIN" -t nat -A POSTROUTING -s "${OVPN_SRV_NET6}" ! -d "${OVPN_SRV_NET6}" -j MASQUERADE
+  admin_fence_add "$IP6TABLES_BIN"
 
   if [ "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null)" != "1" ]; then
     if ! sysctl -w net.ipv6.conf.all.forwarding=1; then
@@ -521,5 +545,20 @@ fi
     rotate_log "${FAIL2BAN_LOG}" || echo "log rotation of ${FAIL2BAN_LOG} failed" >&2
   done
 ) &
+
+# Startup check (audit H1): the admin panel fence must be in place right before OpenVPN starts, after everything above (the ban
+# engine included) has run. A missing rule stops the container: a future edit cannot silently reopen the panel to the tunnel.
+admin_fence_fail() {
+  echo "ERROR: admin panel fence missing: $1 INPUT has no rule \"-i tun+ -p tcp --dport ${ADMIN_PORT} -j DROP\"; VPN clients could reach the admin panel. Stopping the container." >&2
+  exit 1
+}
+admin_fence_ok "$IPTABLES_BIN" || admin_fence_fail "$IPTABLES_BIN"
+if [ "${BAN_IPV6}" = "true" ]; then
+  admin_fence_ok "$IP6TABLES_BIN" || admin_fence_fail "$IP6TABLES_BIN"
+else
+  # IPv6 off: no IPv6 packet enters the tunnel; still fence it when ip6tables works, never fail on it
+  admin_fence_add "$IP6TABLES_BIN" >/dev/null 2>&1 || true
+fi
+echo "admin panel fence: verified, tcp/${ADMIN_PORT} from tun+ is dropped"
 
 exec openvpn --config /etc/openvpn/openvpn.conf --client-config-dir /etc/openvpn/ccd --port "${OVPN_SRV_PORT}" --proto "${OVPN_SRV_PROTO}" --management 127.0.0.1 8989 --dev tun0 --server "${OVPN_SRV_NET}" "${OVPN_SRV_MASK}" "${OVPN_IPV6_ARGS[@]}" --log-append "${OPENVPN_LOG}"

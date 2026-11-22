@@ -24,6 +24,7 @@ What an attacker can try:
 | Guess the admin password | admin panel | Basic Auth in ovpn-admin; nginx rate limit slows it; fail2ban bans the source address |
 | Sniff the admin password | network path to the panel | TLS in nginx (the app speaks plain HTTP and is bound to loopback) |
 | Reach the panel without the proxy | port 8080 | compose publishes it on `127.0.0.1` only; keep it closed in your firewall |
+| Reach the panel from inside the tunnel | port 8080 | the openvpn container drops TCP to `OVPN_LISTEN_PORT` arriving on `tun+` (iptables and ip6tables, `INPUT`); `configure.sh` checks the rule right before OpenVPN starts and stops the container when it is missing |
 | Guess a VPN password with a stolen or leaked client certificate | OpenVPN | `auth_fail` lines in the audit log; fail2ban bans the source address |
 | Scan the VPN port, connect without a certificate | OpenVPN | the TLS handshake fails; OpenVPN logs it, the audit log does **not** (see Limits) |
 | Flood the panel with requests | nginx, ovpn-admin | nginx `limit_req` answers 429 per client address |
@@ -158,7 +159,8 @@ The openvpn container runs its own fail2ban (jail `ovpn-admin`). It reads `openv
 | Variable | Default | Meaning |
 |---|---|---|
 | `OVPN_BAN_ENABLED` | `true` | `false` switches the engine off (and the checks below with it) |
-| `OVPN_BAN_REQUIRED` | `false` | `true`: the container stops when fail2ban cannot start. `false`: OpenVPN runs without bans and logs an error |
+| `OVPN_BAN_REQUIRED` | `true` | `true`: the container stops when fail2ban cannot start. `false`: OpenVPN runs without bans and logs an error |
+| `OVPN_BAN_IGNOREIP` | `127.0.0.0/8 ::1 172.20.0.0/24` | never banned: loopback and the compose bridge subnet only |
 | `OVPN_BAN_IPV6_REQUIRED` | `true` | see "IPv6 fails closed" |
 | `OVPN_SERVER_PORT` | `1194` | OpenVPN listener port inside the container; the single source for `openvpn --port`, the ban jumps and the right side of the compose `ports` mapping |
 | `OVPN_PROTO` | `tcp` | OpenVPN `--proto`; decides the transport of the ban jumps and whether IPv6 is on |

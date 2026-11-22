@@ -232,7 +232,7 @@ The `openvpn` container runs fail2ban 1.1.0 (jail `ovpn-admin`). It reads `openv
 * **Enforcement:** DROP rules in the `OVPN_BAN` (IPv4) and `OVPN_BAN6` (IPv6) chains, only for the OpenVPN listener port `OVPN_SERVER_PORT`. The admin port is never affected.
 * **Repeat bans:** the Nth ban of the same address is permanent (`OVPN_BAN_REPEAT_COUNT`, default 2). See [Permanent bans and manual control](#permanent-bans-and-manual-control).
 * **Restarts:** temporary bans are not kept. Permanent bans are restored from `ban-history.tsv` (v0.1.6). A source still inside the findtime is banned again within seconds, and that re-applied ban is not counted again. See [UPGRADING.md](UPGRADING.md#v013--v014).
-* **Allowlist:** `OVPN_BAN_IGNOREIP` (default: loopback, `10/8`, `172.16/12`, `192.168/16`, `fe80::/10`). Unique-local `fd00::/8` is not on the default list.
+* **Allowlist:** `OVPN_BAN_IGNOREIP` (default: `127.0.0.0/8`, `::1` and the compose bridge subnet `172.20.0.0/24`; private ranges are not on it, so a client that arrives with a `10.x`, `172.16.x` or `192.168.x` address is banned). A client whose connection reaches OpenVPN through Docker's proxy shows up with the bridge gateway `172.20.0.1`, which is on the list and is never banned. Unique-local `fd00::/8` (including `fd00:172:20::1`) is not on the default list.
 * **Logs:** `openvpn.log`, `bans.tsv` and `ban-history.tsv` (from v0.1.6) live in the audit volume. `openvpn.log` and `fail2ban.log` are rotated in the container (`OVPN_LOG_MAX_BYTES`, `OVPN_LOG_KEEP`, `OVPN_LOG_ROTATE_INTERVAL`).
 
 | Variable | Default | Meaning |
@@ -242,8 +242,8 @@ The `openvpn` container runs fail2ban 1.1.0 (jail `ovpn-admin`). It reads `openv
 | `OVPN_BAN_FINDTIME` | `600` | window in seconds for counting failures |
 | `OVPN_BAN_BANTIME` | `3600` | ban length in seconds |
 | `OVPN_BAN_REPEAT_COUNT` | `2` | the Nth ban of an address is permanent; `1` makes every ban permanent (v0.1.6) |
-| `OVPN_BAN_IGNOREIP` | `127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fe80::/10` | never banned (replaces the default list) |
-| `OVPN_BAN_REQUIRED` | `false` | `true` stops the container if fail2ban cannot start; `false` runs without bans and logs an error |
+| `OVPN_BAN_IGNOREIP` | `127.0.0.0/8 ::1 172.20.0.0/24` | never banned (replaces the default list) |
+| `OVPN_BAN_REQUIRED` | `true` | `true` stops the container if fail2ban cannot start; `false` runs without bans and logs an error |
 | `OVPN_BAN_IPV6_REQUIRED` | `true` | `true` stops the container if IPv6 is on and the IPv6 ban chain cannot be built; `false` runs without IPv6 bans and prints a warning |
 
 Full list, measured behavior and limits: [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md). Check the filter against your own log with `fail2ban-regex`, as described in [docs/hardening/README.md](docs/hardening/README.md).

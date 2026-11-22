@@ -37,19 +37,20 @@ services:
       OVPN_LOG_KEEP: "${OVPN_LOG_KEEP:-3}"
       OVPN_LOG_ROTATE_INTERVAL: "${OVPN_LOG_ROTATE_INTERVAL:-60}"
       OVPN_BAN_ENABLED: "${OVPN_BAN_ENABLED:-true}"
-      # true: the container stops if fail2ban cannot start; false: OpenVPN runs without bans and logs an error
-      OVPN_BAN_REQUIRED: "${OVPN_BAN_REQUIRED:-false}"
+      # true (default): the container stops if fail2ban cannot start; false: OpenVPN runs without bans and logs an error (the only opt-out)
+      OVPN_BAN_REQUIRED: "${OVPN_BAN_REQUIRED:-true}"
       OVPN_BAN_MAXRETRY: "${OVPN_BAN_MAXRETRY:-3}"
       OVPN_BAN_FINDTIME: "${OVPN_BAN_FINDTIME:-600}"
       OVPN_BAN_BANTIME: "${OVPN_BAN_BANTIME:-3600}"
       # The Nth ban of the same address is permanent (never expires, survives container restarts; kept in ban-history.tsv in the
       # audit directory). 2 = the second ban is permanent; 1 = every ban is permanent. A permanent ban is lifted by hand only.
       OVPN_BAN_REPEAT_COUNT: "${OVPN_BAN_REPEAT_COUNT:-2}"
-      # Allowlist, never banned: loopback and private ranges, which include the Docker networks (172.16.0.0/12).
+      # Allowlist, never banned: loopback and the Docker bridge subnet of this file (172.20.0.0/24) only. Private ranges are NOT
+      # on the list: a client that arrives with a 10.x, 172.16.x or 192.168.x address is banned like any other.
       # A client whose connection reaches OpenVPN through Docker's proxy shows up with the bridge gateway address (for
-      # example 172.20.0.1) and is therefore never banned: check the source addresses in the OpenVPN log before relying on bans.
+      # example 172.20.0.1), which is on this list and is therefore never banned: check the source addresses in the OpenVPN log before relying on bans.
       # Add your own admin networks (space separated IPv4/IPv6 addresses or CIDR networks); the default is replaced, not extended.
-      OVPN_BAN_IGNOREIP: "${OVPN_BAN_IGNOREIP:-127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fe80::/10}"
+      OVPN_BAN_IGNOREIP: "${OVPN_BAN_IGNOREIP:-127.0.0.0/8 ::1 172.20.0.0/24}"
       # Telegram notification for every new ban (off by default). To enable, set these in the host environment or in an env file
       # OUTSIDE this repository (mode 0600, passed with "docker compose --env-file /path/to/ovpn-admin.env up -d"; never in this
       # file, never in git, never a .env inside the build context; .env and .env.* are ignored by .gitignore and .dockerignore), for example:
