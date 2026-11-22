@@ -509,9 +509,12 @@ var validateUsername = function(name) {
   return '';
 };
 
+// same minimum as the server (counted in characters, not bytes)
+var PASSWORD_MIN = 12;
+
 var validatePassword = function(password) {
-  if (Array.from(password).length < 6) {
-    return 'Use at least 6 characters.';
+  if (Array.from(password).length < PASSWORD_MIN) {
+    return 'Use at least ' + PASSWORD_MIN + ' characters.';
   }
   // the password hash takes at most 72 bytes, a multi-byte character counts for 2 to 4
   return new TextEncoder().encode(password).length > 72 ? 'Use at most 72 bytes (a non-ASCII character takes 2 to 4).' : '';
