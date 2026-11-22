@@ -25,6 +25,12 @@ import (
 // flag R is listed. The CA key is fixed and every time is fixed, so the same index gives the same file
 // (the rollback tests compare the PKI byte by byte).
 func fakeCrl(lines []string) ([]byte, error) {
+	notBefore := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	return fakeCrlAt(lines, notBefore, notBefore.AddDate(30, 0, 0))
+}
+
+// fakeCrlAt is fakeCrl with the thisUpdate and nextUpdate of the list chosen by the caller.
+func fakeCrlAt(lines []string, thisUpdate, nextUpdate time.Time) ([]byte, error) {
 	priv := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{7}, ed25519.SeedSize))
 	notBefore := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	caTemplate := &x509.Certificate{
@@ -59,8 +65,8 @@ func fakeCrl(lines []string) ([]byte, error) {
 	}
 	der, err := x509.CreateRevocationList(rand.Reader, &x509.RevocationList{
 		Number:                    big.NewInt(1),
-		ThisUpdate:                notBefore,
-		NextUpdate:                notBefore.AddDate(30, 0, 0),
+		ThisUpdate:                thisUpdate,
+		NextUpdate:                nextUpdate,
 		RevokedCertificateEntries: entries,
 	}, ca, priv)
 	if err != nil {
@@ -389,7 +395,7 @@ func TestRevokeReportsAFailedPasswordRowRevoke(t *testing.T) {
 	db := setupFakeOpenvpnUser(t)
 	mgmt := startFakeMgmt(t, "alice")
 	withMgmt(oAdmin, map[string]string{"srv": mgmt.addr})
-	mustCreate(t, oAdmin, "alice", "Old-pass-1")
+	mustCreate(t, oAdmin, "alice", "Old-password-1")
 	failOpenvpnUser(t, db, "revoke")
 
 	rec := postForm(oAdmin.userRevokeHandler, "/api/user/revoke", url.Values{"username": {"alice"}})
@@ -404,11 +410,11 @@ func TestRevokeReportsAFailedPasswordRowRevoke(t *testing.T) {
 func TestRevokeRevokesThePasswordRow(t *testing.T) {
 	oAdmin, _ := setupFakeEasyrsa(t)
 	db := setupFakeOpenvpnUser(t)
-	mustCreate(t, oAdmin, "alice", "Old-pass-1")
+	mustCreate(t, oAdmin, "alice", "Old-password-1")
 	if err, msg := oAdmin.userRevoke("alice"); err != nil {
 		t.Fatalf("userRevoke: %v (%s)", err, msg)
 	}
-	if got := dbRow(t, db, "alice"); got != "Old-pass-1|true" {
+	if got := dbRow(t, db, "alice"); got != "Old-password-1|true" {
 		t.Errorf("row = %q", got)
 	}
 }
@@ -451,10 +457,10 @@ func TestRotateFailsAndRollsBackWhenTheSessionCannotBeKilled(t *testing.T) {
 	forEasyrsaLayouts(t, func(t *testing.T, oAdmin *OvpnAdmin, pki string) {
 		db := setupFakeOpenvpnUser(t)
 		withMgmt(oAdmin, map[string]string{"srv": deadMgmtAddr(t)})
-		mustCreate(t, oAdmin, "alice", "Old-pass-1")
+		mustCreate(t, oAdmin, "alice", "Old-password-1")
 		before, dbBefore := snapshotPKI(t, pki), readDB(t, db)
 
-		rec := postForm(oAdmin.userRotateHandler, "/api/user/rotate", url.Values{"username": {"alice"}, "password": {"New-pass-2"}})
+		rec := postForm(oAdmin.userRotateHandler, "/api/user/rotate", url.Values{"username": {"alice"}, "password": {"New-password-2"}})
 		if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "as before") {
 			t.Errorf("rotate: %d %q, want 500 and \"as before\"", rec.Code, rec.Body.String())
 		}
@@ -499,7 +505,7 @@ func TestDeleteReportsAFailedCleanup(t *testing.T) {
 	oAdmin, _ := setupFakeEasyrsa(t)
 	db := setupFakeOpenvpnUser(t)
 	withMgmt(oAdmin, map[string]string{})
-	mustCreate(t, oAdmin, "carol", "Old-pass-1")
+	mustCreate(t, oAdmin, "carol", "Old-password-1")
 	failOpenvpnUser(t, db, "delete")
 
 	rec := postForm(oAdmin.userDeleteHandler, "/api/user/delete", url.Values{"username": {"carol"}})
@@ -523,7 +529,7 @@ func TestChangePasswordOfARevokedUserIsRefused(t *testing.T) {
 	oAdmin, _ := setupFakeEasyrsa(t)
 	db := setupFakeOpenvpnUser(t)
 	withMgmt(oAdmin, map[string]string{})
-	mustCreate(t, oAdmin, "alice", "Old-pass-1")
+	mustCreate(t, oAdmin, "alice", "Old-password-1")
 	if err, msg := oAdmin.userRevoke("alice"); err != nil {
 		t.Fatal(msg)
 	}

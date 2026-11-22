@@ -185,27 +185,43 @@ func fDownload(path, url string, basicAuth bool) error {
 		return err
 	}
 
-	return fWrite(path, string(body))
+	// the archives hold private keys (client keys, users.db): owner only, whatever the umask
+	return os.WriteFile(path, body, 0600)
 }
 
+// createArchiveFromDir archives every file under dir (see createArchiveFromDirSkipping).
 func createArchiveFromDir(dir, path string) error {
+	return createArchiveFromDirSkipping(dir, path, nil)
+}
+
+// createArchiveFromDirSkipping writes a tar.gz of the regular files under dir to path (mode 0600).
+// skip, when not nil, is called with the slash separated path of a file relative to dir; a file for
+// which it returns true is left out of the archive.
+func createArchiveFromDirSkipping(dir, path string, skip func(rel string) bool) error {
 
 	var files []string
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+	root := filepath.Clean(dir)
+	err := filepath.Walk(dir, func(filePath string, info os.FileInfo, err error) error {
 		if err != nil {
 			log.Warn(err)
 			return err
 		}
-		if !info.IsDir() {
-			files = append(files, path)
+		if info.IsDir() {
+			return nil
 		}
+		if skip != nil {
+			if rel, relErr := filepath.Rel(root, filePath); relErr == nil && skip(filepath.ToSlash(rel)) {
+				return nil
+			}
+		}
+		files = append(files, filePath)
 		return nil
 	})
 	if err != nil {
 		log.Warn(err)
 	}
 
-	out, err := os.Create(path)
+	out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		log.Errorf("Error writing archive %s: %s", path, err)
 		return err

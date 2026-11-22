@@ -49,7 +49,7 @@ var templateFiles embed.FS
 
 const (
 	usernameRegexp         = `^([a-zA-Z0-9_.\-@])+$`
-	passwordMinLength      = 6
+	passwordMinLength      = 12
 	passwordMaxBytes       = 72 // bcrypt hashes at most 72 bytes; golang.org/x/crypto >= 0.5 returns an error above that
 	certsArchiveFileName   = "certs.tar.gz"
 	ccdArchiveFileName     = "ccd.tar.gz"
@@ -102,6 +102,15 @@ var (
 	auditPath                = kingpin.Flag("audit.path", "path to the OpenVPN connection audit log (tab-separated, written by the connection hooks); a missing file is an empty login history").Default("/var/log/openvpn-audit/audit.tsv").Envar("OVPN_AUDIT_PATH").String()
 	clientCertExpirationDays = kingpin.Flag("client-cert.expiration-days", "Expiration period of OpenVPN client certificates in days, the period will shrink automatically to the CA expiration period").Default("3650").Envar("CLIENT_CERT_EXPIRATION_DAYS").String()
 
+	// the CRL is valid for 180 days (easyrsa, kubernetes.go); OpenVPN refuses every client once its nextUpdate has passed
+	crlRenewBefore = 30 * 24 * time.Hour
+	// the check runs once a day; the first one waits crlFirstCheckDelay so that it does not race the start of the
+	// openvpn container (a fresh PKI is still being built then, easyrsa allows one run at a time), and a failed
+	// one is repeated after crlRetryInterval instead of a day later
+	crlCheckInterval   = 24 * time.Hour
+	crlFirstCheckDelay = 5 * time.Minute
+	crlRetryInterval   = time.Hour
+
 	certsArchivePath = "/tmp/" + certsArchiveFileName
 	ccdArchivePath   = "/tmp/" + ccdArchiveFileName
 
@@ -131,6 +140,12 @@ var (
 	ovpnServerCaCertExpire = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "ovpn_server_ca_cert_expire",
 		Help: "openvpn server CA certificate expire time in days",
+	},
+	)
+
+	ovpnCrlExpire = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "ovpn_crl_expire_days",
+		Help: "days until the nextUpdate of the certificate revocation list (pki/crl.pem), negative when it has expired",
 	},
 	)
 
@@ -496,9 +511,17 @@ func (oAdmin *OvpnAdmin) downloadCertsHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	archiveCerts()
+	// a private temp file per request, removed when the answer is written: it holds every client key
+	// and users.db, so it must not sit in /tmp afterwards
+	archive, err := archiveCerts()
+	if err != nil {
+		log.Errorf("downloadCertsHandler: %s", err)
+		http.Error(w, `{"status":"error"}`, http.StatusInternalServerError)
+		return
+	}
+	defer removeArchive(archive)
 	w.Header().Set("Content-Disposition", "attachment; filename="+certsArchiveFileName)
-	http.ServeFile(w, r, certsArchivePath)
+	http.ServeFile(w, r, archive)
 }
 
 func (oAdmin *OvpnAdmin) downloadCcdHandler(w http.ResponseWriter, r *http.Request) {
@@ -519,9 +542,15 @@ func (oAdmin *OvpnAdmin) downloadCcdHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	archiveCcd()
+	archive, err := archiveCcd()
+	if err != nil {
+		log.Errorf("downloadCcdHandler: %s", err)
+		http.Error(w, `{"status":"error"}`, http.StatusInternalServerError)
+		return
+	}
+	defer removeArchive(archive)
 	w.Header().Set("Content-Disposition", "attachment; filename="+ccdArchiveFileName)
-	http.ServeFile(w, r, ccdArchivePath)
+	http.ServeFile(w, r, archive)
 }
 
 var app OpenVPNPKI
@@ -598,6 +627,7 @@ func main() {
 	ovpnAdmin.setState()
 
 	go ovpnAdmin.updateState()
+	go ovpnAdmin.crlRefreshLoop(crlFirstCheckDelay, crlCheckInterval, crlRetryInterval, nil)
 
 	ovpnAdmin.modules = append(ovpnAdmin.modules, "core")
 
@@ -835,6 +865,7 @@ func staticFilePath(urlPath string) string {
 func (oAdmin *OvpnAdmin) registerMetrics() {
 	oAdmin.promRegistry.MustRegister(ovpnServerCertExpire)
 	oAdmin.promRegistry.MustRegister(ovpnServerCaCertExpire)
+	oAdmin.promRegistry.MustRegister(ovpnCrlExpire)
 	oAdmin.promRegistry.MustRegister(ovpnClientsTotal)
 	oAdmin.promRegistry.MustRegister(ovpnClientsRevoked)
 	oAdmin.promRegistry.MustRegister(ovpnClientsConnected)
@@ -852,6 +883,7 @@ func (oAdmin *OvpnAdmin) setState() {
 	oAdmin.clients = oAdmin.usersList()
 
 	ovpnServerCaCertExpire.Set(float64((getOvpnCaCertExpireDate().Unix() - time.Now().Unix()) / 3600 / 24))
+	setCrlExpireGauge(time.Now())
 }
 
 func (oAdmin *OvpnAdmin) updateState() {
@@ -1921,17 +1953,55 @@ func (oAdmin *OvpnAdmin) downloadCcd() bool {
 	return true
 }
 
-func archiveCerts() {
-	err := createArchiveFromDir(*easyrsaDirPath+"/pki", certsArchivePath)
-	if err != nil {
-		log.Warnf("archiveCerts(): %s", err)
+// certsArchiveSkips is true for the files of pki/ that must never be in the sync archive: the CA
+// private key (private/ca.key, wherever it is). It stays on the master: a slave only serves the PKI and cannot issue
+// or revoke certificates, and a slave that held the key would turn every slave host into a way to
+// sign certificates for the whole VPN. Everything else a slave needs stays: ca.crt, the server
+// certificate and its key (private/server.key, OpenVPN on the slave reads it), ta.key, dh, the CRL,
+// index.txt, the issued certificates and client keys (the slave panel builds client configs from
+// them) and users.db (the slave's openvpn-user auth hook checks passwords against it).
+//
+// easy-rsa 3.2 also writes inline/private/<name>.inline files (certificate plus key in one file); the one of the CA
+// (ca.inline) would carry the CA key again, so it is left out too.
+func certsArchiveSkips(rel string) bool {
+	switch path.Base(rel) {
+	case "ca.key", "ca.inline":
+		return true
 	}
+	return false
 }
 
-func archiveCcd() {
-	err := createArchiveFromDir(*ccdDir, ccdArchivePath)
+// archiveCerts builds the sync archive of pki/ in a new private temp file and returns its path; the
+// caller removes it (removeArchive) once it has been served.
+func archiveCerts() (string, error) {
+	return archiveToTemp(*easyrsaDirPath+"/pki", "certs-*.tar.gz", certsArchiveSkips)
+}
+
+func archiveCcd() (string, error) {
+	return archiveToTemp(*ccdDir, "ccd-*.tar.gz", nil)
+}
+
+func archiveToTemp(dir, pattern string, skip func(rel string) bool) (string, error) {
+	f, err := os.CreateTemp("", pattern) // mode 0600
 	if err != nil {
-		log.Warnf("archiveCcd(): %s", err)
+		return "", fmt.Errorf("creating the archive file: %w", err)
+	}
+	name := f.Name()
+	if err := f.Close(); err != nil {
+		removeArchive(name)
+		return "", err
+	}
+	if err := createArchiveFromDirSkipping(dir, name, skip); err != nil {
+		removeArchive(name)
+		return "", fmt.Errorf("archiving %s: %w", dir, err)
+	}
+	return name, nil
+}
+
+// removeArchive deletes a temp archive; a file that is already gone is not an error.
+func removeArchive(name string) {
+	if err := os.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Errorf("removing %s: %s", name, err)
 	}
 }
 
@@ -1997,6 +2067,132 @@ func easyrsaGenCrl() error {
 	return nil
 }
 
+// crlNextUpdate reads the CRL that OpenVPN uses (pki/crl.pem) and returns its nextUpdate.
+func crlNextUpdate() (time.Time, error) {
+	data, err := os.ReadFile(*easyrsaDirPath + "/pki/crl.pem")
+	if err != nil {
+		return time.Time{}, fmt.Errorf("reading the CRL: %w", err)
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return time.Time{}, errors.New("crl.pem holds no PEM block")
+	}
+	crl, err := x509.ParseRevocationList(block.Bytes)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parsing the CRL: %w", err)
+	}
+	return crl.NextUpdate, nil
+}
+
+// crlExpireDays is the time until nextUpdate in days, negative when it has passed.
+func crlExpireDays(nextUpdate, now time.Time) float64 {
+	return nextUpdate.Sub(now).Hours() / 24
+}
+
+// setCrlExpireGauge sets ovpn_crl_expire_days from the CRL on disk. A CRL that cannot be read leaves
+// the gauge as it was: the daily check logs the reason.
+func setCrlExpireGauge(now time.Time) {
+	next, err := crlNextUpdate()
+	if err != nil {
+		log.Debugf("ovpn_crl_expire_days: %v", err)
+		return
+	}
+	ovpnCrlExpire.Set(crlExpireDays(next, now))
+}
+
+// rebuildCrl writes a new CRL: easyrsa gen-crl on the filesystem backend, the CRL secret on kubernetes.
+func rebuildCrl() error {
+	if *storageBackend == "kubernetes.secrets" {
+		if err := app.easyrsaGenCRL(); err != nil {
+			return err
+		}
+		return app.updateCRLOnDisk()
+	}
+	if err := easyrsaGenCrl(); err != nil {
+		return err
+	}
+	crlFix()
+	return nil
+}
+
+// crlRefresh is one run of the daily CRL check. A CRL with less than crlRenewBefore left (or one that
+// exists but cannot be read) is rebuilt on a master; a slave never holds the CA key, its CRL comes with the
+// sync from the master, so it only reports. A CRL file that does not exist is a PKI that is not built yet
+// (first start of a new stack): one warning, nothing to rebuild. It logs one line when it rebuilds and one
+// when that fails, and never panics or exits. The result is checked on disk: a rebuild whose nextUpdate
+// did not move counts as failed. It returns false only for a failed rebuild (the caller retries sooner).
+func (oAdmin *OvpnAdmin) crlRefresh(now time.Time) bool {
+	next, readErr := crlNextUpdate()
+	if readErr == nil {
+		ovpnCrlExpire.Set(crlExpireDays(next, now))
+		if next.Sub(now) >= crlRenewBefore {
+			log.Debugf("CRL check: nextUpdate %s, %.1f days left, no rebuild needed", next.UTC().Format(time.RFC3339), crlExpireDays(next, now))
+			return true
+		}
+	} else if errors.Is(readErr, os.ErrNotExist) {
+		log.Warnf("CRL check: %v: there is no CRL yet, nothing to rebuild (the PKI is built by the openvpn container at its first start)", readErr)
+		return true
+	}
+	if oAdmin.role == "slave" {
+		if readErr != nil {
+			log.Errorf("CRL check on a slave: %v", readErr)
+		} else {
+			log.Errorf("CRL check on a slave: nextUpdate %s is %.1f days away and the CRL comes from the master, which rebuilds it daily: check the sync", next.UTC().Format(time.RFC3339), crlExpireDays(next, now))
+		}
+		return true
+	}
+
+	why := fmt.Sprintf("nextUpdate %s is %.1f days away (limit %d days)", next.UTC().Format(time.RFC3339), crlExpireDays(next, now), int(crlRenewBefore.Hours()/24))
+	if readErr != nil {
+		why = readErr.Error()
+	}
+
+	oAdmin.createUserMutex.Lock()
+	defer oAdmin.createUserMutex.Unlock()
+	err := func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("panic: %v", r)
+			}
+		}()
+		return rebuildCrl()
+	}()
+	if err == nil {
+		var after time.Time
+		after, err = crlNextUpdate()
+		if err == nil && readErr == nil && !after.After(next) {
+			err = fmt.Errorf("the CRL was rebuilt but its nextUpdate did not move (still %s)", after.UTC().Format(time.RFC3339))
+		}
+		if err == nil {
+			ovpnCrlExpire.Set(crlExpireDays(after, now))
+			log.Infof("CRL rebuilt (%s): nextUpdate is now %s, %.1f days away", why, after.UTC().Format(time.RFC3339), crlExpireDays(after, now))
+			return true
+		}
+	}
+	log.Errorf("CRL rebuild failed (%s): %v", why, err)
+	return false
+}
+
+// crlRefreshLoop runs crlRefresh after firstDelay, then every interval (a day), or after retry when the
+// last run failed, in the manner of updateState. It ends when stop is closed (a nil stop never ends; only
+// the tests close it).
+func (oAdmin *OvpnAdmin) crlRefreshLoop(firstDelay, interval, retry time.Duration, stop <-chan struct{}) {
+	wait := firstDelay
+	for {
+		select {
+		case <-time.After(wait):
+		case <-stop:
+			return
+		}
+		if oAdmin.crlRefresh(time.Now()) {
+			wait = interval
+		} else {
+			log.Warnf("CRL check: the next try is in %s", retry)
+			wait = retry
+		}
+	}
+}
+
 // confirmRevokedInCrl reads the CRL that OpenVPN uses (pki/crl.pem) and checks that it lists the
 // serial of the revoked certificate of username (index.txt flag R). It fails closed: a missing or
 // unreadable CRL, or a serial that is not in it, is an error.
@@ -2042,6 +2238,7 @@ func (oAdmin *OvpnAdmin) syncDataFromMaster() {
 			certsDownloadFailed = false
 			log.Info("Decompressing archive with certificates from master")
 			unArchiveCerts()
+			removeArchive(certsArchivePath)
 			log.Info("Decompression archive with certificates from master completed")
 			break
 		} else {
@@ -2055,6 +2252,7 @@ func (oAdmin *OvpnAdmin) syncDataFromMaster() {
 			ccdDownloadFailed = false
 			log.Info("Decompressing archive with ccd from master")
 			unArchiveCcd()
+			removeArchive(ccdArchivePath)
 			log.Info("Decompression archive with ccd from master completed")
 			break
 		} else {

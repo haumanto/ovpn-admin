@@ -230,8 +230,8 @@ func assertIndexEntry(t *testing.T, serial, flag string) {
 func TestRotateActiveUserIssuesNewCertificateAndPassword(t *testing.T) {
 	forEasyrsaLayouts(t, func(t *testing.T, oAdmin *OvpnAdmin, pki string) {
 		db := setupFakeOpenvpnUser(t)
-		mustCreate(t, oAdmin, "alice", "Old-pass-1")
-		mustCreate(t, oAdmin, "bob", "Bob-pass-1")
+		mustCreate(t, oAdmin, "alice", "Old-password-1")
+		mustCreate(t, oAdmin, "bob", "Bob-password-1")
 		oldSerial := serialOf(t, "alice")
 		oldKey := readFile(t, pki, "private/alice.key")
 		oldReq := readFile(t, pki, "reqs/alice.req")
@@ -241,7 +241,7 @@ func TestRotateActiveUserIssuesNewCertificateAndPassword(t *testing.T) {
 			bobBefore[f] = readFile(t, pki, f)
 		}
 
-		if err, msg := oAdmin.userRotate("alice", "New-pass-2"); err != nil {
+		if err, msg := oAdmin.userRotate("alice", "New-password-2"); err != nil {
 			t.Fatalf("userRotate: %v (%s)", err, msg)
 		}
 
@@ -268,7 +268,7 @@ func TestRotateActiveUserIssuesNewCertificateAndPassword(t *testing.T) {
 		if got := readFile(t, pki, "revoked/certs_by_serial/"+oldSerial+".crt"); got != oldCert {
 			t.Error("the old certificate is not in revoked/certs_by_serial")
 		}
-		if got := dbRow(t, db, "alice"); got != "New-pass-2|false" {
+		if got := dbRow(t, db, "alice"); got != "New-password-2|false" {
 			t.Errorf("password row of alice = %q, want the new password, not revoked", got)
 		}
 		// another user is untouched
@@ -277,7 +277,7 @@ func TestRotateActiveUserIssuesNewCertificateAndPassword(t *testing.T) {
 				t.Errorf("%s of another user changed", f)
 			}
 		}
-		if got := dbRow(t, db, "bob"); got != "Bob-pass-1|false" {
+		if got := dbRow(t, db, "bob"); got != "Bob-password-1|false" {
 			t.Errorf("password row of bob = %q", got)
 		}
 	})
@@ -286,9 +286,9 @@ func TestRotateActiveUserIssuesNewCertificateAndPassword(t *testing.T) {
 func TestRotateTwiceInARow(t *testing.T) {
 	forEasyrsaLayouts(t, func(t *testing.T, oAdmin *OvpnAdmin, pki string) {
 		db := setupFakeOpenvpnUser(t)
-		mustCreate(t, oAdmin, "alice", "Old-pass-1")
+		mustCreate(t, oAdmin, "alice", "Old-password-1")
 		serials := []string{serialOf(t, "alice")}
-		for i, pw := range []string{"Pass-two-2", "Pass-three-3"} {
+		for i, pw := range []string{"Password-two-2", "Pass-three-3"} {
 			if err, msg := oAdmin.userRotate("alice", pw); err != nil {
 				t.Fatalf("rotation %d: %v (%s)", i+1, err, msg)
 			}
@@ -318,16 +318,16 @@ func TestRotateTwiceInARow(t *testing.T) {
 func TestRotateRevokedUserGetsNewCertificateAndIsActiveAgain(t *testing.T) {
 	forEasyrsaLayouts(t, func(t *testing.T, oAdmin *OvpnAdmin, pki string) {
 		db := setupFakeOpenvpnUser(t)
-		mustCreate(t, oAdmin, "bob", "Old-pass-1")
+		mustCreate(t, oAdmin, "bob", "Old-password-1")
 		oldSerial := serialOf(t, "bob")
 		if err, msg := oAdmin.userRevoke("bob"); err != nil {
 			t.Fatal(msg)
 		}
-		if got := dbRow(t, db, "bob"); got != "Old-pass-1|true" {
+		if got := dbRow(t, db, "bob"); got != "Old-password-1|true" {
 			t.Fatalf("revoked row = %q", got)
 		}
 
-		if err, msg := oAdmin.userRotate("bob", "New-pass-2"); err != nil {
+		if err, msg := oAdmin.userRotate("bob", "New-password-2"); err != nil {
 			t.Fatalf("userRotate: %v (%s)", err, msg)
 		}
 		if got := strings.Join(indexLines(t), ", "); got != "R REVOKED-bob, V bob" {
@@ -336,7 +336,7 @@ func TestRotateRevokedUserGetsNewCertificateAndIsActiveAgain(t *testing.T) {
 		assertIndexEntry(t, oldSerial, "R")
 		assertIndexEntry(t, serialOf(t, "bob"), "V")
 		mustExist(t, pki, "issued/bob.crt", "private/bob.key", "reqs/bob.req")
-		if got := dbRow(t, db, "bob"); got != "New-pass-2|false" {
+		if got := dbRow(t, db, "bob"); got != "New-password-2|false" {
 			t.Errorf("password row = %q, want the new password and active", got)
 		}
 	})
@@ -346,7 +346,7 @@ func TestRotateRevokedUserGetsNewCertificateAndIsActiveAgain(t *testing.T) {
 func TestRotateExpiredUser(t *testing.T) {
 	forEasyrsaLayouts(t, func(t *testing.T, oAdmin *OvpnAdmin, pki string) {
 		db := setupFakeOpenvpnUser(t)
-		mustCreate(t, oAdmin, "carol", "Old-pass-1")
+		mustCreate(t, oAdmin, "carol", "Old-password-1")
 		oldSerial := serialOf(t, "carol")
 		lines := indexTxtParser(fRead(*indexTxtPath))
 		lines[0].Flag, lines[0].ExpirationDate = "E", "200101000000Z"
@@ -354,7 +354,7 @@ func TestRotateExpiredUser(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err, msg := oAdmin.userRotate("carol", "New-pass-2"); err != nil {
+		if err, msg := oAdmin.userRotate("carol", "New-password-2"); err != nil {
 			t.Fatalf("userRotate: %v (%s)", err, msg)
 		}
 		if got := strings.Join(indexLines(t), ", "); got != "R REVOKED-carol, V carol" {
@@ -362,7 +362,7 @@ func TestRotateExpiredUser(t *testing.T) {
 		}
 		assertIndexEntry(t, oldSerial, "R")
 		mustExist(t, pki, "issued/carol.crt", "private/carol.key", "reqs/carol.req")
-		if got := dbRow(t, db, "carol"); got != "New-pass-2|false" {
+		if got := dbRow(t, db, "carol"); got != "New-password-2|false" {
 			t.Errorf("password row = %q", got)
 		}
 	})
@@ -373,10 +373,10 @@ func TestRotateUserWithoutPasswordRow(t *testing.T) {
 	forEasyrsaLayouts(t, func(t *testing.T, oAdmin *OvpnAdmin, pki string) {
 		mustCreate(t, oAdmin, "dave", "")
 		db := setupFakeOpenvpnUser(t)
-		if err, msg := oAdmin.userRotate("dave", "New-pass-2"); err != nil {
+		if err, msg := oAdmin.userRotate("dave", "New-password-2"); err != nil {
 			t.Fatalf("userRotate: %v (%s)", err, msg)
 		}
-		if got := dbRow(t, db, "dave"); got != "New-pass-2|false" {
+		if got := dbRow(t, db, "dave"); got != "New-password-2|false" {
 			t.Errorf("password row = %q", got)
 		}
 	})
@@ -392,15 +392,15 @@ func TestRotateStopsOnARequestThatIsNotTheOldOnes(t *testing.T) {
 	}
 	easyrsaGenCrl()
 	db := setupFakeOpenvpnUser(t)
-	mustCreate(t, oAdmin, "alice", "Old-pass-1")
-	mustCreate(t, oAdmin, "bob", "Bob-pass-1")
+	mustCreate(t, oAdmin, "alice", "Old-password-1")
+	mustCreate(t, oAdmin, "bob", "Bob-password-1")
 	// the request of alice is replaced by the request of bob
 	if err := os.WriteFile(filepath.Join(pki, "reqs/alice.req"), []byte(readFile(t, pki, "reqs/bob.req")), 0600); err != nil {
 		t.Fatal(err)
 	}
 	before, dbBefore := snapshotPKI(t, pki), readDB(t, db)
 
-	err, msg := oAdmin.userRotate("alice", "New-pass-2")
+	err, msg := oAdmin.userRotate("alice", "New-password-2")
 	if err == nil {
 		t.Fatal("rotate succeeded with a request that is not the old one")
 	}
@@ -460,15 +460,15 @@ func TestRotateFailureRestoresEverything(t *testing.T) {
 			t.Run(st.name+", "+fail.name, func(t *testing.T) {
 				forEasyrsaLayouts(t, func(t *testing.T, oAdmin *OvpnAdmin, pki string) {
 					db := setupFakeOpenvpnUser(t)
-					mustCreate(t, oAdmin, "alice", "Old-pass-1")
-					mustCreate(t, oAdmin, "bob", "Bob-pass-1")
+					mustCreate(t, oAdmin, "alice", "Old-password-1")
+					mustCreate(t, oAdmin, "bob", "Bob-password-1")
 					st.setup(t, oAdmin, pki)
 					easyrsaGenCrl()
 					before, dbBefore, indexBefore := snapshotPKI(t, pki), readDB(t, db), fRead(*indexTxtPath)
 					wasRevoked := userCertRevoked("alice")
 					fail.inject(t, pki, db)
 
-					err, msg := oAdmin.userRotate("alice", "New-pass-2")
+					err, msg := oAdmin.userRotate("alice", "New-password-2")
 					if err == nil {
 						t.Fatal("userRotate succeeded although easyrsa or openvpn-user failed")
 					}
@@ -507,13 +507,13 @@ func postForm(h http.HandlerFunc, path string, form url.Values) *httptest.Respon
 func TestPasswordInputErrorsAreBadRequests(t *testing.T) {
 	oAdmin, _ := setupFakeEasyrsa(t)
 	setupFakeOpenvpnUser(t)
-	mustCreate(t, oAdmin, "alice", "Old-pass-1")
+	mustCreate(t, oAdmin, "alice", "Old-password-1")
 
-	short, long := strings.Repeat("a", 5), strings.Repeat("a", 73)
+	short, long := strings.Repeat("a", 11), strings.Repeat("a", 73)
 	cases := []struct {
 		name, password, message string
 	}{
-		{"5 bytes", short, "Password too short, password length must be greater or equal 6"},
+		{"11 bytes", short, "Password too short, password length must be greater or equal 12"},
 		{"73 bytes", long, "Password too long, the hash accepts at most 72 bytes"},
 	}
 	for _, c := range cases {
@@ -573,7 +573,7 @@ func TestPasswordInputErrorsAreBadRequests(t *testing.T) {
 func TestChangePasswordUnknownUserIsBadRequest(t *testing.T) {
 	oAdmin, _ := setupFakeEasyrsa(t)
 	db := setupFakeOpenvpnUser(t)
-	mustCreate(t, oAdmin, "alice", "Old-pass-1")
+	mustCreate(t, oAdmin, "alice", "Old-password-1")
 	dbBefore := readDB(t, db)
 	indexBefore := fRead(*indexTxtPath)
 

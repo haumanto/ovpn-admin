@@ -212,7 +212,16 @@ else
     openvpn --genkey secret ./pki/ta.key
   fi
 fi
-easyrsa gen-crl
+if [ "${OVPN_ROLE:-master}" = "slave" ]; then
+  # The sync archive of the master does not carry the CA private key (audit H3), and gen-crl needs it. A slave never issues or
+  # revokes anything: its CRL is the pki/crl.pem it received from the master, which rebuilds it on every revoke and once a day.
+  if [ ! -s "${EASY_RSA_LOC}/pki/crl.pem" ]; then
+    echo "ERROR: slave without pki/crl.pem: the sync from the master did not bring the CRL, OpenVPN would refuse every client" >&2
+    exit 1
+  fi
+else
+  easyrsa gen-crl
+fi
 
 # Select iptables backend.
 # Default: system iptables

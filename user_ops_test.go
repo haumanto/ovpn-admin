@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // TestFakeEasyrsa is not a test: it is the easyrsa the tests below run (GO_FAKE_EASYRSA=1, the
@@ -140,6 +141,14 @@ func fakeEasyrsa(t *testing.T, args []string) error {
 			}
 		}
 		crl, err := fakeCrl(lines)
+		// ".fake-crl-next": the nextUpdate (RFC 3339) of the CRL it writes, like EASYRSA_CRL_DAYS does
+		if data, readErr := os.ReadFile(".fake-crl-next"); readErr == nil {
+			next, parseErr := time.Parse(time.RFC3339, strings.TrimSpace(string(data)))
+			if parseErr != nil {
+				return parseErr
+			}
+			crl, err = fakeCrlAt(lines, next.AddDate(0, 0, -180), next)
+		}
 		if err != nil {
 			return err
 		}

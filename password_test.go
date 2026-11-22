@@ -13,10 +13,11 @@ func TestValidatePasswordLength(t *testing.T) {
 		wantErr string // "" = accepted, otherwise a part of the message
 	}{
 		{"empty", "", "too short"},
-		{"5 bytes", strings.Repeat("a", 5), "too short"},
-		{"6 bytes", strings.Repeat("a", 6), ""},
-		{"6 two-byte characters (12 bytes)", strings.Repeat("é", 6), ""},
-		{"5 two-byte characters", strings.Repeat("é", 5), "too short"},
+		{"6 bytes (the old minimum)", strings.Repeat("a", 6), "too short"},
+		{"11 bytes", strings.Repeat("a", 11), "too short"},
+		{"12 bytes", strings.Repeat("a", 12), ""},
+		{"11 two-byte characters (22 bytes)", strings.Repeat("é", 11), "too short"},
+		{"12 two-byte characters (24 bytes)", strings.Repeat("é", 12), ""},
 		{"71 bytes", strings.Repeat("a", 71), ""},
 		{"72 bytes", strings.Repeat("a", 72), ""},
 		{"73 bytes", strings.Repeat("a", 73), "too long"},
@@ -43,7 +44,7 @@ func TestValidatePasswordLength(t *testing.T) {
 }
 
 func TestValidatePasswordMessages(t *testing.T) {
-	if got := validatePassword("12345").Error(); got != "Password too short, password length must be greater or equal 6" {
+	if got := validatePassword(strings.Repeat("a", 11)).Error(); got != "Password too short, password length must be greater or equal 12" {
 		t.Errorf("short message changed: %q", got)
 	}
 	if got := validatePassword(strings.Repeat("a", 73)).Error(); got != "Password too long, the hash accepts at most 72 bytes" {

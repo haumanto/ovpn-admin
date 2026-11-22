@@ -26,17 +26,19 @@ The Go source (`openvpn-user.go`, `src/*.go`) is **unmodified, except for one lo
 
 ## Local patch (carry it forward)
 
-There is exactly **one local modification to the upstream Go source**: a 72-byte password guard in `src/commands.go`. Upstream base: commit `5eefd1b4d304810718246d352912c0667232fbb3` (tag `v1.0.9`). Every other `.go` file and `LICENSE` is byte-identical to that commit.
+There are exactly **two local modifications to the upstream Go source**, both in `src/commands.go`: a 72-byte password guard, and bcrypt cost 12 instead of `bcrypt.MinCost` (the second one is described after the table). Upstream base: commit `5eefd1b4d304810718246d352912c0667232fbb3` (tag `v1.0.9`). Every other `.go` file and `LICENSE` is byte-identical to that commit.
 
 | | |
 |---|---|
-| File | `src/commands.go` only (`+12` lines, nothing removed) |
+| File | `src/commands.go` only (the 72-byte guard added `+12` lines and removed nothing; the cost change adds `+5` lines and changes the two `GenerateFromPassword` calls) |
 | Change | New `var errPasswordTooLong`, and `if len(password) > 72 { return "", errPasswordTooLong }` at the top of `CreateUser` and `ChangeUserPassword`. Both sites carry the marker `LOCAL PATCH (ovpn-admin)`; `grep -rn "LOCAL PATCH" src/` finds all of them. |
 | Why | bcrypt hashes at most 72 bytes. `golang.org/x/crypto/bcrypt` returns `ErrPasswordTooLong` for a longer password, and upstream drops that error (`hash, _ := bcrypt.GenerateFromPassword(...)`), so a direct `openvpn-user create --password=<73+ bytes>` reported "User created" with an empty hash stored, and `change-password` reported "Password changed" and replaced the existing hash with NULL (measured on the unpatched binary, exit code 0 both times). Now the command exits 1 with `openvpn-user: error: password is longer than 72 bytes (bcrypt limit)` and writes nothing. |
 | Behaviour for 72 bytes or less | Unchanged. |
-| Also enforced by | `ovpn-admin` itself (HTTP 400 for a password under 8 or over 72 bytes, `password_test.go`); the patch closes the direct command line path. |
+| Also enforced by | `ovpn-admin` itself (HTTP 400 for a password under 12 characters or over 72 bytes, `password_test.go`; the minimum of 12 characters lives in ovpn-admin only, the `openvpn-user` command line itself enforces the 72-byte maximum and no minimum); the patch closes the direct command line path. |
 
-If upstream fixes this itself, drop the patch. Until then, **a new upstream import must re-apply it**: after step 2 of "How to update", check that `grep -rn "LOCAL PATCH" src/` still finds the three markers, and run the guard check (73 bytes must exit non-zero and leave `users.db` unchanged, 72 bytes must succeed). To list the whole difference against upstream, diff this directory against a fresh clone of the base commit: expected are `src/commands.go` (the patch), `go.mod`, `go.sum`, and this README; the upstream files that are not vendored (scripts, Dockerfile, CI) do not exist here.
+**Second modification: bcrypt cost 12.** Upstream hashes every password with `bcrypt.MinCost` (cost 4, a few milliseconds per guess, which makes a copied `users.db` cheap to brute force). `CreateUser` and `ChangeUserPassword` now use the constant `bcryptCost = 12` (about 250 ms per hash; each login check costs the same). A bcrypt hash carries its own cost, so existing cost-4 hashes keep verifying and stay valid until that user's password is changed; nothing is rehashed or reset. The marker `LOCAL PATCH (ovpn-admin), second modification` sits at the constant. Check after an import: create a user against a throwaway database and read the hash, it must start with `$2a$12$`.
+
+If upstream fixes this itself, drop the patch. Until then, **a new upstream import must re-apply it**: after step 2 of "How to update", check that `grep -rn "LOCAL PATCH" src/` still finds the four markers (the comment above the guard, the comment at `bcryptCost`, and the two guards), and run the guard check (73 bytes must exit non-zero and leave `users.db` unchanged, 72 bytes must succeed) and the cost check above. To list the whole difference against upstream, diff this directory against a fresh clone of the base commit: expected are `src/commands.go` (the patch), `go.mod`, `go.sum`, and this README; the upstream files that are not vendored (scripts, Dockerfile, CI) do not exist here.
 
 ## How it is built
 
