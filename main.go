@@ -7,7 +7,9 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"embed"
+	"encoding/asn1"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -1482,7 +1484,10 @@ func restoreRevokedFiles(username, serial string, fail func(what string, err err
 			if err := fMove(from, to); err != nil {
 				fail(what, err)
 			}
+		case fRegularFile(to):
 		case fExist(to):
+			// a directory (or another special file) in the place of the file is not a restored file
+			fail(what, fmt.Errorf("%s exists but is not a regular file", to))
 		default:
 			fail(what, fmt.Errorf("neither %s nor %s exists", from, to))
 		}
@@ -1501,6 +1506,12 @@ func restoreRevokedFiles(username, serial string, fail func(what string, err err
 	move("the certificate could not be restored", revokedCert, issued)
 	move("the private key could not be restored", pkiFile("revoked", "private_by_serial", serial+".key"), pkiFile("private", username+".key"))
 	move("the request could not be restored", pkiFile("revoked", "reqs_by_serial", serial+".req"), pkiFile("reqs", username+".req"))
+}
+
+// fRegularFile reports whether path is an existing regular file (a symlink counts as what it points to).
+func fRegularFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
 }
 
 // readIndexTxt reads and parses index.txt. An index that cannot be read is an error, never an empty
@@ -2248,15 +2259,42 @@ func loadCaKeyIdentity(pki string) (caKeyIdentity, error) {
 	return id, nil
 }
 
-// pemBodies returns the decoded body of every PEM block that holds private key material.
+// pemBodies returns the decoded body of every PEM block that holds usable private key material: a key that
+// parses to a public key (the same parsePrivateKeyDER that addKeyMaterial uses, so the two cannot disagree),
+// or an encrypted key, which cannot be parsed and is kept as reference material on purpose. A block of a
+// private key type with a body that is neither is not reference material.
 func pemBodies(data []byte) [][]byte {
 	var out [][]byte
 	for _, b := range pemBlocks(data) {
-		if strings.HasSuffix(b.Type, "PRIVATE KEY") {
+		if !strings.HasSuffix(b.Type, "PRIVATE KEY") {
+			continue
+		}
+		if _, ok := parsePrivateKeyDER(b.Bytes); ok || encryptedKeyBlock(b) {
 			out = append(out, b.Bytes)
 		}
 	}
 	return out
+}
+
+// encryptedKeyBlock reports whether b is an encrypted private key that cannot be parsed without its
+// passphrase: an "ENCRYPTED PRIVATE KEY" block whose body is a well formed PKCS #8 EncryptedPrivateKeyInfo
+// (an algorithm and the encrypted data), or a legacy PEM block that declares itself encrypted.
+func encryptedKeyBlock(b *pem.Block) bool {
+	if len(b.Bytes) == 0 {
+		return false
+	}
+	if strings.Contains(b.Headers["Proc-Type"], "ENCRYPTED") {
+		return true
+	}
+	if b.Type != "ENCRYPTED PRIVATE KEY" {
+		return false
+	}
+	var info struct {
+		Algorithm pkix.AlgorithmIdentifier
+		Data      []byte
+	}
+	rest, err := asn1.Unmarshal(b.Bytes, &info)
+	return err == nil && len(rest) == 0 && len(info.Data) > 0
 }
 
 // parsePrivateKeyDER returns the public key of a DER encoded private key (PKCS #8, PKCS #1 or SEC 1).
