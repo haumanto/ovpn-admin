@@ -1,4 +1,4 @@
-# nginx reverse proxy for ovpn-admin (v0.1.1): TLS termination, HSTS, per-client rate limit
+# nginx reverse proxy for ovpn-admin (ovpn-admin v0.1.11): TLS termination, HSTS, per-client rate limit
 # and an access log that fail2ban can read.
 #
 # Install: copy to /etc/nginx/conf.d/ovpn-admin.conf (this file is included in the http{} context,

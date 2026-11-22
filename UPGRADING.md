@@ -14,6 +14,7 @@ Pick your section:
 * [v0.1.7 → v0.1.8](#v017--v018)
 * [v0.1.8 → v0.1.9](#v018--v019)
 * [v0.1.9 → v0.1.10](#v019--v0110)
+* [v0.1.10 → v0.1.11](#v0110--v0111)
 * [upstream → v0.1.x](#upstream--v01x)
 
 Kubernetes/Helm deployments: see `charts/openvpn-admin/README.md`. The historical notes of the first release stay in `UPGRADING-v0.1.0.md`.
@@ -328,6 +329,40 @@ Status: candidate, not published. The steps below apply once v0.1.10 is tagged a
 9. **Verify.** Run `curl -fsS http://127.0.0.1:8080/ping`, then log in to the UI with the Basic Auth user.
 
 Known limits of this upgrade: no in-place upgrade of a running v0.1.9 deployment with live data was run. QA used fresh stacks. A rollback was not tested. arm64 images were not tested. Do not rotate a user on the `kubernetes.secrets` backend until it is tested. See `RELEASE-v0.1.10.md`, Known limitations.
+
+## v0.1.10 → v0.1.11
+
+Status: candidate, not published. The steps below apply once v0.1.11 is tagged and released. Details: [RELEASE-v0.1.11.md](RELEASE-v0.1.11.md).
+
+1. **Note your current version** (`git describe --tags --always`, or the image tags). You need it for a rollback.
+2. **Set the ban ignore list before you upgrade.** The default no longer has `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` or `fe80::/10`. Add the networks your admins use, for example in your environment or compose file:
+   ```bash
+   export OVPN_BAN_IGNOREIP="127.0.0.0/8 ::1 172.20.0.0/24 10.0.0.0/8"
+   ```
+   Entries are IPs or CIDRs separated by single spaces.
+3. **Decide about the ban engine.** `OVPN_BAN_REQUIRED` now defaults to `true`: if fail2ban cannot start, the container stops with `ERROR: OVPN_BAN_REQUIRED=true, stopping the container`. If you ran without bans on purpose, set `OVPN_BAN_REQUIRED=false` explicitly.
+4. **Update the checkout** once the `v0.1.11` tag exists: `git fetch --tags && git checkout v0.1.11`. `docker-compose.yaml` changes in this release (the sync token is optional, and the ban defaults change). `docker-compose-slave.yaml` does not change. If you keep your own copy of the compose file, merge the changed defaults by hand. Keep your own edits.
+5. **Back up before you upgrade:**
+   ```bash
+   mkdir -p -m 700 backups
+   tar -czf backups/pre-v0.1.11-$(date -u +%Y%m%dT%H%M%SZ).tar.gz easyrsa_master ccd_master audit_master
+   sha256sum backups/pre-v0.1.11-*.tar.gz
+   ```
+6. **Rebuild both images.** Both change: `ovpn-admin` (Go code, the 12-character minimum and cost-12 hashes) and `openvpn` (`setup/configure.sh`, the tunnel fence and the ban engine start-up, and `openvpn-user`):
+   ```bash
+   docker compose -p openvpn-master build --pull ovpn-admin openvpn
+   docker compose -p openvpn-master up -d --no-deps ovpn-admin openvpn
+   curl -fsS http://127.0.0.1:8080/ping
+   ```
+   Restarting the `openvpn` container drops connected VPN clients. Do this in a quiet window. If the container stops at start with `ERROR: fail2ban did not start`, fix fail2ban in the container or set `OVPN_BAN_REQUIRED=false` explicitly, then start again.
+7. **Sync is off unless you set a token.** If you run a slave, set `OVPN_MASTER_TOKEN` (`openssl rand -hex 32`) on the master and on the slave. Without it the download endpoints answer 403.
+8. **Convert a hand-encrypted `ca.key` if it uses another cipher.** The sync export accepts AES-128, AES-192, AES-256 and DES-EDE3-CBC legacy PEM keys, and PKCS#8. Any other cipher (for example Camellia) answers 500. Convert the key with `openssl pkcs8 -topk8` first.
+9. **Update scripts that read the old answers.** Revoke, rotate and delete answer 500 on a server failure, not 200. Change-password on a revoked user answers 400. The rotate failure text is new.
+10. **Passwords.** Existing short passwords keep working. New and changed passwords must be at least 12 characters, and at most 72 bytes.
+11. **Verify.** Run `curl -fsS http://127.0.0.1:8080/ping`, log in to the UI with the Basic Auth user, and check the CRL gauge with `curl -s -u <user>:<password> http://127.0.0.1:8080/metrics | grep ovpn_crl_expire_days`.
+12. **Helm.** The chart's `version` and `appVersion` move to v0.1.11 (`charts/openvpn-admin/Chart.yaml`). No chart template changed. The chart is not hardened to the compose level, see `charts/openvpn-admin/README.md`.
+
+Known limits of this upgrade: QA used fresh stacks, so no in-place upgrade of a running v0.1.10 deployment with live data was run. A rollback was not tested. arm64 images were not tested. The slave was not tested. See `RELEASE-v0.1.11.md`, Known limitations.
 
 ## upstream → v0.1.x
 

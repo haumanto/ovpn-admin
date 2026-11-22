@@ -1,6 +1,6 @@
 # Hardening guide for an internet-exposed ovpn-admin
 
-This guide is for the operator of a Docker Compose deployment of ovpn-admin v0.1.1 that is reachable from the internet. It tells you what the application already protects, what you must put around it, and the exact steps to do that. Everything referenced here is in this directory:
+This guide is for the operator of a Docker Compose deployment of ovpn-admin v0.1.11 that is reachable from the internet. It tells you what the application already protects, what you must put around it, and the exact steps to do that. Everything referenced here is in this directory:
 
 | File | Purpose |
 |---|---|
@@ -22,32 +22,33 @@ What an attacker can try:
 | Attack | Where it hits | Who stops it |
 |---|---|---|
 | Guess the admin password | admin panel | Basic Auth in ovpn-admin; nginx rate limit slows it; fail2ban bans the source address |
-| Sniff the admin password | network path to the panel | TLS in nginx (the app speaks plain HTTP and is bound to loopback) |
+| Sniff the admin password | network path to the panel | TLS in nginx (the app speaks plain HTTP; compose publishes port 8080 on `127.0.0.1` only, `docker-compose.yaml:85`) |
 | Reach the panel without the proxy | port 8080 | compose publishes it on `127.0.0.1` only; keep it closed in your firewall |
-| Reach the panel from inside the tunnel | port 8080 | the openvpn container drops TCP to `OVPN_LISTEN_PORT` arriving on `tun+` (iptables and ip6tables, `INPUT`); `configure.sh` checks the rule right before OpenVPN starts and stops the container when it is missing |
-| Guess a VPN password with a stolen or leaked client certificate | OpenVPN | `auth_fail` lines in the audit log; fail2ban bans the source address |
+| Reach the panel from inside the tunnel | port 8080 | the openvpn container drops TCP to the panel port (`OVPN_LISTEN_PORT`, 8080) arriving on `tun+`, for IPv4 and IPv6 (iptables and ip6tables, `INPUT`, `setup/configure.sh:252, 261-280`); `configure.sh` checks the rule right before OpenVPN starts and stops the container when it is missing (`setup/configure.sh:559-573`) |
+| Use a connected VPN client to reach the VPN host and the LAN behind it | the host and its LAN | Nothing. This is accepted for now (see Limits). Default-deny forwarding is deferred, not cancelled |
+| Guess a VPN password with a stolen or leaked client certificate | OpenVPN | the ban engine in the openvpn container (on by default) counts `AUTH_FAILED` lines in `openvpn.log`; optionally a host jail on `audit.tsv` |
 | Scan the VPN port, connect without a certificate | OpenVPN | the TLS handshake fails; OpenVPN logs it, the audit log does **not** (see Limits) |
 | Flood the panel with requests | nginx, ovpn-admin | nginx `limit_req` answers 429 per client address |
 | Click-jack or content-sniff the panel | browser | security headers set by ovpn-admin; HSTS set by nginx |
 
 ### What the application does itself
 
-* Refuses to start without `BASIC_USERNAME`, `BASIC_PASSWORD` and `OVPN_MASTER_TOKEN` (compose) and compares credentials in constant time.
-* Binds the admin panel to `127.0.0.1:8080`.
-* Writes `auth failed remote=<address> path=<path>` (warn level) when a request carries wrong credentials. Behind a proxy `remote` is the proxy address, so this line is for detection, not for banning.
-* Sets `X-Frame-Options: DENY`, `Content-Security-Policy: frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`, and `Cache-Control: no-store` on `/api/` answers.
-* Writes one audit line per connect, disconnect and password check (`auth_ok`, `auth_fail`), with the real client address. Passwords are never written.
+* Refuses to start without `BASIC_USERNAME` and `BASIC_PASSWORD` (compose). `OVPN_MASTER_TOKEN` is optional: without it the sync is off and the PKI and CCD download endpoints answer 403 (`docker-compose.yaml`, `main.go`: `validateSyncTokenConfig`, `syncTokenMatches`). It compares credentials in constant time (`main.go:786-787`).
+* Listens on port 8080 on all interfaces of the `openvpn` container's network namespace, because `--listen.host` is empty by default (`main.go:73`, `main.go:684`). Compose publishes it on the host only as `127.0.0.1:8080` (`docker-compose.yaml:85`). It is not bound to loopback inside the container, so the tunnel fence (see the threat model) is what keeps VPN clients off the panel.
+* Writes `auth failed remote=<address> path=<path>` (warn level) when a request carries wrong credentials (`main.go:794`). Behind a proxy `remote` is the proxy address, so this line is for detection, not for banning.
+* Sets `X-Frame-Options: DENY`, `Content-Security-Policy: frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`, and `Cache-Control: no-store` on `/api/` answers (`main.go:811-816`).
+* Writes one audit line per connect, disconnect and password check (`auth_ok`, `auth_fail`), with the real client address. Passwords are never passed to the audit helper or written (`setup/audit.sh:9`, `setup/auth.sh:23`).
 
 ### What is delegated
 
-| To nginx | To fail2ban |
+| To nginx | To fail2ban (host jails) |
 |---|---|
 | TLS and certificates | Banning addresses that fail logins repeatedly |
 | HSTS | Firewall rules (`iptables`) for the ban |
 | Per-client rate limit (HTTP 429) | |
 | The access log that records failed logins with the real client address | |
 
-ovpn-admin does not ban anyone and does not rate-limit. Without nginx and fail2ban an attacker can guess passwords at full speed.
+ovpn-admin does not ban by itself. The ban engine runs in the `openvpn` container (see below). The master's **Banned IPs** tab offers manual ban and unban through `POST /api/ban/manual` and `POST /api/unban` (`main.go:669-670`). Without nginx, the ban engine and the host jails, an attacker can guess passwords with no rate limit and no ban.
 
 ## Install
 
@@ -59,7 +60,8 @@ Assumptions: a Linux host with Docker Compose, the repository checked out at `/o
 cd /opt/ovpn-admin
 export BASIC_USERNAME=admin
 export BASIC_PASSWORD="$(openssl rand -base64 24)"   # store it in your password manager
-export OVPN_MASTER_TOKEN="$(openssl rand -hex 32)"
+# optional, only for a slave: setting OVPN_MASTER_TOKEN turns the master/slave sync on
+# export OVPN_MASTER_TOKEN="$(openssl rand -hex 32)"
 ./start.sh
 ```
 
@@ -154,13 +156,14 @@ Nothing rotates the audit file. A `copytruncate` rule keeps it small; fail2ban f
 
 ## The ban engine inside the OpenVPN container
 
-The openvpn container runs its own fail2ban (jail `ovpn-admin`). It reads `openvpn.log`, bans a source address after `OVPN_BAN_MAXRETRY` failed logins (`AUTH_FAILED`) or revoked-certificate attempts within `OVPN_BAN_FINDTIME` seconds for `OVPN_BAN_BANTIME` seconds, and lists active bans in `bans.tsv` in the audit directory. `bans.tsv` is a view of the bans in force for the UI, not persisted state: it is emptied at every start. Bans live in the `OVPN_BAN` (iptables, IPv4) and `OVPN_BAN6` (ip6tables, IPv6) chains. A restart does not load them from anywhere: the engine starts empty and derives them again from the current `openvpn.log`, see "Restart behaviour". It is independent of the host-level jails above. All variables are set in `docker-compose.yaml` and `docker-compose-slave.yaml`; every value is validated at start, and a bad value stops the container with a message instead of running half-configured.
+The openvpn container runs its own fail2ban (jail `ovpn-admin`). It reads `openvpn.log`, bans a source address after `OVPN_BAN_MAXRETRY` failed logins (`AUTH_FAILED`) or revoked-certificate attempts within `OVPN_BAN_FINDTIME` seconds for `OVPN_BAN_BANTIME` seconds, and lists active bans in `bans.tsv` in the audit directory. The Nth ban of the same address is permanent (`OVPN_BAN_REPEAT_COUNT`, default `2`; see the next section). `bans.tsv` is a view of the bans in force for the UI, not persisted state: it is emptied at every start. Bans live in the `OVPN_BAN` (iptables, IPv4) and `OVPN_BAN6` (ip6tables, IPv6) chains. A restart does not keep temporary bans: the engine starts empty and derives them again from the current `openvpn.log`, see "Restart behaviour". Permanent bans come back at a restart. It is independent of the host-level jails above. All variables are set in `docker-compose.yaml` and `docker-compose-slave.yaml`; every value is validated at start, and a bad value stops the container with a message instead of running half-configured.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `OVPN_BAN_ENABLED` | `true` | `false` switches the engine off (and the checks below with it) |
-| `OVPN_BAN_REQUIRED` | `true` | `true`: the container stops when fail2ban cannot start. `false`: OpenVPN runs without bans and logs an error |
-| `OVPN_BAN_IGNOREIP` | `127.0.0.0/8 ::1 172.20.0.0/24` | never banned: loopback and the compose bridge subnet only |
+| `OVPN_BAN_REQUIRED` | `true` | `true`: the container stops when fail2ban cannot start (`setup/configure.sh:21, 532-536`). `false`: OpenVPN runs without bans and logs an error. `docker-compose-slave.yaml` still defaults to `false` |
+| `OVPN_BAN_IGNOREIP` | `127.0.0.0/8 ::1 172.20.0.0/24` | never banned: loopback and the compose bridge subnet only (`docker-compose.yaml:53`, `setup/configure.sh:39`). `docker-compose-slave.yaml` still has the old list with private ranges (`docker-compose-slave.yaml:51`) |
+| `OVPN_BAN_REPEAT_COUNT` | `2` | the Nth ban of the same address is permanent; `1` makes every ban permanent (`setup/configure.sh:26`) |
 | `OVPN_BAN_IPV6_REQUIRED` | `true` | see "IPv6 fails closed" |
 | `OVPN_SERVER_PORT` | `1194` | OpenVPN listener port inside the container; the single source for `openvpn --port`, the ban jumps and the right side of the compose `ports` mapping |
 | `OVPN_PROTO` | `tcp` | OpenVPN `--proto`; decides the transport of the ban jumps and whether IPv6 is on |
@@ -182,6 +185,12 @@ The ban jumps are not configured separately. `configure.sh` takes the listener p
 * `OVPN_BAN_PORT` is kept only as an assertion. If it is set and differs from `OVPN_SERVER_PORT`, the container exits non-zero. Leave it unset unless you want that cross-check.
 * If you change `OVPN_SERVER_PORT`, the published port in the compose file follows (`7777:${OVPN_SERVER_PORT:-1194}`); the host side stays as it is.
 * `OVPN_PROTO` is limited to `tcp`, `tcp4`, `tcp6`, `tcp-server`, `tcp4-server`, `tcp6-server`, `udp`, `udp4`, `udp6`. An OpenVPN instance that listens on several ports or protocols at once is not supported by this container, and so not by the ban scope either.
+
+### Permanent bans, manual bans and Telegram
+
+* **Permanent bans.** The Nth ban of an address is permanent. `N` is `OVPN_BAN_REPEAT_COUNT` (default `2`; `1` makes every ban permanent). The counts are kept in `ban-history.tsv` in the audit directory (`setup/ovpn-ban.sh:28-30`), so permanent bans survive a container restart. When the jail starts, each permanent entry is restored (`setup/ovpn-ban.sh:755`, `restore_permanent`). Temporary bans are not kept; see "Restart behaviour".
+* **Manual bans.** On the master, the **Banned IPs** tab has **Ban IP** and **Unban**. The API behind them is `POST /api/ban/manual` and `POST /api/unban` (`main.go:669-670`). Use the tab, or the API, for an address that should stay out.
+* **Telegram.** Off by default (`OVPN_TELEGRAM_ENABLED=false`, `docker-compose.yaml:69`). When it is on, each new ban sends one message (`setup/ovpn-ban.sh:11`). A bad setting logs an `ERROR` at start, notifications stay off, and the VPN still starts (`setup/configure.sh:163, 167`). Keep the bot token in a file outside git and point `OVPN_TELEGRAM_BOT_TOKEN_FILE` at it. Setup and variables: [README, Telegram notifications](../../README.md#telegram-notifications).
 
 ### Log rotation
 
@@ -217,17 +226,18 @@ One failed password writes two `AUTH_FAILED` lines with the same source address 
 
 ### Restart behaviour
 
-`bans.tsv` is not persisted state and nothing is re-applied from it: it is a view of the bans in force that is cleared at every start, and the ban state is derived again from the current `openvpn.log` within `OVPN_BAN_FINDTIME`. At every container start (a restart or a recreate) `configure.sh` runs `ovpn-ban.sh init`, which empties both ban chains and `bans.tsv`, and then starts fail2ban without a ban database (`dbfile = None`). The jail reads the whole `openvpn.log` again (the file survives a restart), counts the failures that are still inside the findtime, and bans again whoever reaches `OVPN_BAN_MAXRETRY`. A restart can therefore re-ban a recent offender. So:
+Temporary bans are not persisted, and nothing re-applies them from a file: `bans.tsv` is a view of the bans in force that is cleared at every start, and the temporary ban state is derived again from the current `openvpn.log` within `OVPN_BAN_FINDTIME`. Permanent bans are the exception. `ban-history.tsv` keeps them, and the jail start restores each permanent entry (`setup/ovpn-ban.sh:28-30`, `restore_permanent`, `setup/ovpn-ban.sh:755`). At every container start (a restart or a recreate) `configure.sh` runs `ovpn-ban.sh init`, which empties both ban chains and `bans.tsv` but keeps the history (`setup/ovpn-ban.sh:697-701`), and then starts fail2ban without a ban database (`dbfile = None`, `setup/configure.sh:423`). The jail reads the whole `openvpn.log` again (the file survives a restart), counts the failures that are still inside the findtime, and bans again whoever reaches `OVPN_BAN_MAXRETRY`. A restart can therefore re-ban a recent offender. So:
 
 * **Restart inside `OVPN_BAN_FINDTIME`** of the last counted failure, and while `OVPN_BAN_BANTIME` since that failure has not yet run out: the failures are counted again and the jail bans the address again within seconds of the start. The DROP rule and the `bans.tsv` row come back (with a new `banned_at`), and the ban ends `OVPN_BAN_BANTIME` after the last counted failure, not after the restart. The `expires_at` in `bans.tsv` and in the Banned IPs view is computed at the moment of the re-ban, so for a re-derived ban it can show a later time than the real unban; the row disappears at the real unban. If the findtime is still open but the bantime since the last failure has already run out (a bantime shorter than the findtime), the failures are counted again but nothing is banned (measured: three revoked-certificate failures 100 to 112 seconds old, `OVPN_BAN_BANTIME=60`, restart: `Found` x3, no `Ban`, `bans.tsv` empty).
-* **Restart after `OVPN_BAN_FINDTIME`**: the old failures are too old to count, nothing is banned, and the chains and `bans.tsv` are empty. The restart ended the ban even if `OVPN_BAN_BANTIME` had not run out.
-* A restart is therefore not a way to escape a ban that is still inside its findtime, and not a way to keep one past it. A ban that must survive a restart on its own needs a host firewall rule, not the jail.
+* **Restart after `OVPN_BAN_FINDTIME`**: the old failures are too old to count, nothing is banned, and the chains and `bans.tsv` are empty. The restart ended the temporary ban even if `OVPN_BAN_BANTIME` had not run out. Permanent bans come back.
+* A restart is therefore not a way to escape a temporary ban that is still inside its findtime, and not a way to keep one past it. Permanent bans always come back. A ban that must survive a restart on its own needs a host firewall rule, not the jail.
 
 ## Limits you should know
 
 * **The audit log only sees password failures.** A client without a valid certificate fails the TLS handshake and writes no `auth_fail` line, so the VPN jail does not react to port scans or to certificate-less connection attempts. That traffic is rejected by OpenVPN itself. If you need to react to it, add OpenVPN's own log as a third source.
 * **The admin jail also bans a mistyped saved password.** A browser that keeps sending an old password produces `auth=1` failures. Put your own address in `ignoreip`.
 * **Bans are per address.** Many attackers behind one NAT share a fate, and an attacker with many addresses is slowed down, not stopped. Use long, random passwords.
+* **A connected VPN client reaches the VPN host and the LAN behind it.** The tunnel fence protects the panel port only. This is the owner's decision for now: default-deny forwarding (audit H2) is deferred, not cancelled, so a stolen client certificate still reaches the whole host and LAN. See [RELEASE-v0.1.11.md](../../RELEASE-v0.1.11.md#known-limitations).
 * **The jail and filter files were tested** with `fail2ban-regex` and a real fail2ban 1.1.0 server in a container, including real iptables rules in a stand-in `DOCKER-USER` chain. They were not tested against a Docker host with live NAT traffic. Do step 4 on your host.
 * **Fixtures are partly synthetic.** See [fail2ban/testdata/README.md](fail2ban/testdata/README.md).
-* **Kubernetes (Helm chart):** the chart's Ingress does TLS and Basic Auth for the panel; the audit volume is an `emptyDir` by default, which fail2ban on a node cannot read. This guide covers Docker Compose.
+* **Kubernetes (Helm chart):** the chart is not hardened to the compose level. It sets `duplicate-cn` and `client-to-client`, has no password check and no ban engine, always creates the Ingress, and stores the admin password as `{PLAIN}`. See [charts/openvpn-admin/README.md](../../charts/openvpn-admin/README.md). The audit volume is an `emptyDir` by default, which fail2ban on a node cannot read. This guide covers Docker Compose.
