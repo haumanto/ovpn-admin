@@ -201,6 +201,10 @@ func createArchiveFromDirSkipping(dir, path string, skip func(rel string) bool) 
 	return createArchiveFromDirFiltered(dir, path, skip, nil)
 }
 
+// maxArchiveFilterBytes is the largest file the content filter reads into memory (the largest file of a
+// PKI is users.db, far below this): a larger file makes the archive fail instead of the process grow.
+const maxArchiveFilterBytes = 64 << 20
+
 // createArchiveFromDirFiltered is createArchiveFromDirSkipping with a second filter on the content:
 // skipData, when not nil, is called with the relative path and the bytes of every file that is about to be
 // added, the bytes the archive will hold (the file is read once; its size in the header is the size of what
@@ -275,7 +279,10 @@ func createArchiveFromDirFiltered(dir, path string, skip func(rel string) bool, 
 		// under another name, a link, a copy
 		var content []byte
 		if skipData != nil {
-			content, err = io.ReadAll(file)
+			content, err = io.ReadAll(io.LimitReader(file, maxArchiveFilterBytes+1))
+			if err == nil && len(content) > maxArchiveFilterBytes {
+				err = fmt.Errorf("%s is larger than %d bytes, the content filter does not read it", filePath, maxArchiveFilterBytes)
+			}
 			if err != nil {
 				file.Close()
 				return err

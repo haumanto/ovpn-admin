@@ -65,6 +65,7 @@ for a in "$@"; do
 done
 [ -f "$db.fail" ] && grep -qx "$cmd" "$db.fail" && { echo "injected failure of $cmd" >&2; exit 1; }
 [ "$cmd" = list ] && [ -f "$db.failafterchange" ] && [ -f "$db.changed" ] && { echo "injected failure of list after change-password" >&2; exit 1; }
+[ "$cmd" = list ] && [ -f "$db.failoncelist" ] && [ -f "$db.stored" ] && { rm -f "$db.failoncelist"; echo "injected one-off failure of list after the password was stored" >&2; exit 1; }
 touch "$db"
 case "$cmd" in
   list)
@@ -74,7 +75,7 @@ case "$cmd" in
     while IFS='|' read -r n p r; do i=$((i+1)); echo "$i  | $n | $r | false | false"; done < "$db" ;;
   create)
     if grep -q "^$user|" "$db"; then echo "user exists" >&2; exit 1; fi
-    echo "$user|$pw|false" >> "$db" ;;
+    echo "$user|$pw|false" >> "$db"; touch "$db.stored" ;;
   delete)
     grep -v "^$user|" "$db" > "$db.new"; mv "$db.new" "$db" ;;
   revoke)
@@ -84,7 +85,7 @@ case "$cmd" in
     sed -i "s/^\($user|.*|\)true\$/\1false/" "$db" ;;
   change-password)
     grep -q "^$user|" "$db" || exit 1
-    sed -i "s/^$user|[^|]*|/$user|$pw|/" "$db"; touch "$db.changed" ;;
+    sed -i "s/^$user|[^|]*|/$user|$pw|/" "$db"; touch "$db.changed" "$db.stored" ;;
   auth)
     grep -q "^$user|$pw|false$" "$db" || exit 1 ;;
   *) echo "unknown command $cmd" >&2; exit 1 ;;

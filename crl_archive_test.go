@@ -67,6 +67,7 @@ func writePki(t *testing.T, pki string) {
 			t.Fatal(err)
 		}
 	}
+	writeCaIdentity(t, pki)
 }
 
 // tarNames lists the member names of a tar.gz.
