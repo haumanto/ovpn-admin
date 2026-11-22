@@ -198,6 +198,14 @@ func createArchiveFromDir(dir, path string) error {
 // skip, when not nil, is called with the slash separated path of a file relative to dir; a file for
 // which it returns true is left out of the archive.
 func createArchiveFromDirSkipping(dir, path string, skip func(rel string) bool) error {
+	return createArchiveFromDirFiltered(dir, path, skip, nil)
+}
+
+// createArchiveFromDirFiltered is createArchiveFromDirSkipping with a second filter on the content:
+// skipData, when not nil, is called with the relative path and the bytes of every file that is about to be
+// added, the bytes the archive will hold (the file is read once; its size in the header is the size of what
+// was read), and a file for which it returns true is left out.
+func createArchiveFromDirFiltered(dir, path string, skip func(rel string) bool, skipData func(rel string, data []byte) bool) error {
 
 	var files []string
 	root := filepath.Clean(dir)
@@ -263,6 +271,22 @@ func createArchiveFromDirSkipping(dir, path string, skip func(rel string) bool) 
 		}
 		header.Name = filepath.ToSlash(relPath)
 
+		// the content filter sees the bytes that are about to be archived, wherever the name came from: a file
+		// under another name, a link, a copy
+		var content []byte
+		if skipData != nil {
+			content, err = io.ReadAll(file)
+			if err != nil {
+				file.Close()
+				return err
+			}
+			if skipData(header.Name, content) {
+				file.Close()
+				continue
+			}
+			header.Size = int64(len(content))
+		}
+
 		// Write file header to the tar archive
 		err = tw.WriteHeader(header)
 		if err != nil {
@@ -271,7 +295,11 @@ func createArchiveFromDirSkipping(dir, path string, skip func(rel string) bool) 
 		}
 
 		// Copy file content to tar archive
-		_, err = io.Copy(tw, file)
+		if skipData != nil {
+			_, err = tw.Write(content)
+		} else {
+			_, err = io.Copy(tw, file)
+		}
 		if err != nil {
 			file.Close()
 			return err

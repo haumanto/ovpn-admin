@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -140,7 +141,7 @@ func TestServerCertificatesAreNotManaged(t *testing.T) {
 		t.Error(`checkUserExist("alice") = false`)
 	}
 
-	if err, _ := (&OvpnAdmin{}).userRevoke("ovpn01"); err == nil {
+	if err, _ := (&OvpnAdmin{createUserMutex: &sync.Mutex{}}).userRevoke("ovpn01"); err == nil {
 		t.Error(`userRevoke("ovpn01") succeeded for a server certificate`)
 	}
 }

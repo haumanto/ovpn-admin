@@ -426,6 +426,11 @@ func (oAdmin *OvpnAdmin) mgmtGetActiveClients() []clientStatus {
 	return activeClients
 }
 
+// mgmtKillNotFoundReply is the answer of OpenVPN to "kill <name>" when no client has that common name.
+func mgmtKillNotFoundReply(username string) string {
+	return "ERROR: common name '" + username + "' not found"
+}
+
 // mgmtKillUserConnection sends "kill <username>" to one management interface. A user that is not
 // connected there is the wanted end state, not an error; an interface that cannot be reached, or
 // that refuses the command for another reason, is.
@@ -451,8 +456,9 @@ func (oAdmin *OvpnAdmin) mgmtKillUserConnection(username, serverName string) err
 	switch {
 	case strings.HasPrefix(result, "SUCCESS:"):
 		log.Infof("Session for user \"%s\" killed on %s: %s", username, serverName, result)
-	case strings.HasPrefix(result, "ERROR:") && strings.Contains(result, "not found"):
-		// OpenVPN: "ERROR: common name 'x' not found", the user has no session on this server
+	case result == mgmtKillNotFoundReply(username):
+		// the user has no session on this server: the wanted end state. Only OpenVPN's own reply for
+		// exactly this name counts; any other ERROR (a refused command, another name) is a failure
 		log.Debugf("mgmt kill %s on %s: %s", username, serverName, result)
 	default:
 		return fmt.Errorf("openvpn mgmt interface for %s did not kill the session of %q: %s", serverName, username, result)
@@ -465,8 +471,10 @@ func (oAdmin *OvpnAdmin) mgmtKillUserConnection(username, serverName string) err
 // are tried; the error lists the ones that failed.
 func (oAdmin *OvpnAdmin) mgmtKillUser(username string) error {
 	if len(oAdmin.mgmtInterfaces) == 0 {
-		log.Warnf("no openvpn mgmt interface is configured, the sessions of user %q cannot be killed", username)
-		return nil
+		// nothing was asked of any server: that is not "no session", the sessions may be alive
+		err := fmt.Errorf("no openvpn mgmt interface is configured, the sessions of user %q cannot be killed", username)
+		log.Errorf("mgmtKillUser: %v", err)
+		return err
 	}
 	var failed []string
 	for _, srv := range slices.Sorted(maps.Keys(oAdmin.mgmtInterfaces)) {

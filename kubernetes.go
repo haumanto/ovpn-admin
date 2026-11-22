@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -265,6 +266,9 @@ func (openVPNPKI *OpenVPNPKI) indexTxtUpdate() (err error) {
 
 func (openVPNPKI *OpenVPNPKI) updateIndexTxtOnDisk() (err error) {
 	secret, err := openVPNPKI.secretGetByName(secretIndexTxt)
+	if err != nil {
+		return
+	}
 	indexTxt := secret.Data["index.txt"]
 	err = os.WriteFile(fmt.Sprintf("%s/pki/index.txt", *easyrsaDirPath), indexTxt, 0600)
 	return
@@ -397,15 +401,20 @@ func (openVPNPKI *OpenVPNPKI) easyrsaRevoke(commonName string) (err error) {
 	}
 
 	if secret.Annotations["revokedAt"] != "" {
-		log.Warnf("user (%s) already revoked", commonName)
-		return
-	}
+		// the annotation is written before the CRL is rebuilt: an earlier call may have stopped in between, so
+		// it proves nothing about the CRL that is published. The index and the CRL are built and published
+		// again below; the caller then checks the serial in the CRL file
+		log.Warnf("user (%s) is revoked already, the index and the CRL are rebuilt and published again", commonName)
+	} else {
+		if secret.Annotations == nil {
+			secret.Annotations = map[string]string{}
+		}
+		secret.Annotations["revokedAt"] = time.Now().Format(indexTxtDateFormat)
 
-	secret.Annotations["revokedAt"] = time.Now().Format(indexTxtDateFormat)
-
-	_, err = openVPNPKI.KubeClient.CoreV1().Secrets(namespace).Update(context.TODO(), secret, metav1.UpdateOptions{})
-	if err != nil {
-		return
+		_, err = openVPNPKI.KubeClient.CoreV1().Secrets(namespace).Update(context.TODO(), secret, metav1.UpdateOptions{})
+		if err != nil {
+			return
+		}
 	}
 
 	err = openVPNPKI.indexTxtUpdate()
@@ -428,10 +437,30 @@ func (openVPNPKI *OpenVPNPKI) easyrsaRevoke(commonName string) (err error) {
 	return
 }
 
+// easyrsaRevokedSerial returns the serial number of the revoked certificate of commonName, read from its
+// secret. It is an error when the secret is not marked as revoked.
+func (openVPNPKI *OpenVPNPKI) easyrsaRevokedSerial(commonName string) (*big.Int, error) {
+	secret, err := openVPNPKI.secretGetByLabels("name=" + commonName)
+	if err != nil {
+		return nil, fmt.Errorf("reading the secret of %s: %w", commonName, err)
+	}
+	if secret.Annotations["revokedAt"] == "" {
+		return nil, fmt.Errorf("the secret of %s is not marked as revoked", commonName)
+	}
+	cert, err := decodeCert(secret.Data[certFileName])
+	if err != nil {
+		return nil, fmt.Errorf("decoding the certificate of %s: %w", commonName, err)
+	}
+	return cert.SerialNumber, nil
+}
+
 func (openVPNPKI *OpenVPNPKI) easyrsaUnrevoke(commonName string) (err error) {
 	secret, err := openVPNPKI.secretGetByLabels("name=" + commonName)
 	if err != nil {
-		log.Error(err)
+		return fmt.Errorf("reading the secret of %s: %w", commonName, err)
+	}
+	if secret.Annotations == nil {
+		secret.Annotations = map[string]string{}
 	}
 
 	secret.Annotations["revokedAt"] = ""
@@ -453,7 +482,7 @@ func (openVPNPKI *OpenVPNPKI) easyrsaUnrevoke(commonName string) (err error) {
 
 	err = openVPNPKI.easyrsaGenCRL()
 	if err != nil {
-		log.Error(err)
+		return fmt.Errorf("rebuilding the CRL: %w", err)
 	}
 
 	err = openVPNPKI.updateCRLOnDisk()
@@ -613,6 +642,9 @@ func (openVPNPKI *OpenVPNPKI) updateFilesFromSecrets() (err error) {
 
 func (openVPNPKI *OpenVPNPKI) updateCRLOnDisk() (err error) {
 	secret, err := openVPNPKI.secretGetByName(secretCRL)
+	if err != nil {
+		return
+	}
 	crl := secret.Data["crl.pem"]
 	err = os.WriteFile(fmt.Sprintf("%s/pki/crl.pem", *easyrsaDirPath), crl, 0644)
 	if err != nil {

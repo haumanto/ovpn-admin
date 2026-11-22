@@ -85,6 +85,8 @@ type fakeMgmt struct {
 	sessions map[string]bool
 	kills    []string
 	refuse   bool
+	reply    string // when set, the answer to every kill (a reply OpenVPN would not send)
+	onKill   func() // runs when a kill arrives (a test hook)
 }
 
 func startFakeMgmt(t *testing.T, sessions ...string) *fakeMgmt {
@@ -124,7 +126,12 @@ func (m *fakeMgmt) serve(c net.Conn) {
 	case strings.HasPrefix(line, "kill "):
 		name := strings.TrimPrefix(line, "kill ")
 		m.kills = append(m.kills, name)
+		if m.onKill != nil {
+			m.onKill()
+		}
 		switch {
+		case m.reply != "":
+			_, _ = c.Write([]byte(m.reply + "\r\n"))
 		case m.refuse:
 			_, _ = c.Write([]byte("ERROR: management kill is disabled\r\n"))
 		case m.sessions[name]:
@@ -428,10 +435,10 @@ func TestRotateAndDeleteKillTheSession(t *testing.T) {
 			withMgmt(oAdmin, map[string]string{"a": a.addr, "b": b.addr})
 			mustCreate(t, oAdmin, "alice", "")
 			if strings.HasSuffix(op, "revoked user") {
-				// revoked while no interface was there: the session lives on
-				withMgmt(oAdmin, map[string]string{})
-				if err, msg := oAdmin.userRevoke("alice"); err != nil {
-					t.Fatal(msg)
+				// revoked while no interface was reachable: the revoke is reported as incomplete and the session lives on
+				withMgmt(oAdmin, map[string]string{"gone": deadMgmtAddr(t)})
+				if err, _ := oAdmin.userRevoke("alice"); err == nil || !userCertRevoked("alice") {
+					t.Fatalf("the revoke should be reported as incomplete (err=%v), the certificate revoked", err)
 				}
 				withMgmt(oAdmin, map[string]string{"a": a.addr, "b": b.addr})
 			}
@@ -504,7 +511,7 @@ func TestDeleteFailsWhenTheSessionCannotBeKilled(t *testing.T) {
 func TestDeleteReportsAFailedCleanup(t *testing.T) {
 	oAdmin, _ := setupFakeEasyrsa(t)
 	db := setupFakeOpenvpnUser(t)
-	withMgmt(oAdmin, map[string]string{})
+	withMgmt(oAdmin, map[string]string{"srv": startFakeMgmt(t).addr})
 	mustCreate(t, oAdmin, "carol", "Old-password-1")
 	failOpenvpnUser(t, db, "delete")
 
@@ -528,7 +535,7 @@ func TestRotateAndDeleteOfAnUnknownUserAreBadRequests(t *testing.T) {
 func TestChangePasswordOfARevokedUserIsRefused(t *testing.T) {
 	oAdmin, _ := setupFakeEasyrsa(t)
 	db := setupFakeOpenvpnUser(t)
-	withMgmt(oAdmin, map[string]string{})
+	withMgmt(oAdmin, map[string]string{"srv": startFakeMgmt(t).addr})
 	mustCreate(t, oAdmin, "alice", "Old-password-1")
 	if err, msg := oAdmin.userRevoke("alice"); err != nil {
 		t.Fatal(msg)

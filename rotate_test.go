@@ -64,6 +64,7 @@ for a in "$@"; do
   esac
 done
 [ -f "$db.fail" ] && grep -qx "$cmd" "$db.fail" && { echo "injected failure of $cmd" >&2; exit 1; }
+[ "$cmd" = list ] && [ -f "$db.failafterchange" ] && [ -f "$db.changed" ] && { echo "injected failure of list after change-password" >&2; exit 1; }
 touch "$db"
 case "$cmd" in
   list)
@@ -83,7 +84,9 @@ case "$cmd" in
     sed -i "s/^\($user|.*|\)true\$/\1false/" "$db" ;;
   change-password)
     grep -q "^$user|" "$db" || exit 1
-    sed -i "s/^$user|[^|]*|/$user|$pw|/" "$db" ;;
+    sed -i "s/^$user|[^|]*|/$user|$pw|/" "$db"; touch "$db.changed" ;;
+  auth)
+    grep -q "^$user|$pw|false$" "$db" || exit 1 ;;
   *) echo "unknown command $cmd" >&2; exit 1 ;;
 esac
 `

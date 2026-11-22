@@ -84,6 +84,10 @@ func fakeEasyrsa(t *testing.T, args []string) error {
 
 	case "revoke":
 		name := args[1]
+		// ".fake-fail-revoke": easyrsa revoke fails and changes nothing
+		if _, err := os.Stat(".fake-fail-revoke"); err == nil {
+			return errors.New("injected revoke failure")
+		}
 		if answer, _ := bufio.NewReader(os.Stdin).ReadString('\n'); strings.TrimSpace(answer) != "yes" {
 			return errors.New("not confirmed")
 		}
@@ -141,6 +145,20 @@ func fakeEasyrsa(t *testing.T, args []string) error {
 			}
 		}
 		crl, err := fakeCrl(lines)
+		// ".fake-crl-calls" counts the gen-crl calls (one line each)
+		if f, openErr := os.OpenFile(".fake-crl-calls", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); openErr == nil {
+			_, _ = f.WriteString("gen-crl\n")
+			f.Close()
+		}
+		// ".fake-crl-slow-first": the first gen-crl call sleeps that many ms after it has read index.txt
+		// (a slow easyrsa); it leaves ".fake-crl-started" behind when it begins
+		if data, readErr := os.ReadFile(".fake-crl-slow-first"); readErr == nil {
+			if _, statErr := os.Stat(".fake-crl-started"); statErr != nil {
+				_ = os.WriteFile(".fake-crl-started", nil, 0644)
+				ms, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+				time.Sleep(time.Duration(ms) * time.Millisecond)
+			}
+		}
 		// ".fake-crl-next": the nextUpdate (RFC 3339) of the CRL it writes, like EASYRSA_CRL_DAYS does
 		if data, readErr := os.ReadFile(".fake-crl-next"); readErr == nil {
 			next, parseErr := time.Parse(time.RFC3339, strings.TrimSpace(string(data)))
@@ -193,7 +211,7 @@ func setupFakeEasyrsa(t *testing.T) (*OvpnAdmin, string) {
 	serverCertCache.Clear()
 	t.Cleanup(serverCertCache.Clear)
 
-	return &OvpnAdmin{createUserMutex: &sync.Mutex{}}, pki
+	return &OvpnAdmin{createUserMutex: &sync.Mutex{}, mgmtInterfaces: map[string]string{"srv": startFakeMgmt(t).addr}}, pki
 }
 
 // indexLines returns "FLAG CN" of every index.txt line, sorted (rotate keeps the position of the user

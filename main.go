@@ -371,7 +371,7 @@ func (oAdmin *OvpnAdmin) userUnrevokeHandler(w http.ResponseWriter, r *http.Requ
 	_ = r.ParseForm()
 	err, msg := oAdmin.userUnrevoke(r.FormValue("username"))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), userOpErrorStatus(err))
 	} else {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, msg)
@@ -1288,10 +1288,18 @@ func (oAdmin *OvpnAdmin) getUserStatistic(username string) []clientStatus {
 // userRevoke revokes the certificate (and the password row) of username, rebuilds the CRL, confirms that
 // the CRL lists the certificate and ends every session of the user on every management interface.
 // It reports success only when all of that is done: a step that fails does not stop the others (the
-// sessions are killed even when the CRL failed), and the error names every step that failed.
-// A user that is revoked already goes through the steps after the revoke again, so a revoke that
-// ended in an error can be repeated.
+// sessions are killed even when the certificate could not be revoked or the CRL failed), and the error
+// names every step that failed and says whether the sessions were ended. A user that is revoked already
+// goes through the steps after the revoke again, so a revoke that ended in an error can be repeated.
+// It holds createUserMutex, the lock of every write to the PKI.
 func (oAdmin *OvpnAdmin) userRevoke(username string) (error, string) {
+	oAdmin.createUserMutex.Lock()
+	defer oAdmin.createUserMutex.Unlock()
+	return oAdmin.userRevokeLocked(username)
+}
+
+// userRevokeLocked is userRevoke for a caller that holds createUserMutex already (rotate, delete).
+func (oAdmin *OvpnAdmin) userRevokeLocked(username string) (error, string) {
 	log.Infof("Revoke certificate for user %s", username)
 	if !(usernameIsPathSafe(username) && checkUserExist(username)) {
 		log.Infof("user \"%s\" not found", username)
@@ -1305,24 +1313,33 @@ func (oAdmin *OvpnAdmin) userRevoke(username string) (error, string) {
 		problems = append(problems, what)
 	}
 
-	alreadyRevoked := userCertRevoked(username)
 	if *storageBackend == "kubernetes.secrets" {
-		// easyrsaRevoke rebuilds the CRL itself and returns the error of every step
+		// easyrsaRevoke rebuilds and publishes the CRL itself (also for a certificate that is revoked
+		// already: the annotation of an earlier call says nothing about the CRL) and returns the error of
+		// every step
 		if err := app.easyrsaRevoke(username); err != nil {
 			problem("the certificate could not be revoked in kubernetes", err)
+		} else if err := confirmRevokedInKubernetes(username); err != nil {
+			problem("the new CRL does not list the revoked certificate", err)
 		}
+	} else if alreadyRevoked, err := userCertRevokedErr(username); err != nil {
+		problem("index.txt could not be read", err)
 	} else {
+		revokeFailed := false
 		if !alreadyRevoked {
 			if _, err := runCommand(*easyrsaDirPath, "yes\n", *easyrsaBinPath, "revoke", username); err != nil {
-				log.Errorf("userRevoke: %v", err)
-				return fmt.Errorf("failed to revoke certificate for user %q", username), fmt.Sprintf("Failed to revoke certificate for user \"%s\"", username)
+				problem("the certificate could not be revoked", err)
+				// easyrsa can fail after it has written index.txt: then the CRL still has to be built
+				revokeFailed = !userCertRevoked(username)
 			}
 		}
-		// the revoke is only worth something once the CRL that OpenVPN reads lists the certificate
-		if err := easyrsaGenCrl(); err != nil {
-			problem("the CRL could not be rebuilt", err)
-		} else if err := confirmRevokedInCrl(username); err != nil {
-			problem("the new CRL does not list the revoked certificate", err)
+		if !revokeFailed {
+			// the revoke is only worth something once the CRL that OpenVPN reads lists the certificate
+			if err := easyrsaGenCrl(); err != nil {
+				problem("the CRL could not be rebuilt", err)
+			} else if err := confirmRevokedInCrl(username); err != nil {
+				problem("the new CRL does not list the revoked certificate", err)
+			}
 		}
 	}
 
@@ -1337,99 +1354,140 @@ func (oAdmin *OvpnAdmin) userRevoke(username string) (error, string) {
 		}
 	}
 
-	crlFix()
+	// OpenVPN reads the CRL as an unprivileged user: a CRL it cannot read is a failed revoke
+	if err := crlFix(); err != nil {
+		problem("the CRL could not be made readable for OpenVPN", err)
+	}
 
 	// whatever the panel knows about the active clients: the list is up to 28 s old and a session
-	// it has not seen yet must not survive the revoke
+	// it has not seen yet must not survive the revoke. It is tried in every case, also when a step above
+	// failed
+	killed := true
 	if err := oAdmin.mgmtKillUser(username); err != nil {
 		problem("the session of the user could not be killed", err)
+		killed = false
 	}
 
 	oAdmin.setState()
 
 	if len(problems) > 0 {
-		msg := fmt.Sprintf("Revoke of user \"%s\" is incomplete, do not rely on it: %s. Check the admin log, the revoke can be repeated", username, strings.Join(problems, "; "))
+		msg := fmt.Sprintf("Revoke of user \"%s\" is incomplete, do not rely on it: %s.", username, strings.Join(problems, "; "))
+		if killed {
+			msg += " The sessions of the user were ended."
+		}
+		msg += " Check the admin log, the revoke can be repeated"
 		return errors.New(msg), msg
 	}
 	return nil, fmt.Sprintf("user \"%s\" revoked", username)
 }
 
+// userUnrevoke makes a revoked certificate valid again. Every failing step after the certificate files
+// are back (index.txt, the CRL, the password row, the CRL permissions) is returned: the user is not
+// reported as unrevoked while the CRL that OpenVPN reads still lists it.
 func (oAdmin *OvpnAdmin) userUnrevoke(username string) (error, string) {
-	if usernameIsPathSafe(username) && checkUserExist(username) {
-		if *storageBackend == "kubernetes.secrets" {
-			err := app.easyrsaUnrevoke(username)
-			if err != nil {
-				log.Error(err)
-			}
-		} else {
-			// check certificate revoked flag 'R'
-			usersFromIndexTxt := indexTxtParser(fRead(*indexTxtPath))
-			for i := range usersFromIndexTxt {
-				if usersFromIndexTxt[i].DistinguishedName == "/CN="+username {
-					if usersFromIndexTxt[i].Flag == "R" {
+	oAdmin.createUserMutex.Lock()
+	defer oAdmin.createUserMutex.Unlock()
 
-						usersFromIndexTxt[i].Flag = "V"
-						usersFromIndexTxt[i].RevocationDate = ""
+	if !(usernameIsPathSafe(username) && checkUserExist(username)) {
+		return inputError{fmt.Sprintf("user \"%s\" not found", username)}, fmt.Sprintf("{\"msg\":\"User \"%s\" not found\"}", username)
+	}
 
-						revokedCert := fmt.Sprintf("%s/pki/revoked/certs_by_serial/%s.crt", *easyrsaDirPath, usersFromIndexTxt[i].SerialNumber)
-						err := fCopy(revokedCert, fmt.Sprintf("%s/pki/certs_by_serial/%s.pem", *easyrsaDirPath, usersFromIndexTxt[i].SerialNumber))
-						if err != nil {
-							log.Error(err)
-						}
-						err = fMove(revokedCert, fmt.Sprintf("%s/pki/issued/%s.crt", *easyrsaDirPath, username))
-						if err != nil {
-							log.Error(err)
-						}
-						err = fMove(fmt.Sprintf("%s/pki/revoked/private_by_serial/%s.key", *easyrsaDirPath, usersFromIndexTxt[i].SerialNumber), fmt.Sprintf("%s/pki/private/%s.key", *easyrsaDirPath, username))
-						if err != nil {
-							log.Error(err)
-						}
-						err = fMove(fmt.Sprintf("%s/pki/revoked/reqs_by_serial/%s.req", *easyrsaDirPath, usersFromIndexTxt[i].SerialNumber), fmt.Sprintf("%s/pki/reqs/%s.req", *easyrsaDirPath, username))
-						if err != nil {
-							log.Error(err)
-						}
-						err = fWrite(*indexTxtPath, renderIndexTxt(usersFromIndexTxt))
-						if err != nil {
-							log.Error(err)
-						}
+	var problems []string
+	problem := func(what string, err error) {
+		log.Errorf("userUnrevoke: %s: %v", what, err)
+		problems = append(problems, what)
+	}
 
-						if err := easyrsaGenCrl(); err != nil {
-							log.Errorf("userUnrevoke: %v", err)
-						}
+	if *storageBackend == "kubernetes.secrets" {
+		if err := app.easyrsaUnrevoke(username); err != nil {
+			problem("the certificate could not be unrevoked in kubernetes", err)
+		}
+	} else if usersFromIndexTxt, err := readIndexTxt(); err != nil {
+		problem("index.txt could not be read", err)
+	} else {
+		// check certificate revoked flag 'R'
+		for i := range usersFromIndexTxt {
+			if usersFromIndexTxt[i].DistinguishedName == "/CN="+username {
+				if usersFromIndexTxt[i].Flag == "R" {
 
-						if *authByPassword {
-							if _, err := runOpenvpnUser("restore", "--user="+username); err != nil {
-								log.Errorf("userUnrevoke: %v", err)
-							}
-						}
+					usersFromIndexTxt[i].Flag = "V"
+					usersFromIndexTxt[i].RevocationDate = ""
 
-						crlFix()
-
-						break
+					revokedCert := fmt.Sprintf("%s/pki/revoked/certs_by_serial/%s.crt", *easyrsaDirPath, usersFromIndexTxt[i].SerialNumber)
+					err := fCopy(revokedCert, fmt.Sprintf("%s/pki/certs_by_serial/%s.pem", *easyrsaDirPath, usersFromIndexTxt[i].SerialNumber))
+					if err != nil {
+						log.Error(err)
 					}
+					err = fMove(revokedCert, fmt.Sprintf("%s/pki/issued/%s.crt", *easyrsaDirPath, username))
+					if err != nil {
+						log.Error(err)
+					}
+					err = fMove(fmt.Sprintf("%s/pki/revoked/private_by_serial/%s.key", *easyrsaDirPath, usersFromIndexTxt[i].SerialNumber), fmt.Sprintf("%s/pki/private/%s.key", *easyrsaDirPath, username))
+					if err != nil {
+						log.Error(err)
+					}
+					err = fMove(fmt.Sprintf("%s/pki/revoked/reqs_by_serial/%s.req", *easyrsaDirPath, usersFromIndexTxt[i].SerialNumber), fmt.Sprintf("%s/pki/reqs/%s.req", *easyrsaDirPath, username))
+					if err != nil {
+						log.Error(err)
+					}
+					if err := fWrite(*indexTxtPath, renderIndexTxt(usersFromIndexTxt)); err != nil {
+						problem("index.txt could not be written", err)
+					} else if err := easyrsaGenCrl(); err != nil {
+						problem("the CRL could not be rebuilt", err)
+					}
+
+					if *authByPassword {
+						if _, err := runOpenvpnUser("restore", "--user="+username); err != nil {
+							problem("the password of the user could not be restored", err)
+						}
+					}
+
+					break
 				}
 			}
-			err := fWrite(*indexTxtPath, renderIndexTxt(usersFromIndexTxt))
-			if err != nil {
-				log.Error(err)
-			}
-			//fmt.Print(renderIndexTxt(usersFromIndexTxt))
 		}
-		crlFix()
-		oAdmin.clients = oAdmin.usersList()
-		return nil, fmt.Sprintf("{\"msg\":\"User %s successfully unrevoked\"}", username)
 	}
-	return errors.New(fmt.Sprintf("user \"%s\" not found", username)), fmt.Sprintf("{\"msg\":\"User \"%s\" not found\"}", username)
+
+	if err := crlFix(); err != nil {
+		problem("the CRL could not be made readable for OpenVPN", err)
+	}
+	oAdmin.clients = oAdmin.usersList()
+	if len(problems) > 0 {
+		msg := fmt.Sprintf("Unrevoke of user \"%s\" is incomplete: %s. Check the admin log", username, strings.Join(problems, "; "))
+		return errors.New(msg), msg
+	}
+	return nil, fmt.Sprintf("{\"msg\":\"User %s successfully unrevoked\"}", username)
 }
 
-// userCertRevoked reports whether the certificate of username is revoked (index.txt flag R).
-func userCertRevoked(username string) bool {
-	for _, line := range indexTxtParser(fRead(*indexTxtPath)) {
+// readIndexTxt reads and parses index.txt. An index that cannot be read is an error, never an empty
+// index: whoever rewrites index.txt from an "empty" read would erase every certificate.
+func readIndexTxt() ([]indexTxtLine, error) {
+	raw, err := os.ReadFile(*indexTxtPath)
+	if err != nil {
+		return nil, fmt.Errorf("reading index.txt: %w", err)
+	}
+	return indexTxtParser(string(raw)), nil
+}
+
+// userCertRevokedErr reports whether the certificate of username is revoked (index.txt flag R); an
+// index that cannot be read is an error.
+func userCertRevokedErr(username string) (bool, error) {
+	lines, err := readIndexTxt()
+	if err != nil {
+		return false, err
+	}
+	for _, line := range lines {
 		if line.DistinguishedName == "/CN="+username {
-			return line.Flag == "R"
+			return line.Flag == "R", nil
 		}
 	}
-	return false
+	return false, nil
+}
+
+// userCertRevoked is userCertRevokedErr for callers that treat an unreadable index as "not revoked".
+func userCertRevoked(username string) bool {
+	revoked, _ := userCertRevokedErr(username)
+	return revoked
 }
 
 // revokeBeforeReplace revokes the certificate of username and ends its sessions. Rotate and delete
@@ -1438,8 +1496,9 @@ func userCertRevoked(username string) bool {
 // new certificate with the same name could be issued). A certificate that is revoked already goes
 // through userRevoke as well, which then only rebuilds and checks the CRL and kills the sessions: they
 // are cut on every rotate and delete, also on the repeat of one that failed before.
+// The caller holds createUserMutex.
 func (oAdmin *OvpnAdmin) revokeBeforeReplace(username string) error {
-	err, _ := oAdmin.userRevoke(username)
+	err, _ := oAdmin.userRevokeLocked(username)
 	return err
 }
 
@@ -1455,6 +1514,9 @@ func (oAdmin *OvpnAdmin) userRotate(username, newPassword string) (error, string
 		}
 	}
 
+	oAdmin.createUserMutex.Lock()
+	defer oAdmin.createUserMutex.Unlock()
+
 	if *storageBackend == "kubernetes.secrets" {
 		if err := oAdmin.revokeBeforeReplace(username); err != nil {
 			return err, err.Error()
@@ -1469,8 +1531,11 @@ func (oAdmin *OvpnAdmin) userRotate(username, newPassword string) (error, string
 		return err, msg
 	}
 
-	crlFix()
 	oAdmin.clients = oAdmin.usersList()
+	if err := crlFix(); err != nil {
+		msg := fmt.Sprintf("User \"%s\" was rotated but the CRL could not be made readable for OpenVPN: %v. Check the admin log", username, err)
+		return errors.New(msg), msg
+	}
 	return nil, fmt.Sprintf("{\"msg\":\"User %s successfully rotated\"}", username)
 }
 
@@ -1666,7 +1731,10 @@ func (r *rotation) archiveStaleFiles() error {
 
 // retireIndexEntry renames the replaced certificate in index.txt, so the name is free for the new one.
 func (r *rotation) retireIndexEntry() error {
-	lines := indexTxtParser(fRead(*indexTxtPath))
+	lines, err := readIndexTxt()
+	if err != nil {
+		return err
+	}
 	for i := range lines {
 		if lines[i].SerialNumber == r.serial && lines[i].DistinguishedName == "/CN="+r.username {
 			lines[i].DistinguishedName = "/CN=REVOKED-" + r.username + "-" + strings.Replace(uuid.New().String(), "-", "", -1)
@@ -1678,7 +1746,10 @@ func (r *rotation) retireIndexEntry() error {
 
 // putNewCertificateFirst gives the new certificate the place of the old one in index.txt.
 func (r *rotation) putNewCertificateFirst() error {
-	lines := indexTxtParser(fRead(*indexTxtPath))
+	lines, err := readIndexTxt()
+	if err != nil {
+		return err
+	}
 	oldIndex, newIndex := -1, -1
 	for i := range lines {
 		if lines[i].SerialNumber == r.serial {
@@ -1785,7 +1856,9 @@ func (r *rotation) rollback() error {
 		if err := easyrsaGenCrl(); err != nil {
 			fail("rebuilding the CRL", err)
 		}
-		crlFix()
+		if err := crlFix(); err != nil {
+			fail("making the CRL readable for OpenVPN", err)
+		}
 	}
 
 	if *authByPassword {
@@ -1814,23 +1887,77 @@ func (r *rotation) rollback() error {
 	return nil
 }
 
-// rotateFilesystem replaces the certificate of username (easy-rsa on the filesystem) and its password.
-// It is all or nothing: when a step fails the old certificate, index entry, files and password are back.
-func (oAdmin *OvpnAdmin) rotateFilesystem(username, newPassword string) (error, string) {
-	oAdmin.createUserMutex.Lock()
-	defer oAdmin.createUserMutex.Unlock()
+// newPasswordState tells whether the password that a rotation is about to store is live now, by asking
+// openvpn-user to authenticate it. "changed": it is accepted, so the password row has the new password.
+// "unchanged": it is refused and users.db can be read (a row that is revoked or has no password is refused
+// too, but then the command that stores the password never ran). "unknown": users.db cannot be read, or the
+// row needs a second factor, which a password check cannot see through.
+func (r *rotation) newPasswordState(password string) string {
+	if _, err := runOpenvpnUser("auth", "--user="+r.username, "--password="+password); err == nil {
+		return "changed"
+	}
+	out, err := runOpenvpnUser("list", "--all")
+	if err != nil {
+		return "unknown"
+	}
+	if ovpnUserListAppConfigured(out, r.username) {
+		return "unknown"
+	}
+	return "unchanged"
+}
 
+// ovpnUserListAppConfigured reports whether the row of username has a registered 2FA application (the
+// fifth column of "openvpn-user list --all").
+func ovpnUserListAppConfigured(out, username string) bool {
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Split(line, "|")
+		if len(fields) < 5 {
+			continue
+		}
+		if _, err := strconv.ParseUint(strings.TrimSpace(fields[0]), 10, 64); err != nil {
+			continue
+		}
+		if strings.TrimSpace(fields[1]) == username {
+			return strings.TrimSpace(fields[4]) == "true"
+		}
+	}
+	return false
+}
+
+// rotateFilesystem replaces the certificate of username (easy-rsa on the filesystem) and its password.
+// It is all or nothing for the certificate: when a step fails the old certificate, index entry and files
+// are back. The password is the very last step, so a failure of any earlier step never touches it. The
+// answer says what is true of the password: it is "as before" only when that was checked.
+// The caller holds createUserMutex.
+func (oAdmin *OvpnAdmin) rotateFilesystem(username, newPassword string) (error, string) {
 	r, err := newRotation(username)
 	if err != nil {
 		log.Errorf("userRotate: %v", err)
 		return err, fmt.Sprintf("Failed to rotate user \"%s\": %v", username, err)
 	}
 
+	passwordStep := false
 	failed := func(err error) (error, string) {
 		log.Errorf("userRotate: %v", err)
-		msg := fmt.Sprintf("Failed to rotate user \"%s\", the certificate and the password are as before", username)
+		// asked before the rollback: the row is as the failed step left it
+		state := "unchanged"
+		if passwordStep {
+			state = r.newPasswordState(newPassword)
+		}
+		var msg string
 		if rbErr := r.rollback(); rbErr != nil {
 			msg = fmt.Sprintf("Failed to rotate user \"%s\" and the previous state could not be restored completely, check the admin log", username)
+		} else {
+			msg = fmt.Sprintf("Failed to rotate user \"%s\", the certificate is as before", username)
+			if state == "unchanged" {
+				msg = fmt.Sprintf("Failed to rotate user \"%s\", the certificate and the password are as before", username)
+			}
+		}
+		switch state {
+		case "changed":
+			msg += ". The new password was already stored and is live: the password of the user is the one you entered, not the old one"
+		case "unknown":
+			msg += ". The password of the user may be the new one or the old one, it could not be checked: set it again with change password"
 		}
 		oAdmin.clients = oAdmin.usersList()
 		return errors.New(msg), msg
@@ -1848,22 +1975,26 @@ func (oAdmin *OvpnAdmin) rotateFilesystem(username, newPassword string) (error, 
 	if _, err := runCommand(*easyrsaDirPath, "", *easyrsaBinPath, "--batch", "build-client-full", username, "nopass"); err != nil {
 		return failed(err)
 	}
-	if *authByPassword {
-		if err := r.replacePassword(newPassword); err != nil {
-			return failed(err)
-		}
-	}
 	if err := r.putNewCertificateFirst(); err != nil {
 		return failed(err)
 	}
 	if err := easyrsaGenCrl(); err != nil {
 		return failed(err)
 	}
+	if *authByPassword {
+		passwordStep = true
+		if err := r.replacePassword(newPassword); err != nil {
+			return failed(err)
+		}
+	}
 	log.Infof("Certificate for user %s rotated", username)
 	return nil, ""
 }
 
 func (oAdmin *OvpnAdmin) userDelete(username string) (error, string) {
+	oAdmin.createUserMutex.Lock()
+	defer oAdmin.createUserMutex.Unlock()
+
 	if usernameIsPathSafe(username) && checkUserExist(username) {
 		if err := oAdmin.revokeBeforeReplace(username); err != nil {
 			return err, err.Error()
@@ -1888,7 +2019,11 @@ func (oAdmin *OvpnAdmin) userDelete(username string) (error, string) {
 			}
 		} else {
 			uniqHash := strings.Replace(uuid.New().String(), "-", "", -1)
-			usersFromIndexTxt := indexTxtParser(fRead(*indexTxtPath))
+			// an index that cannot be read is an error: it is never rewritten from an "empty" read
+			usersFromIndexTxt, indexErr := readIndexTxt()
+			if indexErr != nil {
+				problem("index.txt could not be read", indexErr)
+			}
 			for i := range usersFromIndexTxt {
 				if usersFromIndexTxt[i].DistinguishedName == "/CN="+username {
 					usersFromIndexTxt[i].DistinguishedName = "/CN=REVOKED-" + username + "-" + uniqHash
@@ -1900,14 +2035,18 @@ func (oAdmin *OvpnAdmin) userDelete(username string) (error, string) {
 					problem("the password row of the user could not be deleted", err)
 				}
 			}
-			if err := fWrite(*indexTxtPath, renderIndexTxt(usersFromIndexTxt)); err != nil {
-				problem("index.txt could not be written", err)
+			if indexErr == nil {
+				if err := fWrite(*indexTxtPath, renderIndexTxt(usersFromIndexTxt)); err != nil {
+					problem("index.txt could not be written", err)
+				}
 			}
 			if err := easyrsaGenCrl(); err != nil {
 				problem("the CRL could not be rebuilt", err)
 			}
 		}
-		crlFix()
+		if err := crlFix(); err != nil {
+			problem("the CRL could not be made readable for OpenVPN", err)
+		}
 		oAdmin.clients = oAdmin.usersList()
 		if len(problems) > 0 {
 			// the certificate is revoked and its sessions are killed (revokeBeforeReplace): what failed is the clean-up
@@ -1972,16 +2111,147 @@ func certsArchiveSkips(rel string) bool {
 }
 
 // archiveCerts builds the sync archive of pki/ in a new private temp file and returns its path; the
-// caller removes it (removeArchive) once it has been served.
+// caller removes it (removeArchive) once it has been served. The CA signing key is left out by what it
+// is, not only by name: see caKeyIdentity.
 func archiveCerts() (string, error) {
-	return archiveToTemp(*easyrsaDirPath+"/pki", "certs-*.tar.gz", certsArchiveSkips)
+	pki := *easyrsaDirPath + "/pki"
+	identity, err := loadCaKeyIdentity(pki)
+	if err != nil {
+		// the CA key cannot be told from other files: no archive rather than one that may carry it
+		return "", fmt.Errorf("reading the CA key identity: %w", err)
+	}
+	return archiveToTemp(pki, "certs-*.tar.gz", certsArchiveSkips, identity.skipsContent)
+}
+
+// caKeyIdentity is what the CA signing key is made of, independent of any file name: the public keys of the
+// CA certificate(s) (pki/ca.crt) and of pki/private/ca.key, and the exact DER bytes of every PEM body of
+// pki/private/ca.key (this also recognises an encrypted copy, which cannot be parsed).
+type caKeyIdentity struct {
+	public []crypto.PublicKey
+	bodies [][]byte
+}
+
+func loadCaKeyIdentity(pki string) (caKeyIdentity, error) {
+	var id caKeyIdentity
+	data, err := os.ReadFile(pki + "/ca.crt")
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return id, err
+	}
+	for _, b := range pemBlocks(data) {
+		if b.Type != "CERTIFICATE" {
+			continue
+		}
+		if c, err := x509.ParseCertificate(b.Bytes); err == nil {
+			id.public = append(id.public, c.PublicKey)
+		}
+	}
+	data, err = os.ReadFile(pki + "/private/ca.key")
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return id, err
+	}
+	if err == nil {
+		id.addKeyMaterial(data)
+		id.bodies = append(id.bodies, pemBodies(data)...)
+	}
+	return id, nil
+}
+
+// pemBodies returns the decoded body of every PEM block that holds private key material.
+func pemBodies(data []byte) [][]byte {
+	var out [][]byte
+	for _, b := range pemBlocks(data) {
+		if strings.HasSuffix(b.Type, "PRIVATE KEY") {
+			out = append(out, b.Bytes)
+		}
+	}
+	return out
+}
+
+// parsePrivateKeyDER returns the public key of a DER encoded private key (PKCS #8, PKCS #1 or SEC 1).
+func parsePrivateKeyDER(der []byte) (crypto.PublicKey, bool) {
+	var key any
+	if k, err := x509.ParsePKCS8PrivateKey(der); err == nil {
+		key = k
+	} else if k, err := x509.ParsePKCS1PrivateKey(der); err == nil {
+		key = k
+	} else if k, err := x509.ParseECPrivateKey(der); err == nil {
+		key = k
+	}
+	s, ok := key.(interface{ Public() crypto.PublicKey })
+	if !ok {
+		return nil, false
+	}
+	return s.Public(), true
+}
+
+// addKeyMaterial adds the public keys of the private keys in data (PEM or a bare DER key).
+func (id *caKeyIdentity) addKeyMaterial(data []byte) {
+	for _, pub := range privateKeysIn(data) {
+		id.public = append(id.public, pub)
+	}
+}
+
+// privateKeysIn returns the public keys of every private key in data: PEM blocks, or the whole of data
+// as one DER encoded key when it holds no PEM.
+func privateKeysIn(data []byte) []crypto.PublicKey {
+	var out []crypto.PublicKey
+	blocks := pemBlocks(data)
+	for _, b := range blocks {
+		if !strings.HasSuffix(b.Type, "PRIVATE KEY") {
+			continue
+		}
+		if pub, ok := parsePrivateKeyDER(b.Bytes); ok {
+			out = append(out, pub)
+		}
+	}
+	if len(blocks) == 0 {
+		if pub, ok := parsePrivateKeyDER(data); ok {
+			out = append(out, pub)
+		}
+	}
+	return out
+}
+
+// holdsCaKey reports whether data contains the CA signing key in any encoding the PKI uses: a private
+// key whose public key is the one of the CA, or a PEM block with the exact body of ca.key.
+func (id caKeyIdentity) holdsCaKey(data []byte) bool {
+	same := func(pub crypto.PublicKey) bool {
+		for _, ca := range id.public {
+			if k, ok := pub.(interface{ Equal(crypto.PublicKey) bool }); ok && k.Equal(ca) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, pub := range privateKeysIn(data) {
+		if same(pub) {
+			return true
+		}
+	}
+	for _, body := range pemBodies(data) {
+		for _, caBody := range id.bodies {
+			if bytes.Equal(body, caBody) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// skipsContent is the content filter of the sync archive: it leaves out every file that holds the CA key.
+func (id caKeyIdentity) skipsContent(rel string, data []byte) bool {
+	if id.holdsCaKey(data) {
+		log.Warnf("the sync archive leaves out %s: it holds the CA signing key", rel)
+		return true
+	}
+	return false
 }
 
 func archiveCcd() (string, error) {
-	return archiveToTemp(*ccdDir, "ccd-*.tar.gz", nil)
+	return archiveToTemp(*ccdDir, "ccd-*.tar.gz", nil, nil)
 }
 
-func archiveToTemp(dir, pattern string, skip func(rel string) bool) (string, error) {
+func archiveToTemp(dir, pattern string, skip func(rel string) bool, skipData func(rel string, data []byte) bool) (string, error) {
 	f, err := os.CreateTemp("", pattern) // mode 0600
 	if err != nil {
 		return "", fmt.Errorf("creating the archive file: %w", err)
@@ -1991,7 +2261,7 @@ func archiveToTemp(dir, pattern string, skip func(rel string) bool) (string, err
 		removeArchive(name)
 		return "", err
 	}
-	if err := createArchiveFromDirSkipping(dir, name, skip); err != nil {
+	if err := createArchiveFromDirFiltered(dir, name, skip, skipData); err != nil {
 		removeArchive(name)
 		return "", fmt.Errorf("archiving %s: %w", dir, err)
 	}
@@ -2106,13 +2376,15 @@ func rebuildCrl() error {
 		if err := app.easyrsaGenCRL(); err != nil {
 			return err
 		}
-		return app.updateCRLOnDisk()
+		if err := app.updateCRLOnDisk(); err != nil {
+			return err
+		}
+		return crlFix()
 	}
 	if err := easyrsaGenCrl(); err != nil {
 		return err
 	}
-	crlFix()
-	return nil
+	return crlFix()
 }
 
 // crlRefresh is one run of the daily CRL check. A CRL with less than crlRenewBefore left (or one that
@@ -2122,6 +2394,13 @@ func rebuildCrl() error {
 // when that fails, and never panics or exits. The result is checked on disk: a rebuild whose nextUpdate
 // did not move counts as failed. It returns false only for a failed rebuild (the caller retries sooner).
 func (oAdmin *OvpnAdmin) crlRefresh(now time.Time) bool {
+	if oAdmin.role != "slave" {
+		// every write to the PKI holds this lock (revoke, unrevoke, delete, rotate, create). The expiry is read
+		// after it is taken: a revoke that ran while this waited has rebuilt the CRL already, and a CRL is
+		// never built from an index that was read before the lock
+		oAdmin.createUserMutex.Lock()
+		defer oAdmin.createUserMutex.Unlock()
+	}
 	next, readErr := crlNextUpdate()
 	if readErr == nil {
 		ovpnCrlExpire.Set(crlExpireDays(next, now))
@@ -2147,8 +2426,6 @@ func (oAdmin *OvpnAdmin) crlRefresh(now time.Time) bool {
 		why = readErr.Error()
 	}
 
-	oAdmin.createUserMutex.Lock()
-	defer oAdmin.createUserMutex.Unlock()
 	err := func() (err error) {
 		defer func() {
 			if r := recover(); r != nil {
@@ -2197,8 +2474,12 @@ func (oAdmin *OvpnAdmin) crlRefreshLoop(firstDelay, interval, retry time.Duratio
 // serial of the revoked certificate of username (index.txt flag R). It fails closed: a missing or
 // unreadable CRL, or a serial that is not in it, is an error.
 func confirmRevokedInCrl(username string) error {
+	lines, err := readIndexTxt()
+	if err != nil {
+		return err
+	}
 	serial := ""
-	for _, line := range indexTxtParser(fRead(*indexTxtPath)) {
+	for _, line := range lines {
 		if line.DistinguishedName == "/CN="+username && line.Flag == "R" {
 			serial = line.SerialNumber
 			break
@@ -2207,6 +2488,25 @@ func confirmRevokedInCrl(username string) error {
 	if serial == "" {
 		return fmt.Errorf("index.txt has no revoked certificate for %q", username)
 	}
+	want, ok := new(big.Int).SetString(serial, 16)
+	if !ok {
+		return fmt.Errorf("the serial %q of %q in index.txt is not hexadecimal", serial, username)
+	}
+	return checkSerialInCrl(want, username)
+}
+
+// confirmRevokedInKubernetes is confirmRevokedInCrl for the kubernetes.secrets backend, where the serial
+// of the revoked certificate is read from its secret (index.txt there holds decimal serials).
+func confirmRevokedInKubernetes(username string) error {
+	serial, err := app.easyrsaRevokedSerial(username)
+	if err != nil {
+		return err
+	}
+	return checkSerialInCrl(serial, username)
+}
+
+// checkSerialInCrl checks that the CRL file OpenVPN reads (pki/crl.pem) lists serial.
+func checkSerialInCrl(serial *big.Int, username string) error {
 	data, err := os.ReadFile(*easyrsaDirPath + "/pki/crl.pem")
 	if err != nil {
 		return fmt.Errorf("reading the CRL: %w", err)
@@ -2220,11 +2520,11 @@ func confirmRevokedInCrl(username string) error {
 		return fmt.Errorf("parsing the CRL: %w", err)
 	}
 	for _, entry := range crl.RevokedCertificateEntries {
-		if serialMatches(entry.SerialNumber, serial) {
+		if entry.SerialNumber.Cmp(serial) == 0 {
 			return nil
 		}
 	}
-	return fmt.Errorf("serial %s of %q is not in the CRL (%d entries)", serial, username, len(crl.RevokedCertificateEntries))
+	return fmt.Errorf("serial %X of %q is not in the CRL (%d entries)", serial, username, len(crl.RevokedCertificateEntries))
 }
 
 func (oAdmin *OvpnAdmin) syncDataFromMaster() {
@@ -2359,13 +2659,17 @@ func getOvpnCaCertExpireDate() time.Time {
 }
 
 // https://community.openvpn.net/openvpn/ticket/623
-func crlFix() {
-	err := os.Chmod(*easyrsaDirPath+"/pki", 0755)
-	if err != nil {
+// crlFix makes pki/ and pki/crl.pem readable for OpenVPN, which reads the CRL as an unprivileged user
+// (nobody). A chmod that fails is an error: a CRL the daemon cannot read is a failed revoke.
+func crlFix() error {
+	var errs []error
+	if err := os.Chmod(*easyrsaDirPath+"/pki", 0755); err != nil {
 		log.Error(err)
+		errs = append(errs, err)
 	}
-	err = os.Chmod(*easyrsaDirPath+"/pki/crl.pem", 0644)
-	if err != nil {
+	if err := os.Chmod(*easyrsaDirPath+"/pki/crl.pem", 0644); err != nil {
 		log.Error(err)
+		errs = append(errs, err)
 	}
+	return errors.Join(errs...)
 }
