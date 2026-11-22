@@ -299,7 +299,7 @@ func (oAdmin *OvpnAdmin) userRotateHandler(w http.ResponseWriter, r *http.Reques
 	_ = r.ParseForm()
 	err, msg := oAdmin.userRotate(r.FormValue("username"), r.FormValue("password"))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), userOpErrorStatus(err))
 	} else {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, msg)
@@ -318,7 +318,7 @@ func (oAdmin *OvpnAdmin) userDeleteHandler(w http.ResponseWriter, r *http.Reques
 	_ = r.ParseForm()
 	err, msg := oAdmin.userDelete(r.FormValue("username"))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), userOpErrorStatus(err))
 	} else {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, msg)
@@ -337,7 +337,7 @@ func (oAdmin *OvpnAdmin) userRevokeHandler(w http.ResponseWriter, r *http.Reques
 	_ = r.ParseForm()
 	err, msg := oAdmin.userRevoke(r.FormValue("username"))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), userOpErrorStatus(err))
 	} else {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, msg)
@@ -976,6 +976,16 @@ func isInputError(err error) bool {
 	return errors.As(err, &ie)
 }
 
+// userOpErrorStatus is the HTTP status of a failed revoke, rotate or delete: 400 for a refused
+// request (unknown user, bad password), 500 for a failure on the server side (easyrsa, the CRL, the
+// management interface, the password database). The body stays the plain text of the error.
+func userOpErrorStatus(err error) int {
+	if isInputError(err) {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
+}
+
 // usernameIsPathSafe reports whether username can be used as a file name
 // (no path separators, not "." or "..").
 func usernameIsPathSafe(username string) bool {
@@ -1161,6 +1171,13 @@ func (oAdmin *OvpnAdmin) userCreateStatus(username, password string) (bool, stri
 func (oAdmin *OvpnAdmin) userChangePassword(username, password string) (error, string) {
 
 	if checkUserExist(username) {
+		// a revoked user cannot connect: a new password would only look like a repair. Refused before the
+		// password is looked at and before anything is written.
+		if userCertRevoked(username) {
+			msg := fmt.Sprintf("user %q is revoked, unrevoke or rotate it first", username)
+			log.Warnf("userChangePassword: %s", msg)
+			return inputError{msg}, msg
+		}
 		if err := validatePassword(password); err != nil {
 			log.Warningf("userChangePassword: %s", err.Error())
 			return err, err.Error()
@@ -1236,44 +1253,73 @@ func (oAdmin *OvpnAdmin) getUserStatistic(username string) []clientStatus {
 	return userStatistic
 }
 
+// userRevoke revokes the certificate (and the password row) of username, rebuilds the CRL, confirms that
+// the CRL lists the certificate and ends every session of the user on every management interface.
+// It reports success only when all of that is done: a step that fails does not stop the others (the
+// sessions are killed even when the CRL failed), and the error names every step that failed.
+// A user that is revoked already goes through the steps after the revoke again, so a revoke that
+// ended in an error can be repeated.
 func (oAdmin *OvpnAdmin) userRevoke(username string) (error, string) {
 	log.Infof("Revoke certificate for user %s", username)
-	if usernameIsPathSafe(username) && checkUserExist(username) {
-		// check certificate valid flag 'V'
-		if *storageBackend == "kubernetes.secrets" {
-			err := app.easyrsaRevoke(username)
-			if err != nil {
-				log.Error(err)
-			}
-		} else {
+	if !(usernameIsPathSafe(username) && checkUserExist(username)) {
+		log.Infof("user \"%s\" not found", username)
+		msg := fmt.Sprintf("User \"%s\" not found", username)
+		return inputError{msg}, msg
+	}
+
+	var problems []string
+	problem := func(what string, err error) {
+		log.Errorf("userRevoke: %s: %v", what, err)
+		problems = append(problems, what)
+	}
+
+	alreadyRevoked := userCertRevoked(username)
+	if *storageBackend == "kubernetes.secrets" {
+		// easyrsaRevoke rebuilds the CRL itself and returns the error of every step
+		if err := app.easyrsaRevoke(username); err != nil {
+			problem("the certificate could not be revoked in kubernetes", err)
+		}
+	} else {
+		if !alreadyRevoked {
 			if _, err := runCommand(*easyrsaDirPath, "yes\n", *easyrsaBinPath, "revoke", username); err != nil {
 				log.Errorf("userRevoke: %v", err)
 				return fmt.Errorf("failed to revoke certificate for user %q", username), fmt.Sprintf("Failed to revoke certificate for user \"%s\"", username)
 			}
-			easyrsaGenCrl()
 		}
-
-		if *authByPassword {
-			if _, err := runOpenvpnUser("revoke", "--user="+username); err != nil {
-				log.Errorf("userRevoke: %v", err)
-			}
+		// the revoke is only worth something once the CRL that OpenVPN reads lists the certificate
+		if err := easyrsaGenCrl(); err != nil {
+			problem("the CRL could not be rebuilt", err)
+		} else if err := confirmRevokedInCrl(username); err != nil {
+			problem("the new CRL does not list the revoked certificate", err)
 		}
-
-		crlFix()
-		userConnected, userConnectedTo := isUserConnected(username, oAdmin.activeClients)
-		log.Tracef("User %s connected: %t", username, userConnected)
-		if userConnected {
-			for _, connection := range userConnectedTo {
-				oAdmin.mgmtKillUserConnection(username, connection)
-				log.Infof("Session for user \"%s\" killed", username)
-			}
-		}
-
-		oAdmin.setState()
-		return nil, fmt.Sprintf("user \"%s\" revoked", username)
 	}
-	log.Infof("user \"%s\" not found", username)
-	return errors.New(fmt.Sprintf("User \"%s\" not found", username)), fmt.Sprintf("User \"%s\" not found", username)
+
+	if *authByPassword {
+		out, err := runOpenvpnUser("list", "--all")
+		if err != nil {
+			problem("the password database could not be read", err)
+		} else if row := ovpnUserListRow(out, username); row.exists && !row.revoked {
+			if _, err := runOpenvpnUser("revoke", "--user="+username); err != nil {
+				problem("the password of the user could not be revoked", err)
+			}
+		}
+	}
+
+	crlFix()
+
+	// whatever the panel knows about the active clients: the list is up to 28 s old and a session
+	// it has not seen yet must not survive the revoke
+	if err := oAdmin.mgmtKillUser(username); err != nil {
+		problem("the session of the user could not be killed", err)
+	}
+
+	oAdmin.setState()
+
+	if len(problems) > 0 {
+		msg := fmt.Sprintf("Revoke of user \"%s\" is incomplete, do not rely on it: %s. Check the admin log, the revoke can be repeated", username, strings.Join(problems, "; "))
+		return errors.New(msg), msg
+	}
+	return nil, fmt.Sprintf("user \"%s\" revoked", username)
 }
 
 func (oAdmin *OvpnAdmin) userUnrevoke(username string) (error, string) {
@@ -1315,7 +1361,9 @@ func (oAdmin *OvpnAdmin) userUnrevoke(username string) (error, string) {
 							log.Error(err)
 						}
 
-						easyrsaGenCrl()
+						if err := easyrsaGenCrl(); err != nil {
+							log.Errorf("userUnrevoke: %v", err)
+						}
 
 						if *authByPassword {
 							if _, err := runOpenvpnUser("restore", "--user="+username); err != nil {
@@ -1352,23 +1400,20 @@ func userCertRevoked(username string) bool {
 	return false
 }
 
-// revokeBeforeReplace revokes the certificate of username unless it is revoked already. Rotate and
-// delete replace or hide a certificate: an active one must not stay valid (it could still connect),
-// and easyrsa revoke moves its files out of issued/, private/ and reqs/ (an expired one kept them,
-// so no new certificate with the same name could be issued).
+// revokeBeforeReplace revokes the certificate of username and ends its sessions. Rotate and delete
+// replace or hide a certificate: an active one must not stay valid (it could still connect), and
+// easyrsa revoke moves its files out of issued/, private/ and reqs/ (an expired one kept them, so no
+// new certificate with the same name could be issued). A certificate that is revoked already goes
+// through userRevoke as well, which then only rebuilds and checks the CRL and kills the sessions: they
+// are cut on every rotate and delete, also on the repeat of one that failed before.
 func (oAdmin *OvpnAdmin) revokeBeforeReplace(username string) error {
-	if userCertRevoked(username) {
-		return nil
-	}
-	if err, msg := oAdmin.userRevoke(username); err != nil {
-		return errors.New(msg)
-	}
-	return nil
+	err, _ := oAdmin.userRevoke(username)
+	return err
 }
 
 func (oAdmin *OvpnAdmin) userRotate(username, newPassword string) (error, string) {
 	if !(usernameIsPathSafe(username) && checkUserExist(username)) {
-		return fmt.Errorf("user %q not found", username), fmt.Sprintf("{\"msg\":\"User \"%s\" not found\"}", username)
+		return inputError{fmt.Sprintf("user %q not found", username)}, fmt.Sprintf("{\"msg\":\"User \"%s\" not found\"}", username)
 	}
 	// checked before anything is changed: a refused password must not cost the user its certificate
 	if *authByPassword {
@@ -1383,7 +1428,10 @@ func (oAdmin *OvpnAdmin) userRotate(username, newPassword string) (error, string
 			return err, err.Error()
 		}
 		if err := app.easyrsaRotate(username, newPassword); err != nil {
-			log.Error(err)
+			log.Errorf("userRotate: %v", err)
+			msg := fmt.Sprintf("Failed to rotate user \"%s\", check the admin log", username)
+			oAdmin.clients = oAdmin.usersList()
+			return errors.New(msg), msg
 		}
 	} else if err, msg := oAdmin.rotateFilesystem(username, newPassword); err != nil {
 		return err, msg
@@ -1702,7 +1750,9 @@ func (r *rotation) rollback() error {
 		}
 	}
 	if !r.wasRevoked {
-		easyrsaGenCrl()
+		if err := easyrsaGenCrl(); err != nil {
+			fail("rebuilding the CRL", err)
+		}
 		crlFix()
 	}
 
@@ -1774,7 +1824,9 @@ func (oAdmin *OvpnAdmin) rotateFilesystem(username, newPassword string) (error, 
 	if err := r.putNewCertificateFirst(); err != nil {
 		return failed(err)
 	}
-	easyrsaGenCrl()
+	if err := easyrsaGenCrl(); err != nil {
+		return failed(err)
+	}
 	log.Infof("Certificate for user %s rotated", username)
 	return nil, ""
 }
@@ -1793,10 +1845,14 @@ func (oAdmin *OvpnAdmin) userDelete(username string) (error, string) {
 				return err, err.Error()
 			}
 		}
+		var problems []string
+		problem := func(what string, err error) {
+			log.Errorf("userDelete: %s: %v", what, err)
+			problems = append(problems, what)
+		}
 		if *storageBackend == "kubernetes.secrets" {
-			err := app.easyrsaDelete(username)
-			if err != nil {
-				log.Error(err)
+			if err := app.easyrsaDelete(username); err != nil {
+				problem("the certificate could not be retired in kubernetes", err)
 			}
 		} else {
 			uniqHash := strings.Replace(uuid.New().String(), "-", "", -1)
@@ -1809,20 +1865,26 @@ func (oAdmin *OvpnAdmin) userDelete(username string) (error, string) {
 			}
 			if *authByPassword {
 				if _, err := runOpenvpnUser("delete", "--force", "--user="+username); err != nil {
-					log.Errorf("userDelete: %v", err)
+					problem("the password row of the user could not be deleted", err)
 				}
 			}
-			err := fWrite(*indexTxtPath, renderIndexTxt(usersFromIndexTxt))
-			if err != nil {
-				log.Error(err)
+			if err := fWrite(*indexTxtPath, renderIndexTxt(usersFromIndexTxt)); err != nil {
+				problem("index.txt could not be written", err)
 			}
-			easyrsaGenCrl()
+			if err := easyrsaGenCrl(); err != nil {
+				problem("the CRL could not be rebuilt", err)
+			}
 		}
 		crlFix()
 		oAdmin.clients = oAdmin.usersList()
+		if len(problems) > 0 {
+			// the certificate is revoked and its sessions are killed (revokeBeforeReplace): what failed is the clean-up
+			msg := fmt.Sprintf("Delete of user \"%s\" is incomplete: %s. The certificate is revoked. Check the admin log", username, strings.Join(problems, "; "))
+			return errors.New(msg), msg
+		}
 		return nil, fmt.Sprintf("{\"msg\":\"User %s successfully deleted\"}", username)
 	}
-	return errors.New(fmt.Sprintf("User \"%s\" not found", username)), fmt.Sprintf("{\"msg\":\"User \"%s\" not found\"}", username)
+	return inputError{fmt.Sprintf("User \"%s\" not found", username)}, fmt.Sprintf("{\"msg\":\"User \"%s\" not found\"}", username)
 }
 
 func (oAdmin *OvpnAdmin) downloadCerts() bool {
@@ -1926,11 +1988,47 @@ func ovpnUserPrepareDb() {
 	}
 }
 
-// easyrsaGenCrl regenerates the CRL with easyrsa (filesystem backend)
-func easyrsaGenCrl() {
+// easyrsaGenCrl regenerates the CRL with easyrsa (filesystem backend). The error is the caller's to
+// report: a CRL that was not rebuilt means a revoked certificate can still connect.
+func easyrsaGenCrl() error {
 	if _, err := runCommand(*easyrsaDirPath, "", *easyrsaBinPath, "gen-crl"); err != nil {
-		log.Errorf("easyrsa gen-crl: %v", err)
+		return err
 	}
+	return nil
+}
+
+// confirmRevokedInCrl reads the CRL that OpenVPN uses (pki/crl.pem) and checks that it lists the
+// serial of the revoked certificate of username (index.txt flag R). It fails closed: a missing or
+// unreadable CRL, or a serial that is not in it, is an error.
+func confirmRevokedInCrl(username string) error {
+	serial := ""
+	for _, line := range indexTxtParser(fRead(*indexTxtPath)) {
+		if line.DistinguishedName == "/CN="+username && line.Flag == "R" {
+			serial = line.SerialNumber
+			break
+		}
+	}
+	if serial == "" {
+		return fmt.Errorf("index.txt has no revoked certificate for %q", username)
+	}
+	data, err := os.ReadFile(*easyrsaDirPath + "/pki/crl.pem")
+	if err != nil {
+		return fmt.Errorf("reading the CRL: %w", err)
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return errors.New("crl.pem holds no PEM block")
+	}
+	crl, err := x509.ParseRevocationList(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("parsing the CRL: %w", err)
+	}
+	for _, entry := range crl.RevokedCertificateEntries {
+		if serialMatches(entry.SerialNumber, serial) {
+			return nil
+		}
+	}
+	return fmt.Errorf("serial %s of %q is not in the CRL (%d entries)", serial, username, len(crl.RevokedCertificateEntries))
 }
 
 func (oAdmin *OvpnAdmin) syncDataFromMaster() {

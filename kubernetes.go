@@ -393,7 +393,7 @@ func (openVPNPKI *OpenVPNPKI) easyrsaGetClientCert(commonName string) (cert, key
 func (openVPNPKI *OpenVPNPKI) easyrsaRevoke(commonName string) (err error) {
 	secret, err := openVPNPKI.secretGetByLabels("name=" + commonName)
 	if err != nil {
-		log.Error(err)
+		return fmt.Errorf("reading the secret of %s: %w", commonName, err)
 	}
 
 	if secret.Annotations["revokedAt"] != "" {
@@ -420,7 +420,7 @@ func (openVPNPKI *OpenVPNPKI) easyrsaRevoke(commonName string) (err error) {
 
 	err = openVPNPKI.easyrsaGenCRL()
 	if err != nil {
-		log.Error(err)
+		return fmt.Errorf("rebuilding the CRL: %w", err)
 	}
 
 	err = openVPNPKI.updateCRLOnDisk()
@@ -464,7 +464,7 @@ func (openVPNPKI *OpenVPNPKI) easyrsaUnrevoke(commonName string) (err error) {
 func (openVPNPKI *OpenVPNPKI) easyrsaRotate(commonName, newPassword string) (err error) {
 	secret, err := openVPNPKI.secretGetByLabels("name=" + commonName)
 	if err != nil {
-		log.Error(err)
+		return fmt.Errorf("reading the secret of %s: %w", commonName, err)
 	}
 	uniqHash := strings.Replace(uuid.New().String(), "-", "", -1)
 	secret.Annotations["commonName"] = "REVOKED-" + commonName + "-" + uniqHash
@@ -498,7 +498,7 @@ func (openVPNPKI *OpenVPNPKI) easyrsaRotate(commonName, newPassword string) (err
 
 	err = openVPNPKI.easyrsaGenCRL()
 	if err != nil {
-		log.Error(err)
+		return fmt.Errorf("rebuilding the CRL: %w", err)
 	}
 
 	err = openVPNPKI.updateCRLOnDisk()
@@ -507,7 +507,7 @@ func (openVPNPKI *OpenVPNPKI) easyrsaRotate(commonName, newPassword string) (err
 func (openVPNPKI *OpenVPNPKI) easyrsaDelete(commonName string) (err error) {
 	secret, err := openVPNPKI.secretGetByLabels("name=" + commonName)
 	if err != nil {
-		log.Error(err)
+		return fmt.Errorf("reading the secret of %s: %w", commonName, err)
 	}
 	uniqHash := strings.Replace(uuid.New().String(), "-", "", -1)
 	secret.Annotations["commonName"] = "REVOKED-" + commonName + "-" + uniqHash
@@ -531,7 +531,7 @@ func (openVPNPKI *OpenVPNPKI) easyrsaDelete(commonName string) (err error) {
 
 	err = openVPNPKI.easyrsaGenCRL()
 	if err != nil {
-		log.Error(err)
+		return fmt.Errorf("rebuilding the CRL: %w", err)
 	}
 
 	err = openVPNPKI.updateCRLOnDisk()

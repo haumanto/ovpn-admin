@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"maps"
 	"net"
@@ -425,23 +426,59 @@ func (oAdmin *OvpnAdmin) mgmtGetActiveClients() []clientStatus {
 	return activeClients
 }
 
-func (oAdmin *OvpnAdmin) mgmtKillUserConnection(username, serverName string) {
+// mgmtKillUserConnection sends "kill <username>" to one management interface. A user that is not
+// connected there is the wanted end state, not an error; an interface that cannot be reached, or
+// that refuses the command for another reason, is.
+func (oAdmin *OvpnAdmin) mgmtKillUserConnection(username, serverName string) error {
 	addr, ok := oAdmin.mgmtInterfaces[serverName]
 	if !ok {
-		log.Errorf("openvpn mgmt interface for %s is not configured", serverName)
-		return
+		return fmt.Errorf("openvpn mgmt interface for %s is not configured", serverName)
 	}
-	if strings.ContainsAny(username, "\r\n") {
-		log.Errorf("refusing to kill session of invalid user %q", username)
-		return
+	// "kill" takes a common name or IP:port and splits its argument at blanks: such a name cannot be
+	// told apart from another target, so the command is not sent at all
+	if username == "" || strings.ContainsAny(username, " :\r\n\x09") {
+		return fmt.Errorf("refusing to kill the session of user %q: the name cannot be sent to the management interface", username)
 	}
 
 	out, err := mgmtCommand(addr, "kill "+username, isMgmtResult)
 	if err != nil {
-		log.Errorf("openvpn mgmt interface for %s is not reachable by addr %s: %v", serverName, addr, err)
-		return
+		return fmt.Errorf("openvpn mgmt interface for %s is not reachable by addr %s: %w", serverName, addr, err)
 	}
-	log.Debugf("mgmt kill %s on %s: %s", username, serverName, strings.TrimSpace(out))
+	result := strings.TrimSpace(out)
+	if i := strings.LastIndex(result, "\n"); i >= 0 {
+		result = result[i+1:]
+	}
+	switch {
+	case strings.HasPrefix(result, "SUCCESS:"):
+		log.Infof("Session for user \"%s\" killed on %s: %s", username, serverName, result)
+	case strings.HasPrefix(result, "ERROR:") && strings.Contains(result, "not found"):
+		// OpenVPN: "ERROR: common name 'x' not found", the user has no session on this server
+		log.Debugf("mgmt kill %s on %s: %s", username, serverName, result)
+	default:
+		return fmt.Errorf("openvpn mgmt interface for %s did not kill the session of %q: %s", serverName, username, result)
+	}
+	return nil
+}
+
+// mgmtKillUser ends every session of username on every configured management interface, whether or
+// not the panel has seen the session (its list of active clients is up to 28 s old). All interfaces
+// are tried; the error lists the ones that failed.
+func (oAdmin *OvpnAdmin) mgmtKillUser(username string) error {
+	if len(oAdmin.mgmtInterfaces) == 0 {
+		log.Warnf("no openvpn mgmt interface is configured, the sessions of user %q cannot be killed", username)
+		return nil
+	}
+	var failed []string
+	for _, srv := range slices.Sorted(maps.Keys(oAdmin.mgmtInterfaces)) {
+		if err := oAdmin.mgmtKillUserConnection(username, srv); err != nil {
+			log.Errorf("mgmtKillUser: %v", err)
+			failed = append(failed, err.Error())
+		}
+	}
+	if len(failed) > 0 {
+		return errors.New(strings.Join(failed, "; "))
+	}
+	return nil
 }
 
 // parseMgmtVersion extracts "2.6.12" from the output of the "version" command.

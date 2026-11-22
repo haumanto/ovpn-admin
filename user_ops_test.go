@@ -122,7 +122,28 @@ func fakeEasyrsa(t *testing.T, args []string) error {
 		}
 
 	case "gen-crl":
-		return os.WriteFile("pki/crl.pem", []byte("crl"), 0600)
+		// ".fake-fail-crl": gen-crl fails; ".fake-noop-crl": it reports success and writes nothing
+		if _, err := os.Stat(".fake-fail-crl"); err == nil {
+			return errors.New("injected gen-crl failure")
+		}
+		if _, err := os.Stat(".fake-noop-crl"); err == nil {
+			return nil
+		}
+		// ".fake-crl-budget": the number of gen-crl calls that still work, the next one fails
+		if data, err := os.ReadFile(".fake-crl-budget"); err == nil {
+			n, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+			if n <= 0 {
+				return errors.New("injected gen-crl failure (budget used up)")
+			}
+			if err := os.WriteFile(".fake-crl-budget", []byte(strconv.Itoa(n-1)), 0644); err != nil {
+				return err
+			}
+		}
+		crl, err := fakeCrl(lines)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile("pki/crl.pem", crl, 0600)
 
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
