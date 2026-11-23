@@ -2,34 +2,52 @@
 # Ban enforcement and ban list for the fail2ban jail "ovpn-admin" (called from the fail2ban action, see configure.sh).
 #
 #   ovpn-ban.sh init             clear the ban list and every DROP rule of both families (container start, before fail2ban starts);
-#                                the ban history (ban-history.tsv, see below) is kept
+#                                the ban history (bans-history.tsv, see below) is kept, decayed offences are pruned, an old history is migrated
 #   ovpn-ban.sh setup            create the OVPN_BAN (IPv4) and OVPN_BAN6 (IPv6) chains and their INPUT jumps (jail start), then restore the
 #                                DROP rule and the row (expires_at=0) of every permanent entry of the ban history;
 #                                exit 3 when IPv6 is enabled, the IPv6 chain cannot be created and OVPN_BAN_IPV6_REQUIRED is not false
 #   ovpn-ban.sh check            verify the chains and jumps of every enforced family; exit 3 = required IPv6 enforcement missing
-#   ovpn-ban.sh ban IP FAILURES  DROP IP in OVPN_BAN (IPv4) or OVPN_BAN6 (IPv6) and add (or replace) its row in the ban list;
-#                                a new ban then sends the Telegram notification when OVPN_TELEGRAM_ENABLED=true (see below).
-#                                Every call counts in the ban history; the OVPN_BAN_REPEAT_COUNT-th ban of the same address is permanent
-#                                (row with expires_at=0, no expiry)
-#   ovpn-ban.sh ban-manual IP [REASON]  permanent ban at once (DROP rule, row with expires_at=0, history reason "manual" or
-#                                "manual: REASON"); REASON is limited to [A-Za-z0-9 ._:-]{0,120}, anything else is refused
-#   ovpn-ban.sh unban IP         remove the DROP rule and the row; succeeds when neither exists. A permanent address is left as it is
-#                                (success, no change): fail2ban calls this at the end of the jail bantime
-#   ovpn-ban.sh unban IP --force remove the DROP rule, the row and the history entry, permanent or not; the address starts clean
+#   ovpn-ban.sh ban IP FAILURES  DROP the address (IPv6: its prefix, default /64) in OVPN_BAN (IPv4) or OVPN_BAN6 (IPv6) and add (or replace)
+#                                its row in the ban list. The offence is counted per address (IPv6: per prefix) and the ban lasts the step
+#                                of OVPN_BAN_ESCALATION that belongs to that offence number (default 10m, 1h, 24h, then permanent). A new
+#                                ban or offence is recorded in the ban event log and sends the Telegram message when OVPN_TELEGRAM_ENABLED=true
+#   ovpn-ban.sh ban-manual [--force] [--minutes N] IP [REASON]
+#                                operator ban: permanent, or N minutes (1..525600). Refused (exit 4, reason on stderr, a "refuse" event, no
+#                                change) when the address is loopback, on the ignore list, inside the VPN client network or in a private
+#                                range, unless --force. History reason "manual" or "manual: REASON"; REASON is limited to
+#                                [A-Za-z0-9 ._:-]{0,120}, anything else is refused
+#   ovpn-ban.sh unban IP         remove the DROP rule and the row of an address whose ban has run out; succeeds when neither exists. A
+#                                permanent address, and a temporary one that has not run out, is left as it is (success, no change):
+#                                fail2ban calls this at the end of the jail bantime, which is the first step of the escalation
+#   ovpn-ban.sh unban IP --force remove the DROP rule, the row and every history row of the address, permanent or not; it starts clean.
+#                                IP can also be the network as the ban list writes it (2001:db8:1:2::/64)
+#   ovpn-ban.sh expire           lift every temporary ban that has run out (also done by every ban and unban, and every 30 s by the
+#                                watcher ovpn-ban-control)
+#   ovpn-ban.sh jail-bantime     print the bantime for the fail2ban jail (the first escalation step in seconds, -1 = permanent)
 #   ovpn-ban.sh flush            remove every DROP rule of both chains and clear the ban list
 #   ovpn-ban.sh teardown         remove the INPUT jumps, flush, delete both chains (actionstop, ban engine disabled)
 #
 # Ban list (read by ovpn-admin): OVPN_BAN_STATE, default /etc/openvpn/audit/bans.tsv, root:root 0600, no header, one
 # tab-separated row per active ban: ip, banned_at_unix, expires_at_unix, failures, reason. IPv4 and IPv6 share the file;
-# the ip column holds the canonical text form of the address.
+# the ip column holds the canonical text form of the address, or for an IPv6 ban of a prefix the network with the prefix length it was
+# banned with ("2001:db8:1:2::/64"): the unban removes exactly that rule. At most OVPN_BAN_MAX_ENTRIES rows (default 500): when the list is
+# full the oldest temporary ban is dropped (logged, counted in OVPN_BAN_STATE.caphits, event "cap-evict"); a permanent ban is never dropped.
 # The file is replaced atomically (temp file in the same directory + rename) while holding an flock.
 # A permanent ban has expires_at_unix 0 (ovpn-admin versions before the manual-control release skip such a row as malformed).
 #
-# Ban history: ban-history.tsv next to the ban list, root:root 0600, no header, one row per address that was ever banned (and not
-# force-unbanned): ip, ban_count, first_banned_unix, last_banned_unix, permanent (0/1), last_reason, last_failures. It survives
-# container restarts (init keeps it); setup restores every permanent=1 entry. Rewritten atomically under the same flock as the ban list.
-# A ban that fail2ban re-derives from the log lines right after a container start (within OVPN_BAN_RESTART_GRACE seconds of init) for an
-# address whose ban was still running at the restart (or that is permanent) is the same ban, not a new one: it is not counted again.
+# Ban history: bans-history.tsv next to the ban list, root:root 0600, no header, one tab-separated row per OFFENCE:
+#   time_unix  address  prefix  reason  offence  ban_seconds        (ban_seconds 0 = permanent)
+# The offence number of an address (IPv6: of its prefix) is the offence number of its last offence inside OVPN_BAN_DECAY_DAYS (default 30)
+# plus one; an address without an offence in that window starts again at 1. Rows older than the window are pruned (at init, setup and at
+# every offence), a permanent row never decays: the fourth offence stays permanent. A manual ban is recorded with the offence number the
+# address has and does not raise it. It survives container restarts (init keeps it); setup restores every permanent entry. Rewritten
+# atomically under the same flock as the ban list. The file of the earlier releases (ban-history.tsv, one row per address) is migrated to
+# this one at the first setup and kept as ban-history.tsv.migrated.
+# A ban that fail2ban re-derives from the log lines right after a container start (within 120 seconds of init) for an address whose ban was
+# still running at the restart (or that is permanent) is the same ban, not a new offence: it is not counted again.
+#
+# Ban event log: OVPN_BAN_EVENTS_LOG, default /var/lib/ovpn-admin/audit/ban-events.log, root:root 0600 (umask 077), JSON lines:
+#   {"time","time_unix","address","prefix","reason","offence","ban_seconds","action"}   action: ban, unban, refuse, expire, cap-evict, cap-refuse
 #
 # Scope: the INPUT chain jumps to the ban chains only for the OpenVPN listener: the port and transport that configure.sh
 # derives from the same variables as the openvpn command line. Other listeners in the same network namespace, such as the
@@ -44,16 +62,29 @@
 #   OVPN_BAN_IPV6_REQUIRED  default true: with IPv6 on, a missing IPv6 ban chain stops setup (exit 3); false = loud warning, continue
 #   OVPN_LISTEN_PORT   ovpn-admin port of the shared network namespace (default 8080), never allowed as the ban port
 #   OVPN_BAN_STATE      ban list path
-#   OVPN_BAN_BANTIME    seconds a ban lasts, used for expires_at_unix (default 3600)
-#   OVPN_BAN_REPEAT_COUNT  the Nth ban of the same address is permanent (positive integer, default 2)
-#   OVPN_BAN_HISTORY    ban history path (default ban-history.tsv in the directory of OVPN_BAN_STATE)
+#   OVPN_BAN_ESCALATION ban length by offence number, comma separated steps (whole number, optional unit s, m, h, d; no unit = seconds;
+#                       0 = permanent, ends the list); default "10m,1h,24h,0". An offence beyond the last step gets the last step again
+#   OVPN_BAN_BANTIME, OVPN_BAN_REPEAT_COUNT  the earlier single-duration policy, still accepted: only when OVPN_BAN_ESCALATION is empty and
+#                       either is set, they mean "BANTIME seconds (default 3600) for REPEAT_COUNT-1 bans (default 2), then permanent"
+#   OVPN_BAN_DECAY_DAYS days without an offence after which the offence count of an address starts again (default 30)
+#   OVPN_BAN_IPV6_PREFIX  prefix length of an IPv6 ban, 48 to 128 (default 64; 128 = the single address). A prefix that would also cover an
+#                       address of the ignore list is narrowed to the single address
+#   OVPN_BAN_MAX_ENTRIES  most active bans in the ban list (default 500), see above
+#   OVPN_BAN_IGNOREIP   the ignore list of fail2ban (set by configure.sh): an address on it is not banned; the manual ban guard reads it too
+#   OVPN_BAN_OWN_NETS   VPN client networks (set by configure.sh, space separated; OVPN_NETWORK and OVPN_NETWORK_IPV6 are read as well):
+#                       the manual ban guard refuses an address inside them
+#   OVPN_BAN_HISTORY    ban history path (default bans-history.tsv in the directory of OVPN_BAN_STATE)
+#   OVPN_BAN_EVENTS_LOG ban event log (default /var/lib/ovpn-admin/audit/ban-events.log)
 #   OVPN_BAN_LOG        OpenVPN log, only read to name the reason of a ban (default /etc/openvpn/audit/openvpn.log)
 #   OVPN_BAN_NOTIFY_LOG  file that receives the warning when a Telegram notification fails (set by configure.sh to the fail2ban log)
-#   OVPN_TELEGRAM_ENABLED  set by configure.sh (true only when the Telegram settings are valid); with true, a successful new ban
-#                       runs /usr/local/sbin/ovpn-telegram-notify IP FAILURES REASON EXPIRES_AT after the DROP rule and the row are
-#                       written. The bot token and chat id reach the notifier through its environment only (inherited from the
-#                       fail2ban server, set by configure.sh), never through an argument. A notifier failure is one warning in the
-#                       fail2ban log, which the container log mirrors; the ban stays successful and the exit status is not affected. No notification on unban.
+#   OVPN_TELEGRAM_ENABLED  set by configure.sh (true only when the Telegram settings are valid); with true, a new ban (or offence) and the
+#                       lifting of a ban run /usr/local/sbin/ovpn-telegram-notify ban|unban ... after the DROP rule and the row are
+#                       written, outside the lock. The message carries the reason, the offence number, the duration and the host, and NO
+#                       address and NO user name; the address is only added with OVPN_TELEGRAM_INCLUDE_ADDRESS=true (default false: the
+#                       notifier then gets "-" instead of the address). The bot token and chat id reach the notifier through its
+#                       environment only (inherited from the fail2ban server, set by configure.sh), never through an argument. A notifier
+#                       failure is one warning in the fail2ban log, which the container log mirrors; the ban stays successful and the
+#                       exit status is not affected.
 #
 # Locking: every command that changes the firewall chains or the ban list/history (init, setup, check, ban, ban-manual, unban, flush,
 # teardown) does so inside ONE exclusive flock (OVPN_BAN_STATE.lock, wait at most 30 s): the firewall check/add and the state decision of a
@@ -114,15 +145,22 @@ MGMT_PORT="8989"
 STATE="${OVPN_BAN_STATE:-/etc/openvpn/audit/bans.tsv}"
 LOCK="${STATE}.lock"
 REMOVALS="${STATE}.removals"
+CAP_HITS="${STATE}.caphits"
 LOCK_WAIT=30
-HISTORY="${OVPN_BAN_HISTORY:-$(dirname "$STATE")/ban-history.tsv}"
+HISTORY="${OVPN_BAN_HISTORY:-$(dirname "$STATE")/bans-history.tsv}"
+LEGACY_HISTORY="$(dirname "$STATE")/ban-history.tsv"
 BOOT_FILE="${STATE}.boot"
-BANTIME="${OVPN_BAN_BANTIME:-3600}"
-REPEAT="${OVPN_BAN_REPEAT_COUNT:-2}"
+EVENTS_LOG="${OVPN_BAN_EVENTS_LOG:-/var/lib/ovpn-admin/audit/ban-events.log}"
 RESTART_GRACE=120
 OVPN_LOG="${OVPN_BAN_LOG:-/etc/openvpn/audit/openvpn.log}"
-NOTIFY_BIN="/usr/local/sbin/ovpn-telegram-notify"
+NOTIFY_BIN="${OVPN_BAN_NOTIFY_BIN:-/usr/local/sbin/ovpn-telegram-notify}"
 NOTIFY_LOG="${OVPN_BAN_NOTIFY_LOG:-}"
+TG_INCLUDE_ADDRESS="${OVPN_TELEGRAM_INCLUDE_ADDRESS:-false}"
+IPV6_PREFIX="${OVPN_BAN_IPV6_PREFIX:-64}"
+MAX_ENTRIES="${OVPN_BAN_MAX_ENTRIES:-500}"
+DECAY_DAYS="${OVPN_BAN_DECAY_DAYS:-30}"
+MIN_MANUAL_MINUTES=1
+MAX_MANUAL_MINUTES=525600
 
 die() { echo "ovpn-ban: $*" >&2; exit 1; }
 
@@ -131,13 +169,63 @@ for bin in "$IPT4" "$IPT6"; do
     *[!A-Za-z0-9._-]* | "") die "invalid OVPN_IPTABLES_BIN or OVPN_IP6TABLES_BIN" ;;
   esac
 done
-case "$BANTIME" in
-  *[!0-9]* | "" | 0*) die "invalid OVPN_BAN_BANTIME" ;;
-esac
-[[ "$REPEAT" =~ ^[1-9][0-9]{0,9}$ ]] || die "OVPN_BAN_REPEAT_COUNT must be a positive integer: \"$REPEAT\""
-for flag in "$V6" "$V6_REQUIRED"; do
-  case "$flag" in true | false) ;; *) die "OVPN_BAN_IPV6 and OVPN_BAN_IPV6_REQUIRED must be true or false" ;; esac
+for flag in "$V6" "$V6_REQUIRED" "$TG_INCLUDE_ADDRESS"; do
+  case "$flag" in true | false) ;; *) die "OVPN_BAN_IPV6, OVPN_BAN_IPV6_REQUIRED and OVPN_TELEGRAM_INCLUDE_ADDRESS must be true or false" ;; esac
 done
+[[ "$IPV6_PREFIX" =~ ^[0-9]{2,3}$ ]] && [ "$IPV6_PREFIX" -ge 48 ] && [ "$IPV6_PREFIX" -le 128 ] || die "OVPN_BAN_IPV6_PREFIX must be a whole number from 48 to 128: \"$IPV6_PREFIX\""
+[[ "$MAX_ENTRIES" =~ ^[1-9][0-9]{0,5}$ ]] || die "OVPN_BAN_MAX_ENTRIES must be a positive integer: \"$MAX_ENTRIES\""
+[[ "$DECAY_DAYS" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$DECAY_DAYS" -le 3650 ] || die "OVPN_BAN_DECAY_DAYS must be a whole number of days from 1 to 3650: \"$DECAY_DAYS\""
+DECAY_SECONDS=$((DECAY_DAYS * 86400))
+
+# Escalation: the Nth offence of one address (IPv6: one prefix) gets the Nth step; a step is a whole number with an optional unit
+# s, m, h or d (no unit = seconds); 0 is permanent and ends the list. An offence beyond the last step gets the last step again.
+# OVPN_BAN_BANTIME and OVPN_BAN_REPEAT_COUNT (the earlier single-duration policy) are still accepted: when OVPN_BAN_ESCALATION is empty
+# and either of them is set, the list is "BANTIME x (REPEAT_COUNT-1), then permanent", which is what they always meant (defaults 3600 and 2).
+# parse_escalation sets STEPS (the list in seconds, 0 = permanent) and STEPS_CSV.
+parse_escalation() {
+  local raw="$1" tok secs n unit ended=0
+  local -a toks
+  STEPS=()
+  IFS=',' read -r -a toks <<< "$raw"
+  for tok in "${toks[@]}"; do
+    tok="${tok//[[:space:]]/}"
+    [[ "$tok" =~ ^([0-9]{1,9})([smhd]?)$ ]] || return 1
+    n="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+    n=$((10#$n))
+    case "$unit" in m) secs=$((n * 60)) ;; h) secs=$((n * 3600)) ;; d) secs=$((n * 86400)) ;; *) secs="$n" ;; esac
+    [ "$secs" -le 315360000 ] || return 1   # ten years: longer is a typo, use 0 for permanent
+    [ "$ended" -eq 1 ] && continue          # steps after a permanent one are checked, never reached
+    STEPS+=("$secs")
+    [ "$secs" -eq 0 ] && ended=1
+  done
+  [ "${#STEPS[@]}" -ge 1 ] || return 1
+  local IFS=,
+  STEPS_CSV="${STEPS[*]}"
+}
+
+ESCALATION="${OVPN_BAN_ESCALATION:-}"
+LEGACY_BANTIME="${OVPN_BAN_BANTIME:-}"
+LEGACY_REPEAT="${OVPN_BAN_REPEAT_COUNT:-}"
+# the earlier settings are checked whenever they are set, also when OVPN_BAN_ESCALATION wins: a typo is not silently ignored
+if [ -n "$LEGACY_BANTIME" ]; then
+  case "$LEGACY_BANTIME" in *[!0-9]* | 0*) die "invalid OVPN_BAN_BANTIME" ;; esac
+  [ "${#LEGACY_BANTIME}" -le 9 ] || die "invalid OVPN_BAN_BANTIME"
+fi
+if [ -n "$LEGACY_REPEAT" ]; then
+  [[ "$LEGACY_REPEAT" =~ ^[1-9][0-9]{0,9}$ ]] || die "OVPN_BAN_REPEAT_COUNT must be a positive integer: \"$LEGACY_REPEAT\""
+fi
+if [ -z "$ESCALATION" ]; then
+  if [ -n "$LEGACY_BANTIME" ] || [ -n "$LEGACY_REPEAT" ]; then
+    LEGACY_BANTIME="${LEGACY_BANTIME:-3600}"
+    LEGACY_REPEAT="${LEGACY_REPEAT:-2}"
+    ESCALATION=""
+    for ((i = 1; i < LEGACY_REPEAT && i <= 1000; i++)); do ESCALATION="${ESCALATION}${LEGACY_BANTIME},"; done
+    ESCALATION="${ESCALATION}0"
+  else
+    ESCALATION="10m,1h,24h,0"
+  fi
+fi
+parse_escalation "$ESCALATION" || die "OVPN_BAN_ESCALATION must be a comma separated list of durations (whole number, optional unit s, m, h or d; 0 = permanent), got \"${OVPN_BAN_ESCALATION:-}\""
 
 # need_listener: the ports of the jumps come from configure.sh only; refuse anything that is not a valid listener scope.
 # Commands that create or check jumps call this first, so a missing or wrong value fails instead of scoping a jump somewhere else.
@@ -161,43 +249,347 @@ ipt() {
 
 chain_of() { if [ "$1" = "6" ]; then echo "$CHAIN6"; else echo "$CHAIN4"; fi; }
 
-# classify_ip IP: sets FAM (4 or 6) and IP (canonical text form). Accepts only an address that is allowed to be banned:
-# refuses 0.x.x.x, unspecified, loopback, link-local, multicast and reserved ranges; an IPv4-mapped IPv6 address is
-# treated as the IPv4 address. The address reaches python3 as an argument, never through a shell.
-#   Status: 0 = accepted; 1 = INVALID address (not an address, or one that must never be banned); 2 = the classifier itself failed (python3
-#   missing, crashed, unexpected output): the address is unknown, not invalid, and a caller must never discard anything because of it.
-#   The python program exits 3 for an invalid or refused address; any other non-zero status (also 1, which an uncaught exception gives) is a failure.
-classify_ip() {
-  local out rc=0
-  [[ "$1" =~ ^[0-9A-Fa-f:.]{2,45}$ ]] || return 1
-  out="$(python3 -c '
-import ipaddress, sys
+# PYLIB: the address, history and event logic of the engine, one python3 program called as "python3 -c "$PYLIB" SUBCOMMAND ARGS".
+# Nothing from a caller reaches a shell: every value is an argument vector element. Exit status: 0 ok, 2 a file exists but cannot be read
+# (state unknown, never "empty"), 3 invalid or refused address, 5 manual guard refusal (reason on stdout), 6 address is on the ignore list,
+# 64 usage error, anything else (an uncaught exception gives 1) = failure.
+read -r -d '' PYLIB <<'PYEOF'
+import datetime, ipaddress, json, os, re, sys
+
+PRIV = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7")]
+LOOP = [ipaddress.ip_network(n) for n in ("127.0.0.0/8", "::1/128")]
+REASON_RE = re.compile(r"^[A-Za-z0-9 ._:+-]{1,120}$")
+
+
+class Exit(Exception):
+    def __init__(self, code):
+        self.code = code
+
+
+def nets(text):
+    out = []
+    for tok in text.split():
+        try:
+            out.append(ipaddress.ip_network(tok, strict=False))
+        except ValueError:
+            pass
+    return out
+
+
+def ov(a, b):
+    return a.version == b.version and a.overlaps(b)
+
+
+def unwrap(a):
+    if a.version == 6 and a.ipv4_mapped is not None:
+        return a.ipv4_mapped
+    return a
+
+
+def hard_refused(a, allow_loopback=False):
+    """Never bannable: unspecified, multicast, link-local, reserved (::1 is inside the reserved ::/8: a loopback address is let through
+    when allow_loopback, which only the manual ban with force and the unban of such a ban use)."""
+    if allow_loopback and a.is_loopback:
+        return False
+    return a.is_unspecified or a.is_multicast or a.is_link_local or a.is_reserved or (a.version == 4 and int(a) >> 24 == 0)
+
+
+def entry_text(net):
+    return str(net.network_address) if net.prefixlen == net.max_prefixlen else str(net)
+
+
+def host_net(a, pfx6):
+    if a.version == 4:
+        return ipaddress.ip_network((a, 32))
+    return ipaddress.ip_network((a, pfx6), strict=False)
+
+
+def own_nets():
+    t = os.environ.get("OVPN_BAN_OWN_NETS", "") + " " + os.environ.get("OVPN_NETWORK", "") + " " + os.environ.get("OVPN_NETWORK_IPV6", "")
+    return nets(t)
+
+
+def show(net, addr):
+    print(net.version, addr, entry_text(net), net.prefixlen)
+
+
+def cmd_classify(mode, arg, pfx6):
+    pfx6 = int(pfx6)
+    if mode == "target":
+        try:
+            if "/" in arg:
+                net = ipaddress.ip_network(arg, strict=False)
+                if net.version == 6 and net.network_address.ipv4_mapped is not None:
+                    raise Exit(3)
+            else:
+                a = unwrap(ipaddress.ip_address(arg))
+                net = ipaddress.ip_network((a, a.max_prefixlen))
+        except ValueError:
+            raise Exit(3)
+        if hard_refused(net.network_address, True):
+            raise Exit(3)
+        return show(net, net.network_address)
+    if "/" in arg:
+        raise Exit(3)
+    try:
+        a = unwrap(ipaddress.ip_address(arg))
+    except ValueError:
+        raise Exit(3)
+    if hard_refused(a, mode == "manual"):
+        raise Exit(3)
+    if mode == "auto":
+        if a.is_loopback:
+            raise Exit(3)
+        ign = nets(os.environ.get("OVPN_BAN_IGNOREIP", ""))
+        if any(a in n for n in ign if n.version == a.version):
+            raise Exit(6)
+    net = host_net(a, pfx6)
+    if mode == "auto" and net.prefixlen < net.max_prefixlen and any(ov(net, n) for n in ign):
+        # the whole prefix would take an address of the ignore list with it: ban the one address instead
+        net = ipaddress.ip_network((a, a.max_prefixlen))
+    show(net, a)
+
+
+def cmd_guard(entry):
+    """Manual ban guard: print the reason and exit 5 when the target must not be banned without force."""
+    net = ipaddress.ip_network(entry, strict=False)
+    if any(ov(net, n) for n in LOOP):
+        why = "the address is a loopback address"
+    elif any(ov(net, n) for n in nets(os.environ.get("OVPN_BAN_IGNOREIP", ""))):
+        why = "the address is on the ignore list (OVPN_BAN_IGNOREIP)"
+    elif any(ov(net, n) for n in own_nets()):
+        why = "the address is inside the VPN client network (OVPN_NETWORK, OVPN_NETWORK_IPV6, OVPN_SERVER_NET)"
+    elif any(ov(net, n) for n in PRIV):
+        why = "the address is in a private range"
+    else:
+        return
+    print(why)
+    raise Exit(5)
+
+
+class Row:
+    def __init__(self, t, addr, prefix, reason, off, sec):
+        self.t, self.addr, self.prefix, self.reason, self.off, self.sec = t, addr, prefix, reason, off, sec
+        self.net = ipaddress.ip_network((addr, prefix), strict=False)
+
+    def line(self):
+        return "%d\t%s\t%d\t%s\t%d\t%d\n" % (self.t, self.addr, self.prefix, self.reason, self.off, self.sec)
+
+    def manual(self):
+        return self.reason.startswith("manual")
+
+
+def read_hist(path):
+    """Rows of the offence history; a missing file is empty, any other read error propagates (exit 2). Malformed rows are skipped."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return []
+    rows = []
+    for line in data.split("\n"):
+        p = line.split("\t")
+        if len(p) != 6:
+            continue
+        try:
+            rows.append(Row(int(p[0]), ipaddress.ip_address(p[1]), int(p[2]), p[3], int(p[4]), int(p[5])))
+        except ValueError:
+            continue
+    return rows
+
+
+def emit(rows):
+    sys.stdout.write("".join(r.line() for r in rows))
+
+
+def keep(rows, now, decay):
+    """Rows that still count: younger than the decay window, and every permanent row (it never decays)."""
+    return [r for r in rows if r.sec == 0 or now - r.t <= decay]
+
+
+def cmd_decide(path, entry, mode, now, decay, steps, manual_sec, boot, grace):
+    """Prints "OFFENCE BAN_SECONDS APPEND BASE": the offence number and ban length for a ban of ENTRY now, whether it is a new offence
+    (APPEND 1, a history row is to be written) and the time its length counts from (NOW, or the time of the ban that is being re-applied)."""
+    now, decay, manual_sec, boot, grace = int(now), int(decay), int(manual_sec), int(boot), int(grace)
+    steps = [int(s) for s in steps.split(",")]
+    net = ipaddress.ip_network(entry, strict=False)
+    rel = [r for r in read_hist(path) if ov(r.net, net)]
+    perm = [r for r in rel if r.sec == 0]
+    if perm:
+        print(max(r.off for r in perm), 0, 0, max(r.t for r in perm))
+        return
+    win = [r for r in rel if not r.manual() and now - r.t <= decay]
+    prev = max((r.off for r in win), default=0)
+    if mode == "manual":
+        print(prev, manual_sec, 1, now)
+        return
+    if win and boot > 0 and 0 <= now - boot <= grace:
+        last = max(win, key=lambda r: r.t)
+        if last.t < boot and (last.sec == 0 or last.t + last.sec > now):
+            # fail2ban re-derives the ban from the log right after a container start: the same ban, not a new offence
+            print(last.off, last.sec, 0, last.t)
+            return
+    off = prev + 1
+    print(off, steps[min(off, len(steps)) - 1], 1, now)
+
+
+def cmd_append(path, now, decay, addr, prefix, reason, off, sec):
+    now = int(now)
+    rows = keep(read_hist(path), now, int(decay))
+    rows.append(Row(now, ipaddress.ip_address(addr), int(prefix), reason, int(off), int(sec)))
+    emit(rows)
+
+
+def cmd_prune(path, now, decay):
+    emit(keep(read_hist(path), int(now), int(decay)))
+
+
+def cmd_forget(path, entry):
+    net = ipaddress.ip_network(entry, strict=False)
+    emit([r for r in read_hist(path) if not ov(r.net, net)])
+
+
+def cmd_has(path, entry):
+    net = ipaddress.ip_network(entry, strict=False)
+    if not any(ov(r.net, net) for r in read_hist(path)):
+        raise Exit(1)
+
+
+def cmd_is_perm(path, entry):
+    net = ipaddress.ip_network(entry, strict=False)
+    if not any(r.sec == 0 and ov(r.net, net) for r in read_hist(path)):
+        raise Exit(1)
+
+
+def cmd_perm(path):
+    """One line per permanent entry: ENTRY FAMILY TIME REASON (tab separated), the latest row of each network."""
+    seen = {}
+    for r in read_hist(path):
+        if r.sec == 0 and (r.net not in seen or r.t >= seen[r.net].t):
+            seen[r.net] = r
+    for net, r in seen.items():
+        print("%s\t%d\t%d\t%s" % (entry_text(net), net.version, r.t, r.reason))
+
+
+def cmd_migrate(legacy, bantime):
+    """The per-address history of the earlier releases (ban-history.tsv: ip, count, first, last, permanent, reason, failures) as
+    offence rows; a legacy IPv6 address keeps its single-address scope (prefix 128)."""
+    try:
+        with open(legacy, encoding="utf-8") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return
+    for line in data.split("\n"):
+        p = line.split("\t")
+        if len(p) < 5:
+            continue
+        try:
+            a = ipaddress.ip_address(p[0])
+            n, last = int(p[1]), int(p[3])
+            perm = p[4] == "1"
+        except ValueError:
+            continue
+        reason = p[5] if len(p) > 5 and REASON_RE.match(p[5]) else "legacy"
+        sys.stdout.write(Row(last, a, a.max_prefixlen, reason, max(n, 1), 0 if perm else int(bantime)).line())
+
+
+def cmd_state_find(path, target):
+    """The entry of the ban list row that holds TARGET (an address or a network): the most specific row that contains it."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return
+    t = ipaddress.ip_network(target, strict=False)
+    best = None
+    for line in data.split("\n"):
+        col = line.split("\t")[0]
+        if not col:
+            continue
+        try:
+            n = ipaddress.ip_network(col, strict=False)
+        except ValueError:
+            continue
+        if n.version == t.version and t.subnet_of(n) and (best is None or n.prefixlen > best.prefixlen):
+            best = n
+    if best is not None:
+        print(entry_text(best))
+
+
+def cmd_event(path, when, action, address, prefix, reason, off, sec, forced):
+    rec = {
+        "time": datetime.datetime.fromtimestamp(int(when), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "time_unix": int(when),
+        "address": address,
+        "prefix": int(prefix),
+        "reason": reason,
+        "offence": int(off),
+        "ban_seconds": int(sec),
+        "action": action,
+    }
+    if forced == "1":
+        rec["forced"] = True
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, (json.dumps(rec, separators=(",", ":")) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+CMDS = {
+    "classify": (cmd_classify, 3), "guard": (cmd_guard, 1), "decide": (cmd_decide, 9), "append": (cmd_append, 8), "prune": (cmd_prune, 3),
+    "forget": (cmd_forget, 2), "has": (cmd_has, 2), "is_perm": (cmd_is_perm, 2), "perm": (cmd_perm, 1), "migrate": (cmd_migrate, 2),
+    "state_find": (cmd_state_find, 2),
+    "event": (cmd_event, 9),
+}
 try:
-    a = ipaddress.ip_address(sys.argv[1])
-except ValueError:
-    sys.exit(3)
-if a.version == 6 and a.ipv4_mapped is not None:
-    a = a.ipv4_mapped
-if a.is_loopback or a.is_unspecified or a.is_multicast or a.is_link_local or a.is_reserved:
-    sys.exit(3)
-if a.version == 4 and int(a) >> 24 == 0:
-    sys.exit(3)
-print(a.version, a)
-' "$1" 2>/dev/null)" || rc=$?
-  case "$rc" in 0) ;; 3) return 1 ;; *) return 2 ;; esac
-  [[ "$out" =~ ^[46]\ [0-9a-f:.]+$ ]] || return 2
-  FAM="${out%% *}"
-  IP="${out#* }"
+    fn, n = CMDS[sys.argv[1]]
+    if len(sys.argv) - 2 != n:
+        raise Exit(64)
+    fn(*sys.argv[2:])
+except Exit as e:
+    sys.exit(e.code)
+except (KeyError, IndexError):
+    sys.exit(64)
+except (OSError, UnicodeError):
+    sys.exit(2)
+PYEOF
+
+# pylib SUBCOMMAND ARGS: run the program above
+pylib() { python3 -c "$PYLIB" "$@"; }
+
+# classify_ip ARG [MODE]: sets FAM (4 or 6), IP (the address; for a network the network address), ENTRY (what the DROP rule and the ban
+# list say: the address, or "network/prefix" when the prefix is shorter than the whole address) and PFX (its prefix length).
+# MODE auto (default, a ban by the engine): only an address that is allowed to be banned: refuses 0.x.x.x, unspecified, loopback,
+# link-local, multicast and reserved ranges; an IPv4-mapped IPv6 address is the IPv4 address; an IPv6 address gets the prefix
+# OVPN_BAN_IPV6_PREFIX (default 64), narrowed to the single address when the prefix would also cover an address of the ignore list.
+# MODE manual: the same but loopback and private ranges pass (ban_guard decides); MODE target (unban, journal): an address or a network
+# "address/prefix" as the ban list writes it. The address reaches python3 as an argument, never through a shell.
+#   Status: 0 = accepted; 1 = INVALID address (not an address, or one that must never be banned); 2 = the classifier itself failed (python3
+#   missing, crashed, unexpected output): the address is unknown, not invalid, and a caller must never discard anything because of it;
+#   4 = the address is on the ignore list (auto mode only).
+classify_ip() {
+  local mode="${2:-auto}" out rc=0 re='^[0-9A-Fa-f:.]{2,45}$'
+  [ "$mode" = "target" ] && re='^[0-9A-Fa-f:.]{2,45}(/[0-9]{1,3})?$'
+  [[ "$1" =~ $re ]] || return 1
+  out="$(pylib classify "$mode" "$1" "$IPV6_PREFIX" 2>/dev/null)" || rc=$?
+  case "$rc" in 0) ;; 3) return 1 ;; 6) return 4 ;; *) return 2 ;; esac
+  [[ "$out" =~ ^[46]\ [0-9a-f:.]+\ [0-9a-f:./]+\ [0-9]{1,3}$ ]] || return 2
+  read -r FAM IP ENTRY PFX <<< "$out"
 }
 
-# classify_or_die MESSAGE ADDRESS: classify_ip for a command line argument; exits with MESSAGE for an invalid address and with a different
-# message when the classifier itself failed
+# classify_or_die MESSAGE ADDRESS [MODE]: classify_ip for a command line argument; exits with MESSAGE for an invalid address and with a
+# different message when the classifier itself failed
 classify_or_die() {
   local rc=0
-  classify_ip "$2" || rc=$?
+  classify_ip "$2" "${3:-auto}" || rc=$?
   case "$rc" in
     0) ;;
     2) die "cannot check the address $2: the address classifier (python3) failed" ;;
+    4) echo "ovpn-ban: $2 is on the ignore list (OVPN_BAN_IGNOREIP): not banned" >&2; exit 0 ;;
     *) die "$1: $2" ;;
   esac
 }
@@ -348,12 +740,12 @@ file_state() {
   return 2
 }
 
-# Readers of the ban list, the history and the removal journal. Every one returns 0 when the file was read completely or does not exist
+# Readers of the ban list and the removal journal. Every one returns 0 when the file was read completely or does not exist
 # (a first start: no entries), and 2 when it exists but cannot be read (state unknown, never "empty"). Output is only trusted with status 0.
-#   hist_line IP     the history row of IP (no output when there is none)
-#   hist_without IP  every other history row;  rows_without IP  every other ban list row
-#   read_all FILE    the whole file (callers take it into a variable and check the status before looping over it)
-read_rows() { # FILE MODE IP: MODE line = the first row of IP, MODE others = every row except those of IP
+# The history is read by the python program (pylib: a missing file is empty, an unreadable one exits 2).
+#   rows_without ENTRY  every ban list row except those of ENTRY
+#   read_all FILE       the whole file (callers take it into a variable and check the status before looping over it)
+read_rows() { # FILE MODE ENTRY: MODE line = the first row of ENTRY, MODE others = every row except those of ENTRY
   local f="$1" mode="$2" ip="$3" st=0
   file_state "$f" || st=$?
   [ "$st" -eq 1 ] && return 0
@@ -371,8 +763,6 @@ read_all() {
   [ "$st" -eq 0 ] || return 2
   cat -- "$1" || return 2
 }
-hist_line() { read_rows "$HISTORY" line "$1"; }
-hist_without() { read_rows "$HISTORY" others "$1"; }
 rows_without() { read_rows "$STATE" others "$1"; }
 
 # row_kind IP: what the ban list says about IP: "none" (no row), "perm" (every row of IP has expires_at 0), "temp" (a row with an expiry).
@@ -411,111 +801,212 @@ rows_with() {
 # as it was, when the current ban list cannot be read completely
 ban_row() { publish "$STATE" rows_with "$@"; }
 
-# hist_with IP N FIRST LAST PERM REASON FAILURES: the history content with the row of IP added or replaced (a producer for publish)
-hist_with() {
-  hist_without "$1" || return 1
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@"
-}
-
-# txn_ban IP FAILURES REASON NOW MODE: the history and ban list part of a ban, under the lock. MODE is auto (fail2ban) or manual.
-# Prints "PERMANENT NEWLY_PERMANENT EXPIRES_AT" (1/0 flags, expires 0 = never) on stdout.
-txn_ban() {
-  local ip="$1" fails="$2" reason="$3" now="$4" mode="$5"
-  local line prev_n=0 first="$4" last="$4" prev_perm=0 n perm newperm=0 expires boot=0
-  line="$(hist_line "$ip")" || { echo "ovpn-ban: cannot read the ban history $HISTORY: $ip not recorded" >&2; return 1; }
-  if [ -n "$line" ]; then
-    IFS=$'\t' read -r _ prev_n first last prev_perm _ <<< "$line" || { echo "ovpn-ban: cannot parse the history row of $ip: $ip not recorded" >&2; return 1; }
-    [[ "$prev_n" =~ ^[0-9]{1,10}$ ]] || prev_n=0
-    [[ "$first" =~ ^[0-9]{1,12}$ ]] || first="$now"
-    [[ "$last" =~ ^[0-9]{1,12}$ ]] || last="$now"
-    [ "$prev_perm" = "1" ] || prev_perm=0
-  fi
-  if [ "$mode" = "manual" ]; then
-    n="$prev_n"
-    [ "$prev_perm" = "1" ] || n=$((prev_n + 1))
-    last="$now"
-    perm=1
-  else
-    n=$((prev_n + 1))
-    if [ -n "$line" ]; then
-      [ -r "$BOOT_FILE" ] && read -r boot < "$BOOT_FILE" 2>/dev/null
-      [[ "$boot" =~ ^[0-9]{1,12}$ ]] || boot=0
-      # fail2ban re-derives the ban from the log right after a container start: the same ban, not a new one
-      if [ "$boot" -gt 0 ] && [ "$((now - boot))" -le "$RESTART_GRACE" ] && [ "$last" -lt "$boot" ] \
-        && { [ "$prev_perm" = "1" ] || [ "$((last + BANTIME))" -gt "$boot" ]; }; then
-        n="$prev_n"
-      else
-        last="$now"
-      fi
-    fi
-    perm="$prev_perm"
-    [ "$n" -ge "$REPEAT" ] && perm=1
-  fi
-  [ "$perm" = "1" ] && [ "$prev_perm" = "0" ] && newperm=1
-  expires=$((now + BANTIME))
-  [ "$perm" = "1" ] && expires=0
-  publish "$HISTORY" hist_with "$ip" "$n" "$first" "$last" "$perm" "$reason" "$fails" || return 1
-  # 2 = the history (authoritative for permanence) is written, the row is not: setup/check restore the row of a permanent entry
-  ban_row "$ip" "$fails" "$reason" "$now" "$expires" || return 2
-  echo "$perm $newperm $expires"
-}
-
-# txn_ban_fw IP FAILURES REASON MODE FAMILY: the whole ban in ONE critical section (the caller holds the lock): complete a pending
-# removal, check/add the DROP rule, decide and record permanence (txn_ban). The firewall check and the state decision can therefore not
-# be separated by an unban of the same address. Prints "PERMANENT NEWLY_PERMANENT EXPIRES_AT ADDED" on stdout. When the history cannot
-# be written, a rule added here is taken out again; a firewall read error refuses the ban.
-txn_ban_fw() {
-  local ip="$1" fails="$2" reason="$3" mode="$4" fam="$5" chain now out rc added=0
-  chain="$(chain_of "$fam")"
-  reconcile_removals || echo "ovpn-ban: WARNING: a pending removal could not be completed yet" >&2
-  # The journal line of THIS address is committed intent (a force-unban the caller was told about or crashed in). It is cleared only by a
-  # completed removal (removal_apply). While it is still there the replay of this address failed (or its journal cannot be read): the new
-  # ban fails and the line stays, so the removal is repeated by the next operation. A retry can only go on after the replay succeeded.
-  removal_has "$ip"; rc=$?
-  case "$rc" in
-    0) echo "ovpn-ban: the pending removal of $ip could not be completed (the journal line is kept, the removal is repeated by the next operation): $ip not banned" >&2; return 1 ;;
-    1) ;;
-    *) echo "ovpn-ban: cannot read the removal journal $REMOVALS: $ip not banned" >&2; return 1 ;;
+# entry_parts ENTRY: sets E_ADDR (the address, for a network its network address) and E_PFX (its prefix length)
+entry_parts() {
+  case "$1" in
+    */*) E_ADDR="${1%%/*}"; E_PFX="${1##*/}" ;;
+    *:*) E_ADDR="$1"; E_PFX=128 ;;
+    *) E_ADDR="$1"; E_PFX=32 ;;
   esac
-  ensure_chain "$fam" || { echo "ovpn-ban: cannot create chain $chain" >&2; return 1; }
-  fw_has "$fam" "$ip"; rc=$?
-  case "$rc" in
-    0) ;;
-    1) ipt "$fam" -A "$chain" -s "$ip" -j DROP || { echo "ovpn-ban: cannot add DROP rule for $ip" >&2; return 1; }
-       added=1 ;;
-    *) echo "ovpn-ban: cannot read chain $chain of the firewall: $ip not banned" >&2; return 1 ;;
-  esac
-  now="$(date +%s)"
-  out="$(txn_ban "$ip" "$fails" "$reason" "$now" "$mode")"; rc=$?
-  if [ "$rc" -ne 0 ]; then
-    if [ "$rc" -eq 1 ] && [ "$added" -eq 1 ]; then
-      fw_remove "$fam" "$ip" || echo "ovpn-ban: WARNING: the DROP rule of $ip stays although the history could not be written" >&2
-    fi
-    echo "ovpn-ban: cannot update $STATE or $HISTORY for $ip" >&2
-    return 1
-  fi
-  echo "$out $added"
 }
 
-# notify_ban IP FAILURES REASON EXPIRES_AT: Telegram message for a new ban (see the header). Never fails the caller. fail2ban does
-# not log the stderr of a successful action, so a warning of the notifier is appended to OVPN_BAN_NOTIFY_LOG (the fail2ban log,
-# which the container mirrors to its log; set by configure.sh) and also written to our own stderr (visible to a manual caller).
-# The notifier prints at most one line, never the token or a response body; the line is cut to its first 300 characters.
-notify_ban() {
-  local rc=0 msg=""
+# fam_of ENTRY: 6 for an IPv6 entry, 4 otherwise
+fam_of() { case "$1" in *:*) echo 6 ;; *) echo 4 ;; esac; }
+
+# warn_log MESSAGE: a warning on our stderr (visible to a manual caller) and, when OVPN_BAN_NOTIFY_LOG is set, one line in the fail2ban
+# log (fail2ban does not log the stderr of a successful action; the container mirrors that log to its own)
+warn_log() {
+  echo "$1" >&2
+  if [ -n "$NOTIFY_LOG" ]; then echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >>"$NOTIFY_LOG" 2>/dev/null || true; fi
+  return 0
+}
+
+# ban_event ACTION ADDRESS PREFIX REASON OFFENCE SECONDS [FORCED]: one JSON line in the ban event log (OVPN_BAN_EVENTS_LOG, default
+# /var/lib/ovpn-admin/audit/ban-events.log, created 0600 with umask 077): time, address, prefix, reason, offence, ban_seconds, action. One line per
+# ban, unban and refusal, plus "expire" (a ban ran out) and "cap-evict" (a temporary ban was dropped for room). The panel audit trail is
+# separate (it carries a hash chain that is only written by ovpn-admin). A log that cannot be written is a warning, never a failed ban.
+ban_event() {
+  pylib event "$EVENTS_LOG" "$(date +%s)" "$1" "$2" "$3" "$4" "$5" "$6" "${7:-0}" 2>/dev/null \
+    || warn_log "ovpn-ban: WARNING: cannot write the ban event log $EVENTS_LOG"
+  return 0
+}
+
+# Telegram. The message carries the reason, the offence number, the duration and the host, and neither an address nor a user name; the
+# address is added only with OVPN_TELEGRAM_INCLUDE_ADDRESS=true. A ban reason of a manual ban is cut to the word "manual" here: its note is
+# free text of the operator. Messages are queued under the lock (queue_notify) and sent after it is released (flush_notify): a slow or
+# failing Telegram API never holds up the firewall.
+NOTIFY_QUEUE="${STATE}.notify"
+# queue_notify ban ENTRY REASON OFFENCE SECONDS | queue_notify unban ENTRY
+queue_notify() {
   [ "${OVPN_TELEGRAM_ENABLED:-false}" = "true" ] || return 0
-  if [ ! -x "$NOTIFY_BIN" ]; then
-    msg="ovpn-ban: WARNING: Telegram notification for $1 not sent: $NOTIFY_BIN is not installed"
+  local kind="$1" entry="$2" reason="${3:-}"
+  case "$reason" in manual*) reason="manual" ;; esac
+  if [ "$kind" = "ban" ]; then
+    printf 'ban\t%s\t%s\t%s\t%s\n' "$entry" "$reason" "$4" "$5" >> "$NOTIFY_QUEUE" 2>/dev/null || true
   else
-    msg="$(timeout 20 "$NOTIFY_BIN" "$@" 2>&1 </dev/null)" || rc=$?
-    if [ "$rc" -gt 2 ]; then msg="ovpn-ban: WARNING: Telegram notification for $1 failed (notifier exit $rc)"; fi
+    printf 'unban\t%s\t\t\t\n' "$entry" >> "$NOTIFY_QUEUE" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# send_notify KIND ENTRY REASON OFFENCE SECONDS: one notifier call. Never fails the caller. The notifier prints at most one line, never the
+# token or a response body; the line is cut to its first 300 characters.
+send_notify() {
+  local kind="$1" entry="$2" rc=0 msg="" shown="-"
+  [ "$TG_INCLUDE_ADDRESS" = "true" ] && shown="$entry"
+  if [ ! -x "$NOTIFY_BIN" ]; then
+    msg="ovpn-ban: WARNING: Telegram notification ($kind) not sent: $NOTIFY_BIN is not installed"
+  else
+    if [ "$kind" = "ban" ]; then
+      msg="$(timeout 20 "$NOTIFY_BIN" ban "$shown" "$3" "$4" "$5" 2>&1 </dev/null)" || rc=$?
+    else
+      msg="$(timeout 20 "$NOTIFY_BIN" unban "$shown" 2>&1 </dev/null)" || rc=$?
+    fi
+    if [ "$rc" -gt 2 ]; then msg="ovpn-ban: WARNING: Telegram notification ($kind) failed (notifier exit $rc)"; fi
   fi
   msg="${msg%%$'\n'*}"
   [ -n "$msg" ] || return 0
-  msg="${msg:0:300}"
-  echo "$msg" >&2
-  if [ -n "$NOTIFY_LOG" ]; then echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >>"$NOTIFY_LOG" 2>/dev/null || true; fi
+  warn_log "${msg:0:300}"
+}
+
+# flush_notify: send what the transactions queued. The queue file is claimed by a rename first, so two callers never send a line twice.
+flush_notify() {
+  local claimed="${NOTIFY_QUEUE}.$$" kind entry reason off sec
+  [ "${OVPN_TELEGRAM_ENABLED:-false}" = "true" ] || return 0
+  mv -f "$NOTIFY_QUEUE" "$claimed" 2>/dev/null || return 0
+  while IFS=$'\t' read -r kind entry reason off sec; do
+    case "$kind" in
+      ban) [[ "$off" =~ ^[0-9]{1,10}$ && "$sec" =~ ^[0-9]{1,10}$ ]] && send_notify ban "$entry" "$reason" "$off" "$sec" ;;
+      unban) send_notify unban "$entry" ;;
+    esac
+  done < "$claimed"
+  rm -f "$claimed"
   return 0
+}
+
+# cap_count: one more cap hit, kept in CAP_HITS (sets CAP_N)
+cap_count() {
+  local n=0
+  [ -r "$CAP_HITS" ] && { read -r n < "$CAP_HITS" 2>/dev/null || true; }
+  [[ "$n" =~ ^[0-9]{1,12}$ ]] || n=0
+  CAP_N=$((n + 1))
+  echo "$CAP_N" | write_file "$CAP_HITS" || true
+}
+
+# cap_hit VICTIM: the ban list is full and the oldest temporary ban VICTIM is dropped: count, log and record the event
+cap_hit() {
+  cap_count
+  warn_log "ovpn-ban: WARNING: the ban list is full (OVPN_BAN_MAX_ENTRIES=$MAX_ENTRIES, cap hit number $CAP_N): dropped the oldest temporary ban $1"
+  entry_parts "$1"
+  ban_event cap-evict "$E_ADDR" "$E_PFX" "cap" 0 0
+}
+
+# cap_make_room ENTRY: the ban list holds at most OVPN_BAN_MAX_ENTRIES rows (the caller holds the lock). A ban of an entry that already has
+# a row replaces it and needs no room. When the list is full, the oldest TEMPORARY ban is lifted (rule, row, event, counted); a permanent ban
+# is never dropped: a list that holds only permanent bans refuses the new ban (status 4, counted and logged).
+cap_make_room() {
+  local entry="$1" data n victim guard=0
+  while [ "$guard" -lt 1000 ]; do
+    guard=$((guard + 1))
+    data="$(read_all "$STATE")" || { echo "ovpn-ban: cannot read the ban list $STATE: $entry not banned" >&2; return 1; }
+    n="$(awk -F '\t' -v e="$entry" 'NF >= 3 && $1 != "" { if ($1 == e) f = 1; c++ } END { print (f ? -1 : c + 0) }' <<< "$data")"
+    [[ "$n" =~ ^-?[0-9]+$ ]] || return 1
+    [ "$n" -lt "$MAX_ENTRIES" ] && return 0
+    victim="$(awk -F '\t' 'NF >= 3 && $1 != "" && $3 != "0" { if (v == "" || $2 + 0 < m + 0) { m = $2; v = $1 } } END { print v }' <<< "$data")"
+    if [ -z "$victim" ]; then
+      cap_count
+      warn_log "ovpn-ban: ERROR: the ban list is full of permanent bans (OVPN_BAN_MAX_ENTRIES=$MAX_ENTRIES, cap hit number $CAP_N): $entry not banned"
+      entry_parts "$entry"
+      ban_event cap-refuse "$E_ADDR" "$E_PFX" "cap" 0 0
+      return 4
+    fi
+    fw_remove "$(fam_of "$victim")" "$victim" || return 1
+    publish "$STATE" rows_without "$victim" || return 1
+    cap_hit "$victim"
+  done
+  return 1
+}
+
+# txn_expire NOW: lift every ban whose expires_at has passed (the caller holds the lock): DROP rule, row, event, queued unban message.
+# A permanent row (expires_at 0) is never touched. Fails (status 1) when the ban list cannot be read or one lifting did not complete;
+# the rest is still done and the next call repeats the rest.
+txn_expire() {
+  local now="$1" data list entry rc=0 seen=0 want
+  data="$(read_all "$STATE")" || { echo "ovpn-ban: cannot read the ban list $STATE: expiry not checked" >&2; return 1; }
+  [ -n "$data" ] || return 0
+  list="$(awk -F '\t' -v now="$now" 'NF >= 3 && $1 != "" && $3 ~ /^[0-9]+$/ && $3 != "0" && $3 + 0 <= now + 0 { print $1 }' <<< "$data")" || return 1
+  [ -n "$list" ] || return 0
+  nlines "$list"; want="$NLINES"
+  while IFS= read -r entry <&3; do
+    seen=$((seen + 1))
+    fw_remove "$(fam_of "$entry")" "$entry" || { rc=1; continue; }
+    publish "$STATE" rows_without "$entry" || { rc=1; continue; }
+    entry_parts "$entry"
+    ban_event expire "$E_ADDR" "$E_PFX" "expired" 0 0
+    queue_notify unban "$entry"
+  done 3<<< "$list"
+  [ "$seen" -eq "$want" ] || rc=1
+  return "$rc"
+}
+
+# txn_ban_fw ADDRESS ENTRY FAMILY PREFIX FAILURES REASON MODE MANUAL_SECONDS: the whole ban in ONE critical section (the caller holds the
+# lock): complete a pending removal, lift expired bans, make room (OVPN_BAN_MAX_ENTRIES), decide the offence number and the length from the
+# history (pylib decide), check/add the DROP rule for ENTRY, record the offence and the row. The firewall check and the state decision can
+# therefore not be separated by an unban of the same entry. MODE is auto (fail2ban: escalation) or manual (MANUAL_SECONDS, 0 = permanent).
+# Prints "OFFENCE SECONDS EXPIRES_AT ADDED APPENDED" on stdout (SECONDS and EXPIRES_AT 0 = permanent). When the history cannot be
+# written, a rule added here is taken out again; a firewall read error refuses the ban.
+txn_ban_fw() {
+  local addr="$1" entry="$2" fam="$3" pfx="$4" fails="$5" reason="$6" mode="$7" msec="$8"
+  local chain now out rc added=0 boot=0 off sec append base expires
+  chain="$(chain_of "$fam")"
+  reconcile_removals || echo "ovpn-ban: WARNING: a pending removal could not be completed yet" >&2
+  # The journal line of THIS entry is committed intent (a force-unban the caller was told about or crashed in). It is cleared only by a
+  # completed removal (removal_apply). While it is still there the replay of this entry failed (or its journal cannot be read): the new
+  # ban fails and the line stays, so the removal is repeated by the next operation. A retry can only go on after the replay succeeded.
+  removal_has "$entry"; rc=$?
+  case "$rc" in
+    0) echo "ovpn-ban: the pending removal of $entry could not be completed (the journal line is kept, the removal is repeated by the next operation): $entry not banned" >&2; return 1 ;;
+    1) ;;
+    *) echo "ovpn-ban: cannot read the removal journal $REMOVALS: $entry not banned" >&2; return 1 ;;
+  esac
+  now="$(date +%s)"
+  txn_expire "$now" || echo "ovpn-ban: WARNING: an expired ban could not be lifted yet" >&2
+  ensure_chain "$fam" || { echo "ovpn-ban: cannot create chain $chain" >&2; return 1; }
+  [ -r "$BOOT_FILE" ] && { read -r boot < "$BOOT_FILE" 2>/dev/null || true; }
+  [[ "$boot" =~ ^[0-9]{1,12}$ ]] || boot=0
+  out="$(pylib decide "$HISTORY" "$entry" "$mode" "$now" "$DECAY_SECONDS" "$STEPS_CSV" "$msec" "$boot" "$RESTART_GRACE")" \
+    || { echo "ovpn-ban: cannot read the ban history $HISTORY: $entry not banned" >&2; return 1; }
+  read -r off sec append base <<< "$out"
+  [[ "$off" =~ ^[0-9]{1,10}$ && "$sec" =~ ^[0-9]{1,10}$ && "$append" =~ ^[01]$ && "$base" =~ ^[0-9]{1,12}$ ]] \
+    || { echo "ovpn-ban: internal error: unexpected result of the ban decision" >&2; return 1; }
+  cap_make_room "$entry" || return 1
+  fw_has "$fam" "$entry"; rc=$?
+  case "$rc" in
+    0) ;;
+    1) ipt "$fam" -A "$chain" -s "$entry" -j DROP || { echo "ovpn-ban: cannot add DROP rule for $entry" >&2; return 1; }
+       added=1 ;;
+    *) echo "ovpn-ban: cannot read chain $chain of the firewall: $entry not banned" >&2; return 1 ;;
+  esac
+  if [ "$append" = "1" ]; then
+    if ! publish "$HISTORY" pylib append "$HISTORY" "$now" "$DECAY_SECONDS" "$addr" "$pfx" "$reason" "$off" "$sec"; then
+      if [ "$added" -eq 1 ]; then
+        fw_remove "$fam" "$entry" || echo "ovpn-ban: WARNING: the DROP rule of $entry stays although the history could not be written" >&2
+      fi
+      echo "ovpn-ban: cannot update $HISTORY for $entry" >&2
+      return 1
+    fi
+  fi
+  expires=0
+  [ "$sec" -gt 0 ] && expires=$((base + sec))
+  if ! ban_row "$entry" "$fails" "$reason" "$now" "$expires"; then
+    # a permanent entry is restored by setup/check from the history; a temporary rule without a row would never be lifted
+    if [ "$sec" -gt 0 ] && [ "$added" -eq 1 ]; then fw_remove "$fam" "$entry" || true; fi
+    echo "ovpn-ban: cannot update $STATE for $entry" >&2
+    return 1
+  fi
+  # a new ban (no DROP rule before) or a new offence is announced once; the same ban that is only re-applied is not announced again
+  if [ "$added" -eq 1 ] || [ "$append" = "1" ]; then queue_notify ban "$entry" "$reason" "$off" "$sec"; fi
+  echo "$off $sec $expires $added $append"
 }
 
 # fw_listed CHAIN IP: reads "iptables -S CHAIN" on stdin; 0 when it lists the rule "-A CHAIN -s IP -j DROP" (the source printed as IP, IP/32 or
@@ -589,23 +1080,28 @@ removal_drop() {
   publish "$REMOVALS" removal_without "$1"
 }
 
-# removal_apply IP FAMILY: carry out a recorded removal (idempotent, every step can be repeated): DROP rule (absence read back), row, history
-# entry, then verify all three and clear the journal line. Returns 1 at the first step that fails, including every read error of the ban
-# list or the history (an unreadable file is not an absent entry); the journal line then stays and the next ban engine operation repeats the
-# removal. Replacements of the ban list and the history are published only after their old content was read completely (publish).
+# removal_apply ENTRY FAMILY: carry out a recorded removal (idempotent, every step can be repeated): DROP rule (absence read back), row, history
+# rows of the network (every offence of it: the address starts clean), then verify all three and clear the journal line. Returns 1 at the
+# first step that fails, including every read error of the ban list or the history (an unreadable file is not an absent entry); the journal
+# line then stays and the next ban engine operation repeats the removal. Replacements of the ban list and the history are published only
+# after their old content was read completely (publish).
 removal_apply() {
-  local ip="$1" fam="$2" rc line rk
+  local ip="$1" fam="$2" rc rk hrc=0
   fw_remove "$fam" "$ip" || return 1
   publish "$STATE" rows_without "$ip" || { echo "ovpn-ban: cannot rewrite the ban list $STATE: removal of $ip not complete" >&2; return 1; }
-  line="$(hist_line "$ip")" || { echo "ovpn-ban: cannot read the ban history $HISTORY: removal of $ip not complete" >&2; return 1; }
-  if [ -n "$line" ]; then
-    publish "$HISTORY" hist_without "$ip" || { echo "ovpn-ban: cannot rewrite the ban history $HISTORY: removal of $ip not complete" >&2; return 1; }
-  fi
+  pylib has "$HISTORY" "$ip" || hrc=$?
+  case "$hrc" in
+    0) publish "$HISTORY" pylib forget "$HISTORY" "$ip" || { echo "ovpn-ban: cannot rewrite the ban history $HISTORY: removal of $ip not complete" >&2; return 1; } ;;
+    1) ;;
+    *) echo "ovpn-ban: cannot read the ban history $HISTORY: removal of $ip not complete" >&2; return 1 ;;
+  esac
   fw_has "$fam" "$ip"; rc=$?
   [ "$rc" -eq 1 ] || { echo "ovpn-ban: $ip is still in the firewall after its removal" >&2; return 1; }
   rk="$(row_kind "$ip")" || { echo "ovpn-ban: cannot read the ban list $STATE: removal of $ip not verified" >&2; return 1; }
-  line="$(hist_line "$ip")" || { echo "ovpn-ban: cannot read the ban history $HISTORY: removal of $ip not verified" >&2; return 1; }
-  if [ "$rk" != "none" ] || [ -n "$line" ]; then echo "ovpn-ban: $ip is still in the ban list or history after its removal" >&2; return 1; fi
+  hrc=0
+  pylib has "$HISTORY" "$ip" || hrc=$?
+  [ "$hrc" -eq 1 ] || { echo "ovpn-ban: cannot verify the ban history $HISTORY: removal of $ip not verified" >&2; return 1; }
+  if [ "$rk" != "none" ]; then echo "ovpn-ban: $ip is still in the ban list after its removal" >&2; return 1; fi
   removal_drop "$ip" || return 1
 }
 
@@ -620,9 +1116,9 @@ reconcile_removals() {
     seen=$((seen + 1))
     [ -n "$ip" ] || continue
     crc=0
-    classify_ip "$ip" || crc=$?
+    classify_ip "$ip" target || crc=$?
     if [ "$crc" -eq 1 ]; then
-      # only a line that is not a bannable address is discarded; a failing classifier says nothing about the line, which stays
+      # only a line that is not a bannable address or network is discarded; a failing classifier says nothing about the line, which stays
       removal_drop "$ip" || rc=1
       continue
     elif [ "$crc" -ne 0 ]; then
@@ -630,10 +1126,10 @@ reconcile_removals() {
       rc=1
       continue
     fi
-    if removal_apply "$IP" "$FAM"; then
-      echo "ovpn-ban: completed the pending removal of $IP" >&2
+    if removal_apply "$ENTRY" "$FAM"; then
+      echo "ovpn-ban: completed the pending removal of $ENTRY" >&2
     else
-      echo "ovpn-ban: WARNING: the pending removal of $IP is not complete yet" >&2
+      echo "ovpn-ban: WARNING: the pending removal of $ENTRY is not complete yet" >&2
       rc=1
     fi
   done 3<<< "$data"
@@ -644,33 +1140,66 @@ reconcile_removals() {
   return "$rc"
 }
 
-# txn_unban IP FAMILY FORCE: under the lock. A permanent address (history flag, or a row without expiry) is kept unless FORCE=1.
-# FORCE=1 records the removal in the journal first (the commit point), then applies it (removal_apply): from there on it always ends in
-# "unbanned", even when a step fails (an unreadable history or ban list included) and the caller is told so: the journal line stays and the
-# removal is repeated by the next operation, never reversed. Success is only reported after absence is verified. Without FORCE the
-# permanence decision needs the history and the ban list: when one cannot be read the state is unknown and the unban fails (nothing changed).
+# txn_unban TARGET DEFAULT_ENTRY FORCE: under the lock. TARGET is what the caller named (an address, or a network as the ban list writes it).
+# The entry that is removed is the one the ban list holds for it (pylib state_find: the row whose network contains TARGET), so an unban
+# removes exactly the rule that was added, with the prefix it was added with; without a row it is DEFAULT_ENTRY (what a ban would add now).
+# A permanent entry (history row without end, or a row without expiry) is kept unless FORCE=1. A temporary one is lifted only when its
+# expires_at has passed: fail2ban unbans at its own bantime, which is the first escalation step and ends before a longer ban does (the
+# periodic "expire" lifts those when they run out). FORCE=1 records the removal in the journal first (the commit point), then applies it
+# (removal_apply): from there on it always ends in "unbanned", even when a step fails (an unreadable history or ban list included) and the
+# caller is told so: the journal line stays and the removal is repeated by the next operation, never reversed. Success is only reported
+# after absence is verified. Without FORCE the permanence decision needs the history and the ban list: when one cannot be read the state is
+# unknown and the unban fails (nothing changed).
 txn_unban() {
-  local ip="$1" fam="$2" force="$3" line perm=0 rk
+  local target="$1" def="$2" force="$3" entry found fam rc perm=0 rk row now had=0 exp
   reconcile_removals || echo "ovpn-ban: WARNING: a pending removal could not be completed yet" >&2
+  found="$(pylib state_find "$STATE" "$target")" || { echo "ovpn-ban: cannot read the ban list $STATE: unban of $target not done" >&2; return 1; }
+  entry="${found:-$def}"
+  fam="$(fam_of "$entry")"
+  fw_has "$fam" "$entry"; rc=$?
+  [ "$rc" -eq 1 ] || had=1
+  rk="$(row_kind "$entry")" || {
+    [ "$force" = "1" ] || { echo "ovpn-ban: cannot read the ban list $STATE: unban of $entry not done" >&2; return 1; }
+    rk="unknown"   # a forced removal goes on: the journal repeats it until the ban list can be read
+  }
+  [ "$rk" != "none" ] && had=1
   if [ "$force" = "1" ]; then
-    removal_add "$ip" || { echo "ovpn-ban: cannot record the removal of $ip: nothing was changed" >&2; return 1; }
-    removal_apply "$ip" "$fam" || { echo "ovpn-ban: removal of $ip is recorded but not complete: the next ban engine operation finishes it, it is not restored" >&2; return 1; }
+    pylib has "$HISTORY" "$entry" && had=1
+    removal_add "$entry" || { echo "ovpn-ban: cannot record the removal of $entry: nothing was changed" >&2; return 1; }
+    removal_apply "$entry" "$fam" || { echo "ovpn-ban: removal of $entry is recorded but not complete: the next ban engine operation finishes it, it is not restored" >&2; return 1; }
+    entry_parts "$entry"
+    ban_event unban "$E_ADDR" "$E_PFX" "manual-unban" 0 0
+    [ "$had" -eq 1 ] && queue_notify unban "$entry"
     return 0
   fi
-  line="$(hist_line "$ip")" || { echo "ovpn-ban: cannot read the ban history $HISTORY: unban of $ip not done" >&2; return 1; }
-  if [ -n "$line" ]; then
-    IFS=$'\t' read -r _ _ _ _ perm _ <<< "$line" || { echo "ovpn-ban: cannot parse the history row of $ip: unban of $ip not done" >&2; return 1; }
-  fi
-  if [ "$perm" != "1" ]; then
-    rk="$(row_kind "$ip")" || { echo "ovpn-ban: cannot read the ban list $STATE: unban of $ip not done" >&2; return 1; }
-    [ "$rk" = "perm" ] && perm=1
-  fi
+  rc=0
+  pylib is_perm "$HISTORY" "$entry" || rc=$?
+  case "$rc" in
+    0) perm=1 ;;
+    1) ;;
+    *) echo "ovpn-ban: cannot read the ban history $HISTORY: unban of $entry not done" >&2; return 1 ;;
+  esac
+  [ "$rk" = "perm" ] && perm=1
   if [ "$perm" = "1" ]; then
-    echo "ovpn-ban: $ip is permanently banned, unban ignored (use unban $ip --force)" >&2
+    echo "ovpn-ban: $entry is permanently banned, unban ignored (use unban $entry --force)" >&2
     return 0
   fi
-  fw_remove "$fam" "$ip" || return 1
-  publish "$STATE" rows_without "$ip" || return 1
+  now="$(date +%s)"
+  row="$(read_rows "$STATE" line "$entry")" || { echo "ovpn-ban: cannot read the ban list $STATE: unban of $entry not done" >&2; return 1; }
+  if [ -n "$row" ]; then
+    IFS=$'\t' read -r _ _ exp _ <<< "$row"
+    if [[ "$exp" =~ ^[0-9]{1,12}$ ]] && [ "$exp" -gt "$now" ]; then
+      echo "ovpn-ban: $entry is banned for $((exp - now)) more seconds, unban ignored (the ban ends on its own; use unban $entry --force)" >&2
+      return 0
+    fi
+  fi
+  fw_remove "$fam" "$entry" || return 1
+  publish "$STATE" rows_without "$entry" || return 1
+  if [ "$had" -eq 1 ]; then
+    entry_parts "$entry"
+    ban_event unban "$E_ADDR" "$E_PFX" "expired" 0 0
+    queue_notify unban "$entry"
+  fi
   return 0
 }
 
@@ -693,48 +1222,72 @@ txn_flush() {
   return "$rc"
 }
 
-# init: DROP rules and ban list are cleared, the ban history stays; the start time is recorded for the restart rule of txn_ban
+# migrate_legacy: the per-address history of the earlier releases (ban-history.tsv: one row per address with a counter and a permanent flag)
+# becomes offence rows in bans-history.tsv, once: only while the new file does not exist yet. A permanent address stays permanent. The old
+# file is renamed to ban-history.tsv.migrated, never deleted. The caller holds the lock.
+migrate_legacy() {
+  local lst=0 nst=0 mig="${OVPN_BAN_BANTIME:-3600}"
+  [ "$HISTORY" != "$LEGACY_HISTORY" ] || return 0
+  file_state "$HISTORY" || nst=$?
+  [ "$nst" -eq 1 ] || return 0
+  file_state "$LEGACY_HISTORY" || lst=$?
+  [ "$lst" -eq 0 ] || return 0
+  [[ "$mig" =~ ^[1-9][0-9]{0,8}$ ]] || mig=3600
+  publish "$HISTORY" pylib migrate "$LEGACY_HISTORY" "$mig" || { echo "ovpn-ban: WARNING: cannot migrate the ban history $LEGACY_HISTORY to $HISTORY" >&2; return 1; }
+  mv -f "$LEGACY_HISTORY" "${LEGACY_HISTORY}.migrated" 2>/dev/null || true
+  echo "ovpn-ban: migrated the ban history $LEGACY_HISTORY to $HISTORY (the old file is kept as ${LEGACY_HISTORY}.migrated)" >&2
+}
+
+# prune_history: drop the offences older than OVPN_BAN_DECAY_DAYS (a permanent entry never decays). Only an existing file is rewritten.
+# The caller holds the lock.
+prune_history() {
+  local st=0
+  file_state "$HISTORY" || st=$?
+  [ "$st" -eq 0 ] || return 0
+  publish "$HISTORY" pylib prune "$HISTORY" "$(date +%s)" "$DECAY_SECONDS"
+}
+
+# txn_housekeeping: migration of an old history, pruning of the decayed offences (the caller holds the lock). Failures are warnings only.
+txn_housekeeping() {
+  migrate_legacy || true
+  prune_history || echo "ovpn-ban: WARNING: cannot prune the ban history $HISTORY" >&2
+  return 0
+}
+
+# init: DROP rules and ban list are cleared, the ban history stays (decayed offences are pruned, an old history is migrated); the start
+# time is recorded for the restart rule of the ban decision
 cmd_init() {
   mkdir -p "$(dirname "$STATE")" || die "cannot create $(dirname "$STATE")"
   with_state_lock txn_flush || die "cannot empty the ban chains and reset $STATE"
+  with_state_lock txn_housekeeping || true
   date +%s | write_file "$BOOT_FILE" || die "cannot write $BOOT_FILE"
 }
 
-# perm_entries: one line "IP FAM" per permanent entry of the history that is to be enforced now. Not listed: addresses with a pending
-# removal, entries that are not a bannable address (warning), IPv6 entries with IPv6 off (the intentional opt-out, warning).
+# perm_entries: one line "ENTRY FAM" per permanent entry of the history that is to be enforced now (ENTRY: the address, or the network
+# with the prefix it was banned with). Not listed: entries with a pending removal, IPv6 entries with IPv6 off (the intentional opt-out, warning).
 # Returns 2, listing nothing trustworthy, when the history or the removal journal exists but cannot be read: a failed enumeration is an error,
 # never "no permanent entries". A history file that does not exist (first start) has no entries and is a success.
 perm_entries() {
-  local line ip n first last perm reason fails data jr crc seen=0 want
-  data="$(read_all "$HISTORY")" || { echo "ovpn-ban: ERROR: cannot read the ban history $HISTORY" >&2; return 2; }
+  local line entry fam t reason data jr seen=0 want
+  data="$(pylib perm "$HISTORY")" || { echo "ovpn-ban: ERROR: cannot read the ban history $HISTORY" >&2; return 2; }
   [ -n "$data" ] || return 0
   nlines "$data"; want="$NLINES"
   while IFS= read -r line || [ -n "$line" ]; do
     seen=$((seen + 1))
     [ -n "$line" ] || continue
-    IFS=$'\t' read -r ip n first last perm reason fails <<< "$line" || { echo "ovpn-ban: ERROR: cannot parse a row of the ban history $HISTORY" >&2; return 2; }
-    [ "$perm" = "1" ] || continue
-    crc=0
-    classify_ip "$ip" || crc=$?
-    if [ "$crc" -eq 1 ]; then
-      echo "ovpn-ban: WARNING: permanent entry skipped, not a bannable address: $ip" >&2
-      continue
-    elif [ "$crc" -ne 0 ]; then
-      echo "ovpn-ban: ERROR: cannot classify the permanent entry $ip: the address classifier failed" >&2
-      return 2
-    fi
+    IFS=$'\t' read -r entry fam t reason <<< "$line" || { echo "ovpn-ban: ERROR: cannot parse a row of the ban history $HISTORY" >&2; return 2; }
     jr=0
-    removal_has "$IP" || jr=$?
+    removal_has "$entry" || jr=$?
     case "$jr" in
       0) continue ;;
       1) ;;
       *) echo "ovpn-ban: ERROR: cannot read the removal journal $REMOVALS" >&2; return 2 ;;
     esac
-    if [ "$FAM" = "6" ] && [ "$V6" != "true" ]; then
-      echo "ovpn-ban: WARNING: permanent ban of $IP NOT restored: IPv6 is not enabled" >&2
+    if [ "$fam" = "6" ] && [ "$V6" != "true" ]; then
+      echo "ovpn-ban: WARNING: permanent ban of $entry NOT restored: IPv6 is not enabled" >&2
       continue
     fi
-    echo "$IP $FAM"
+    echo "$entry $fam"
   done <<< "$data"
   if [ "$seen" -ne "$want" ]; then
     echo "ovpn-ban: ERROR: the history snapshot was not consumed completely ($seen of $want rows): the permanent bans are unknown" >&2
@@ -751,11 +1304,11 @@ fail_status() {
 
 # restore_permanent: DROP rule and row (expires_at=0) for every permanent entry of the history, under the lock. A failing entry never
 # stops the others, but any failure of an enforced family is returned (see fail_status). Skipped, not failed: IPv6 entries when IPv6 is off
-# or, with OVPN_BAN_IPV6_REQUIRED=false, when the IPv6 chain cannot be created (the intentional opt-outs), entries that are not an address.
+# or, with OVPN_BAN_IPV6_REQUIRED=false, when the IPv6 chain cannot be created (the intentional opt-outs).
 restore_permanent() {
-  local line ip n first last perm reason fails fam chain count=0 skipped=0 failed=0 req6=0 other=0 rc data jr jst=0 crc seen=0 want
+  local line entry fam t reason chain count=0 skipped=0 failed=0 req6=0 other=0 rc data jr jst=0 seen=0 want
   # the whole history is read, and the journal checked, BEFORE anything is restored: an unreadable file is an error (status 1), not an empty history
-  data="$(read_all "$HISTORY")" || { echo "ovpn-ban: ERROR: cannot read the ban history $HISTORY: the permanent bans are unknown, nothing restored" >&2; return 1; }
+  data="$(pylib perm "$HISTORY")" || { echo "ovpn-ban: ERROR: cannot read the ban history $HISTORY: the permanent bans are unknown, nothing restored" >&2; return 1; }
   file_state "$REMOVALS" || jst=$?
   [ "$jst" -ne 2 ] || { echo "ovpn-ban: ERROR: cannot read the removal journal $REMOVALS: nothing restored" >&2; return 1; }
   [ -n "$data" ] || return 0
@@ -763,67 +1316,53 @@ restore_permanent() {
   while IFS= read -r line || [ -n "$line" ]; do
     seen=$((seen + 1))
     [ -n "$line" ] || continue
-    if ! IFS=$'\t' read -r ip n first last perm reason fails <<< "$line"; then
+    if ! IFS=$'\t' read -r entry fam t reason <<< "$line"; then
       echo "ovpn-ban: ERROR: cannot parse a row of the ban history $HISTORY" >&2
       failed=$((failed + 1)); other=$((other + 1))
       continue
     fi
-    [ "$perm" = "1" ] || continue
-    crc=0
-    classify_ip "$ip" || crc=$?
-    if [ "$crc" -eq 1 ]; then
-      echo "ovpn-ban: WARNING: permanent entry skipped, not a bannable address: $ip" >&2
-      skipped=$((skipped + 1))
-      continue
-    elif [ "$crc" -ne 0 ]; then
-      echo "ovpn-ban: ERROR: permanent entry $ip NOT restored: the address classifier failed" >&2
-      failed=$((failed + 1)); other=$((other + 1))
-      continue
-    fi
     jr=0
-    removal_has "$IP" || jr=$?
+    removal_has "$entry" || jr=$?
     if [ "$jr" -eq 0 ]; then
-      echo "ovpn-ban: WARNING: permanent entry of $IP skipped, its removal is pending" >&2
+      echo "ovpn-ban: WARNING: permanent entry of $entry skipped, its removal is pending" >&2
       skipped=$((skipped + 1))
       continue
     elif [ "$jr" -ne 1 ]; then
-      echo "ovpn-ban: ERROR: cannot read the removal journal $REMOVALS: $IP not restored" >&2
+      echo "ovpn-ban: ERROR: cannot read the removal journal $REMOVALS: $entry not restored" >&2
       failed=$((failed + 1)); other=$((other + 1))
       continue
     fi
-    fam="$FAM"
     chain="$(chain_of "$fam")"
     if [ "$fam" = "6" ] && [ "$V6" != "true" ]; then
-      echo "ovpn-ban: WARNING: permanent ban of $IP NOT restored: IPv6 is not enabled" >&2
+      echo "ovpn-ban: WARNING: permanent ban of $entry NOT restored: IPv6 is not enabled" >&2
       skipped=$((skipped + 1))
       continue
     fi
     if ! ensure_chain "$fam"; then
       if [ "$fam" = "6" ] && [ "$V6_REQUIRED" != "true" ]; then
-        echo "ovpn-ban: WARNING: permanent ban of $IP NOT restored: chain $chain is not available (OVPN_BAN_IPV6_REQUIRED=false)" >&2
+        echo "ovpn-ban: WARNING: permanent ban of $entry NOT restored: chain $chain is not available (OVPN_BAN_IPV6_REQUIRED=false)" >&2
         skipped=$((skipped + 1))
       else
-        echo "ovpn-ban: ERROR: permanent ban of $IP NOT restored: chain $chain is not available" >&2
+        echo "ovpn-ban: ERROR: permanent ban of $entry NOT restored: chain $chain is not available" >&2
         failed=$((failed + 1)); if [ "$fam" = "6" ]; then req6=$((req6 + 1)); else other=$((other + 1)); fi
       fi
       continue
     fi
-    fw_has "$fam" "$IP"; rc=$?
+    fw_has "$fam" "$entry"; rc=$?
     if [ "$rc" -eq 1 ]; then
-      ipt "$fam" -A "$chain" -s "$IP" -j DROP || rc=2
+      ipt "$fam" -A "$chain" -s "$entry" -j DROP || rc=2
     elif [ "$rc" -ne 0 ]; then
       rc=2
     fi
     if [ "$rc" -eq 2 ]; then
-      echo "ovpn-ban: ERROR: cannot restore the DROP rule of $IP" >&2
+      echo "ovpn-ban: ERROR: cannot restore the DROP rule of $entry" >&2
       failed=$((failed + 1)); if [ "$fam" = "6" ] && [ "$V6_REQUIRED" = "true" ]; then req6=$((req6 + 1)); else other=$((other + 1)); fi
       continue
     fi
-    [[ "$last" =~ ^[1-9][0-9]{0,11}$ ]] || last="$(date +%s)"
-    [[ "$fails" =~ ^[0-9]{1,10}$ ]] || fails=0
+    [[ "$t" =~ ^[1-9][0-9]{0,11}$ ]] || t="$(date +%s)"
     [ -n "$reason" ] || reason="restored"
-    if ! ban_row "$IP" "$fails" "$reason" "$last" 0; then
-      echo "ovpn-ban: ERROR: cannot restore the row of $IP" >&2
+    if ! ban_row "$entry" 0 "$reason" "$t" 0; then
+      echo "ovpn-ban: ERROR: cannot restore the row of $entry" >&2
       failed=$((failed + 1)); if [ "$fam" = "6" ] && [ "$V6_REQUIRED" = "true" ]; then req6=$((req6 + 1)); else other=$((other + 1)); fi
       continue
     fi
@@ -838,9 +1377,11 @@ restore_permanent() {
   fail_status "$req6" "$other"
 }
 
-# txn_restore: complete pending removals, then restore; the status of restore_permanent, or 1 when a removal cannot be completed
+# txn_restore: migrate an old history, complete pending removals, then restore; the status of restore_permanent, or 1 when a removal cannot
+# be completed
 txn_restore() {
   local rc=0 r=0
+  txn_housekeeping
   reconcile_removals || r=1
   restore_permanent || rc=$?
   if [ "$rc" -eq 0 ] && [ "$r" -ne 0 ]; then rc=1; fi
@@ -941,51 +1482,110 @@ cmd_check() {
   echo "$msg"
 }
 
-# do_ban IP FAILURES REASON MODE: the common part of ban and ban-manual (IP already classified: FAM and IP are set).
-# Firewall check/add and the history/ban list decision are one critical section (txn_ban_fw); the notification follows the unlock.
+# do_ban ADDRESS ENTRY FAMILY PREFIX FAILURES REASON MODE MANUAL_SECONDS FORCED: the common part of ban and ban-manual (the address is already
+# classified). Firewall check/add and the history/ban list decision are one critical section (txn_ban_fw); the event line is written after
+# it and the Telegram message follows the unlock.
 do_ban() {
-  local ip="$1" fails="$2" reason="$3" mode="$4" out perm newperm expires added
+  local addr="$1" entry="$2" fam="$3" pfx="$4" fails="$5" reason="$6" mode="$7" msec="$8" forced="$9"
+  local out off sec expires added append
   need_listener
-  out="$(with_state_lock txn_ban_fw "$ip" "$fails" "$reason" "$mode" "$FAM")" || die "ban of $ip not completed"
-  read -r perm newperm expires added <<< "$out"
-  [[ "$expires" =~ ^[0-9]{1,12}$ ]] && [[ "$added" =~ ^[01]$ ]] || die "internal error: unexpected result of the ban transaction"
-  # a new ban (the address had no DROP rule) or a ban that just became permanent is announced once; an address that already had its
-  # DROP rule and stays what it was is not announced again. The ban is complete at this point.
-  if [ "$added" -eq 1 ] || [ "$newperm" = "1" ]; then
-    notify_ban "$ip" "$fails" "$reason" "$expires"
+  out="$(with_state_lock txn_ban_fw "$addr" "$entry" "$fam" "$pfx" "$fails" "$reason" "$mode" "$msec")" || { flush_notify; die "ban of $entry not completed"; }
+  read -r off sec expires added append <<< "$out"
+  if ! [[ "$off" =~ ^[0-9]{1,10}$ && "$sec" =~ ^[0-9]{1,10}$ && "$expires" =~ ^[0-9]{1,12}$ && "$added" =~ ^[01]$ && "$append" =~ ^[01]$ ]]; then
+    flush_notify
+    die "internal error: unexpected result of the ban transaction"
   fi
-  if [ "$perm" = "1" ]; then echo "ovpn-ban: $ip banned permanently" >&2; fi
+  # a new ban (the entry had no DROP rule) or a new offence is recorded once; the same ban that is only re-applied is not recorded again.
+  # The ban is complete at this point.
+  if [ "$added" -eq 1 ] || [ "$append" -eq 1 ]; then ban_event ban "$addr" "$pfx" "$reason" "$off" "$sec" "$forced"; fi
+  flush_notify
+  if [ "$sec" -eq 0 ]; then
+    echo "ovpn-ban: $entry banned permanently (offence $off)" >&2
+  else
+    echo "ovpn-ban: $entry banned for $sec seconds (offence $off)" >&2
+  fi
   return 0
 }
 
 cmd_ban() {
   [ "$#" -eq 2 ] || die "usage: ban IP FAILURES"
-  classify_or_die "refusing to ban: not a public-routable IPv4 or IPv6 address" "$1"
+  classify_or_die "refusing to ban: not a public-routable IPv4 or IPv6 address" "$1" auto
   valid_posint "$2" || die "FAILURES must be a positive integer: $2"
-  do_ban "$IP" "$2" "$(reason_for "$IP")" auto
+  do_ban "$IP" "$ENTRY" "$FAM" "$PFX" "$2" "$(reason_for "$IP")" auto 0 0
 }
 
-# ban-manual IP [REASON]: permanent at once. REASON: [A-Za-z0-9 ._:-]{0,120}; the history and the notification carry "manual" or "manual: REASON"
+# ban-manual [--force] [--minutes N] IP [REASON]: an operator ban. Permanent unless --minutes (1..525600). The address is refused (status 4,
+# a refusal event, no change) when it is a loopback address, on the ignore list, inside the VPN client network or a private range, unless
+# --force. REASON: [A-Za-z0-9 ._:-]{0,120}; the history and the ban list carry "manual" or "manual: REASON" (the Telegram message only "manual")
 cmd_ban_manual() {
-  [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die "usage: ban-manual IP [REASON]"
-  local note="${2:-}"
-  classify_or_die "refusing to ban: not a public-routable IPv4 or IPv6 address" "$1"
+  local force=0 minutes="" minutes_set=0 note="" why rc=0 msec=0 forced=0 reason
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      --minutes) [ "$#" -ge 2 ] || die "usage: ban-manual [--force] [--minutes N] IP [REASON]"; minutes="$2"; minutes_set=1; shift 2 ;;
+      --) shift; break ;;
+      --*) die "usage: ban-manual [--force] [--minutes N] IP [REASON]" ;;
+      *) break ;;
+    esac
+  done
+  [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die "usage: ban-manual [--force] [--minutes N] IP [REASON]"
+  note="${2:-}"
+  classify_or_die "refusing to ban: not a public-routable IPv4 or IPv6 address" "$1" manual
   [[ "$note" =~ ^[A-Za-z0-9\ ._:-]{0,120}$ ]] || die "REASON must match [A-Za-z0-9 ._:-]{0,120}"
   note="${note#"${note%%[! ]*}"}"
   note="${note%"${note##*[! ]}"}"
-  if [ -n "$note" ]; then do_ban "$IP" 0 "manual: $note" manual; else do_ban "$IP" 0 "manual" manual; fi
+  if [ "$minutes_set" -eq 1 ]; then
+    [[ "$minutes" =~ ^[0-9]{1,7}$ ]] && [ "$((10#$minutes))" -ge "$MIN_MANUAL_MINUTES" ] && [ "$((10#$minutes))" -le "$MAX_MANUAL_MINUTES" ] \
+      || die "minutes must be a whole number from $MIN_MANUAL_MINUTES to $MAX_MANUAL_MINUTES: $minutes"
+    msec=$((10#$minutes * 60))
+  fi
+  why="$(pylib guard "$ENTRY" 2>/dev/null)" || rc=$?
+  case "$rc" in
+    0) ;;
+    5)
+      if [ "$force" -eq 1 ]; then
+        forced=1
+      else
+        echo "ovpn-ban: refused: $why (force=true overrides)" >&2
+        ban_event refuse "$IP" "$PFX" "$why" 0 0
+        exit 4
+      fi ;;
+    *) die "cannot check the address $1: the address classifier (python3) failed" ;;
+  esac
+  reason="manual"
+  [ -n "$note" ] && reason="manual: $note"
+  do_ban "$IP" "$ENTRY" "$FAM" "$PFX" 0 "$reason" manual "$msec" "$forced"
 }
 
-# unban IP [--force]: see the header. A permanent address needs --force.
+# unban IP|NETWORK [--force]: see the header. A permanent address needs --force.
 cmd_unban() {
-  local force=0
+  local force=0 target def
   [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die "usage: unban IP [--force]"
   if [ "$#" -eq 2 ]; then
     [ "$2" = "--force" ] || die "usage: unban IP [--force]"
     force=1
   fi
-  classify_or_die "not a valid IPv4 or IPv6 address" "$1"
-  with_state_lock txn_unban "$IP" "$FAM" "$force"
+  classify_or_die "not a valid IPv4 or IPv6 address" "$1" target
+  target="$ENTRY"
+  def="$ENTRY"
+  # a bare address without a row is looked up under the entry a ban would add now (its prefix)
+  case "$1" in */*) ;; *) classify_ip "$1" manual && def="$ENTRY" ;; esac
+  with_state_lock txn_unban "$target" "$def" "$force" || { flush_notify; return 1; }
+  flush_notify
+}
+
+# expire: lift every temporary ban whose time has passed (also done at every ban, unban and by the watcher of ovpn-ban-control)
+cmd_expire() {
+  local rc=0
+  with_state_lock txn_expire "$(date +%s)" || rc=$?
+  flush_notify
+  return "$rc"
+}
+
+# jail-bantime: the ban time of the fail2ban jail, the first step of the escalation in seconds (-1 = permanent). fail2ban only schedules
+# its own unban with it; the length of a ban is decided here and enforced by "expire"
+cmd_jail_bantime() {
+  if [ "${STEPS[0]}" -eq 0 ]; then echo -1; else echo "${STEPS[0]}"; fi
 }
 
 cmd_flush() {
@@ -1018,7 +1618,9 @@ case "$action" in
   ban) cmd_ban "$@" ;;
   ban-manual) cmd_ban_manual "$@" ;;
   unban) cmd_unban "$@" ;;
+  expire) [ "$#" -eq 0 ] || die "usage: expire"; cmd_expire ;;
+  jail-bantime) [ "$#" -eq 0 ] || die "usage: jail-bantime"; cmd_jail_bantime ;;
   flush) [ "$#" -eq 0 ] || die "usage: flush"; cmd_flush ;;
   teardown) [ "$#" -eq 0 ] || die "usage: teardown"; cmd_teardown ;;
-  *) die "usage: $0 init | setup | check | ban IP FAILURES | ban-manual IP [REASON] | unban IP [--force] | flush | teardown" ;;
+  *) die "usage: $0 init | setup | check | ban IP FAILURES | ban-manual [--force] [--minutes N] IP [REASON] | unban IP [--force] | expire | jail-bantime | flush | teardown" ;;
 esac

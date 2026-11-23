@@ -21,9 +21,20 @@ BAN_ENABLED="${OVPN_BAN_ENABLED:-true}"
 BAN_REQUIRED="${OVPN_BAN_REQUIRED:-true}"
 BAN_MAXRETRY="${OVPN_BAN_MAXRETRY:-3}"
 BAN_FINDTIME="${OVPN_BAN_FINDTIME:-600}"
-BAN_BANTIME="${OVPN_BAN_BANTIME:-3600}"
-# the Nth ban of the same address is permanent (never expires; kept across restarts in ban-history.tsv); 1 = every ban is permanent
-BAN_REPEAT_COUNT="${OVPN_BAN_REPEAT_COUNT:-2}"
+BAN_BANTIME="${OVPN_BAN_BANTIME:-}"
+# Ban length: OVPN_BAN_ESCALATION, comma separated steps by offence number (10m, 1h, 24h, then 0 = permanent; whole number with an
+# optional unit s, m, h or d). OVPN_BAN_BANTIME and OVPN_BAN_REPEAT_COUNT (the earlier single-duration policy: BANTIME seconds, the Nth
+# ban permanent) are still accepted: only when OVPN_BAN_ESCALATION is empty and either is set. ovpn-ban.sh decides and validates the list.
+BAN_ESCALATION="${OVPN_BAN_ESCALATION:-}"
+# the Nth ban of the same address is permanent (never expires; kept across restarts in bans-history.tsv); 1 = every ban is permanent
+BAN_REPEAT_COUNT="${OVPN_BAN_REPEAT_COUNT:-}"
+# days without an offence after which the offence count of an address starts again; IPv6 bans cover the prefix of this length (48..128);
+# at most this many active bans (the oldest temporary ban is dropped when the list is full; a permanent ban never is)
+BAN_DECAY_DAYS="${OVPN_BAN_DECAY_DAYS:-30}"
+BAN_IPV6_PREFIX="${OVPN_BAN_IPV6_PREFIX:-64}"
+BAN_MAX_ENTRIES="${OVPN_BAN_MAX_ENTRIES:-500}"
+# the Telegram ban message carries no address and no user name unless this is true
+TG_INCLUDE_ADDRESS="${OVPN_TELEGRAM_INCLUDE_ADDRESS:-false}"
 # The enforced port and transport are derived below from OVPN_SERVER_PORT and OVPN_PROTO, the values of the openvpn command
 # line. OVPN_BAN_PORT is only an optional assertion: when set it must equal the derived listener port or the container stops.
 BAN_PORT_ASSERT="${OVPN_BAN_PORT:-}"
@@ -37,18 +48,22 @@ LOG_KEEP="${OVPN_LOG_KEEP:-3}"
 LOG_ROTATE_INTERVAL="${OVPN_LOG_ROTATE_INTERVAL:-60}"
 # hosts and networks that are never banned: loopback and the Docker bridge subnet of the compose files, nothing else by default
 BAN_IGNOREIP="${OVPN_BAN_IGNOREIP:-127.0.0.0/8 ::1 172.20.0.0/24}"
-for ban_bool in OVPN_BAN_ENABLED:"${BAN_ENABLED}" OVPN_BAN_REQUIRED:"${BAN_REQUIRED}" OVPN_BAN_IPV6_REQUIRED:"${BAN_IPV6_REQUIRED}"; do
+for ban_bool in OVPN_BAN_ENABLED:"${BAN_ENABLED}" OVPN_BAN_REQUIRED:"${BAN_REQUIRED}" OVPN_BAN_IPV6_REQUIRED:"${BAN_IPV6_REQUIRED}" OVPN_TELEGRAM_INCLUDE_ADDRESS:"${TG_INCLUDE_ADDRESS}"; do
   if [ "${ban_bool#*:}" != "true" ] && [ "${ban_bool#*:}" != "false" ]; then
     echo "ERROR: ${ban_bool%%:*} must be true or false, got \"${ban_bool#*:}\"" >&2
     exit 1
   fi
 done
-for ban_num in OVPN_BAN_MAXRETRY:"${BAN_MAXRETRY}" OVPN_BAN_FINDTIME:"${BAN_FINDTIME}" OVPN_BAN_BANTIME:"${BAN_BANTIME}" OVPN_BAN_REPEAT_COUNT:"${BAN_REPEAT_COUNT}" OVPN_LOG_MAX_BYTES:"${LOG_MAX_BYTES}" OVPN_LOG_KEEP:"${LOG_KEEP}" OVPN_LOG_ROTATE_INTERVAL:"${LOG_ROTATE_INTERVAL}"; do
+for ban_num in OVPN_BAN_MAXRETRY:"${BAN_MAXRETRY}" OVPN_BAN_FINDTIME:"${BAN_FINDTIME}" OVPN_BAN_BANTIME:"${BAN_BANTIME:-3600}" OVPN_BAN_REPEAT_COUNT:"${BAN_REPEAT_COUNT:-2}" OVPN_BAN_DECAY_DAYS:"${BAN_DECAY_DAYS}" OVPN_BAN_MAX_ENTRIES:"${BAN_MAX_ENTRIES}" OVPN_LOG_MAX_BYTES:"${LOG_MAX_BYTES}" OVPN_LOG_KEEP:"${LOG_KEEP}" OVPN_LOG_ROTATE_INTERVAL:"${LOG_ROTATE_INTERVAL}"; do
   if ! [[ "${ban_num#*:}" =~ ^[1-9][0-9]{0,9}$ ]]; then
     echo "ERROR: ${ban_num%%:*} must be a positive integer, got \"${ban_num#*:}\"" >&2
     exit 1
   fi
 done
+if ! [[ "${BAN_IPV6_PREFIX}" =~ ^[0-9]{2,3}$ ]] || [ "${BAN_IPV6_PREFIX}" -lt 48 ] || [ "${BAN_IPV6_PREFIX}" -gt 128 ]; then
+  echo "ERROR: OVPN_BAN_IPV6_PREFIX must be a whole number from 48 to 128, got \"${BAN_IPV6_PREFIX}\"" >&2
+  exit 1
+fi
 if [ "${LOG_KEEP}" -gt 99 ]; then
   echo "ERROR: OVPN_LOG_KEEP must be 1 to 99, got \"${LOG_KEEP}\"" >&2
   exit 1
@@ -366,10 +381,13 @@ chown nobody:nogroup "${OPENVPN_LOG}"
 chmod 600 "${OPENVPN_LOG}"
 tail -n 0 -F "${OPENVPN_LOG}" &
 
-# ban list and enforcement, see ovpn-ban.sh (installed fresh at every start). The ban history (ban-history.tsv, same directory) keeps
-# the ban counts and the permanent bans across restarts; "init" below leaves it alone and "setup" restores the permanent bans.
+# ban list and enforcement, see ovpn-ban.sh (installed fresh at every start). The ban history (bans-history.tsv, same directory) keeps
+# the offences and the permanent bans across restarts; "init" below leaves it alone and "setup" restores the permanent bans.
 BAN_STATE_FILE="${AUDIT_LOG_DIR}/bans.tsv"
-export OVPN_BAN_STATE="${BAN_STATE_FILE}" OVPN_BAN_LOG="${OPENVPN_LOG}" OVPN_BAN_BANTIME="${BAN_BANTIME}" OVPN_BAN_REPEAT_COUNT="${BAN_REPEAT_COUNT}" OVPN_IPTABLES_BIN="${IPTABLES_BIN}" OVPN_IP6TABLES_BIN="${IP6TABLES_BIN}"
+export OVPN_BAN_STATE="${BAN_STATE_FILE}" OVPN_BAN_LOG="${OPENVPN_LOG}" OVPN_BAN_ESCALATION="${BAN_ESCALATION}" OVPN_BAN_BANTIME="${BAN_BANTIME}" OVPN_BAN_REPEAT_COUNT="${BAN_REPEAT_COUNT}" OVPN_IPTABLES_BIN="${IPTABLES_BIN}" OVPN_IP6TABLES_BIN="${IP6TABLES_BIN}"
+export OVPN_BAN_DECAY_DAYS="${BAN_DECAY_DAYS}" OVPN_BAN_IPV6_PREFIX="${BAN_IPV6_PREFIX}" OVPN_BAN_MAX_ENTRIES="${BAN_MAX_ENTRIES}" OVPN_TELEGRAM_INCLUDE_ADDRESS="${TG_INCLUDE_ADDRESS}"
+# the manual ban guard refuses these unless the request carries force: the ignore list and the VPN client networks
+export OVPN_BAN_IGNOREIP="${BAN_IGNOREIP}" OVPN_BAN_OWN_NETS="${OVPN_SRV_NET}/${OVPN_SRV_MASK} ${OVPN_SRV_NET6}"
 # the enforced scope, derived above from the same variables as the openvpn command line (never taken from OVPN_BAN_PORT)
 export OVPN_BAN_NOTIFY_LOG="${FAIL2BAN_LOG}"
 export OVPN_BAN_PORT="${BAN_PORT}" OVPN_BAN_PROTOS="${BAN_PROTOS}" OVPN_BAN_IPV6="${BAN_IPV6}" OVPN_BAN_IPV6_REQUIRED="${BAN_IPV6_REQUIRED}" OVPN_LISTEN_PORT="${ADMIN_PORT}"
@@ -381,6 +399,9 @@ BAN_CONTROL_TOOL="/usr/local/sbin/ovpn-ban-control"
 BAN_CONTROL_DIR="${AUDIT_LOG_DIR}/control"
 install -D -m 0755 /etc/openvpn/setup/ovpn-ban-control.py "${BAN_CONTROL_TOOL}"
 export OVPN_BAN_TOOL="${BAN_TOOL}" OVPN_BAN_CONTROL_DIR="${BAN_CONTROL_DIR}"
+# the jail bantime is the first escalation step: fail2ban only schedules its own unban with it, the length of a ban is decided by
+# ovpn-ban.sh and enforced by its "expire" (also run every 30 s by the watcher); a bad OVPN_BAN_ESCALATION stops the container here
+BAN_JAIL_BANTIME="$("${BAN_TOOL}" jail-bantime)"
 # clear the ban list once, before fail2ban starts: a fresh network namespace has no bans, so no stale rows
 "${BAN_TOOL}" init
 
@@ -467,7 +488,7 @@ backend = polling
 logpath = ${OPENVPN_LOG}
 maxretry = ${BAN_MAXRETRY}
 findtime = ${BAN_FINDTIME}
-bantime = ${BAN_BANTIME}
+bantime = ${BAN_JAIL_BANTIME}
 ignoreip = ${BAN_IGNOREIP}
 usedns = no
 
@@ -516,7 +537,7 @@ if [ "${BAN_ENABLED}" = "true" ]; then
     fi
   fi
   if start_fail2ban && "${BAN_TOOL}" check; then
-    echo "fail2ban: jail ovpn-admin running (maxretry=${BAN_MAXRETRY} findtime=${BAN_FINDTIME}s bantime=${BAN_BANTIME}s repeat-count=${BAN_REPEAT_COUNT})"
+    echo "fail2ban: jail ovpn-admin running (maxretry=${BAN_MAXRETRY} findtime=${BAN_FINDTIME}s jail-bantime=${BAN_JAIL_BANTIME}s escalation=\"${BAN_ESCALATION:-default 10m,1h,24h,0}\" decay-days=${BAN_DECAY_DAYS} ipv6-prefix=/${BAN_IPV6_PREFIX} max-entries=${BAN_MAX_ENTRIES})"
     # after the jail start (its start action rebuilt the chains and restored the permanent bans), before OpenVPN
     start_ban_control || true
   else

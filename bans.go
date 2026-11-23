@@ -22,7 +22,9 @@ import (
 //
 //	ip  banned_at_unix  expires_at_unix  failures  reason
 //
-// expires_at_unix 0 marks a permanent ban: it never expires on its own and is removed only by a manual unban.
+// ip is an address, or for an IPv6 ban of a prefix the network with the prefix length it was banned with ("2001:db8:1:2::/64"; the
+// engine bans a whole /64 by default). expires_at_unix 0 marks a permanent ban: it never expires on its own and is removed only by a
+// manual unban.
 //
 // The file sits next to the audit log (--audit.path) and is replaced atomically by the writer.
 const (
@@ -65,15 +67,33 @@ func banListPath() string {
 	return filepath.Join(filepath.Dir(*auditPath), banFileName)
 }
 
+// parseBanSource parses the first column of a row: an address, or for an IPv6 ban of a prefix the network with the prefix length it was
+// banned with ("2001:db8:1:2::/64"). It returns the canonical text of it; the unban of a row names exactly that text.
+func parseBanSource(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if strings.Contains(s, "/") {
+		_, network, err := net.ParseCIDR(s)
+		if err != nil {
+			return "", fmt.Errorf("bad network %q", raw)
+		}
+		return network.String(), nil
+	}
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return "", fmt.Errorf("bad ip %q", raw)
+	}
+	return ip.String(), nil
+}
+
 // parseBanLine parses one row of the ban list. The reason is the last column and may be empty.
 func parseBanLine(line string) (banEntry, error) {
 	f := strings.SplitN(strings.TrimRight(line, "\r"), "\t", banFieldCount)
 	if len(f) != banFieldCount {
 		return banEntry{}, fmt.Errorf("want %d fields, got %d", banFieldCount, len(f))
 	}
-	ip := net.ParseIP(strings.TrimSpace(f[0]))
-	if ip == nil {
-		return banEntry{}, fmt.Errorf("bad ip %q", f[0])
+	ipText, err := parseBanSource(f[0])
+	if err != nil {
+		return banEntry{}, err
 	}
 	bannedAt, err := strconv.ParseInt(strings.TrimSpace(f[1]), 10, 64)
 	if err != nil || bannedAt <= 0 {
@@ -88,7 +108,7 @@ func parseBanLine(line string) (banEntry, error) {
 		return banEntry{}, fmt.Errorf("bad failures %q", f[3])
 	}
 	return banEntry{
-		IP:        ip.String(),
+		IP:        ipText,
 		BannedAt:  bannedAt,
 		ExpiresAt: expiresAt,
 		Failures:  failures,

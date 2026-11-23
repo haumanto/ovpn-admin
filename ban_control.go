@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -30,6 +32,8 @@ const (
 	banControlMaxBytes = 4096
 	banReasonMaxLen    = 120
 	banControlIDLen    = 16 // random bytes, 32 hex characters
+	banMinMinutes      = 1
+	banMaxMinutes      = 525600 // one year
 )
 
 // banControlWait is how long a request waits for the watcher; a variable so that tests can shorten it.
@@ -42,10 +46,12 @@ var (
 
 // banControlRequest is the JSON of a queue request.
 type banControlRequest struct {
-	ID     string `json:"id"`
-	Action string `json:"action"`
-	IP     string `json:"ip"`
-	Reason string `json:"reason"`
+	ID      string `json:"id"`
+	Action  string `json:"action"`
+	IP      string `json:"ip"`
+	Reason  string `json:"reason"`
+	Force   bool   `json:"force,omitempty"`   // ban only: apply although the address is loopback, ignored, in the VPN network or private
+	Minutes int    `json:"minutes,omitempty"` // ban only: 1..banMaxMinutes, 0 = permanent
 }
 
 // banControlResult is the JSON of a queue result.
@@ -87,7 +93,12 @@ func newBanControlID() (string, error) {
 
 // validateBanIP accepts one literal address and returns its canonical text. Loopback, unspecified, multicast and
 // link-local addresses are refused: they are never a remote client worth banning, or would lock the host out.
-func validateBanIP(raw string) (string, error) {
+func validateBanIP(raw string) (string, error) { return validateBanTarget(raw, false) }
+
+// validateBanTarget is validateBanIP with the override of the manual ban: with force a loopback address is accepted here (the ban
+// tool refuses a private, ignore-listed or VPN network address itself and applies it with force too). An unspecified,
+// multicast or link-local address is never accepted.
+func validateBanTarget(raw string, force bool) (string, error) {
 	if raw == "" {
 		return "", errors.New("ip is required")
 	}
@@ -98,14 +109,55 @@ func validateBanIP(raw string) (string, error) {
 	switch {
 	case ip.IsUnspecified():
 		return "", errors.New("the unspecified address cannot be banned")
-	case ip.IsLoopback():
-		return "", errors.New("a loopback address cannot be banned")
+	case ip.IsLoopback() && !force:
+		return "", errors.New("refused: the address is a loopback address (force=true overrides)")
 	case ip.IsMulticast(), ip.IsInterfaceLocalMulticast(), ip.IsLinkLocalMulticast():
 		return "", errors.New("a multicast address cannot be banned")
 	case ip.IsLinkLocalUnicast():
 		return "", errors.New("a link-local address cannot be banned")
 	}
 	return ip.String(), nil
+}
+
+// validateUnbanTarget accepts an address or the network a ban list row shows ("2001:db8:1:2::/64") and returns its canonical text.
+// An unban may name a loopback address: a forced ban can have put it on the list.
+func validateUnbanTarget(raw string) (string, error) {
+	if strings.Contains(raw, "/") {
+		_, network, err := net.ParseCIDR(raw)
+		if err != nil {
+			return "", errors.New("ip is not a valid IPv4 or IPv6 address or network")
+		}
+		if ones, _ := network.Mask.Size(); ones == 0 {
+			return "", errors.New("the whole address space cannot be unbanned by network")
+		}
+		return network.String(), nil
+	}
+	return validateBanTarget(raw, true)
+}
+
+// validateBanMinutes parses the optional duration of a manual ban: empty = permanent (0), else a whole number of minutes
+// from 1 to banMaxMinutes (one year).
+func validateBanMinutes(raw string) (int, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < banMinMinutes || n > banMaxMinutes {
+		return 0, fmt.Errorf("minutes must be a whole number from %d to %d", banMinMinutes, banMaxMinutes)
+	}
+	return n, nil
+}
+
+// parseBanForce reads the optional force flag of a manual ban: empty, "false" or "0" = off; "true" or "1" = on; anything else is refused.
+func parseBanForce(raw string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "false", "0":
+		return false, nil
+	case "true", "1":
+		return true, nil
+	}
+	return false, errors.New("force must be true or false")
 }
 
 // validateBanReason: at most 120 characters, printable ASCII and spaces only (no tab, newline or control character).
@@ -185,11 +237,17 @@ func readBanControlResult(dir, id string) (res banControlResult, found bool, err
 // after it was seen. On a timeout the request is withdrawn if the watcher has not claimed it yet, so that a request
 // answered with 504 is not run later.
 func submitBanControl(ctx context.Context, dir, action, ip, reason string, timeout time.Duration) (banControlResult, error) {
+	return submitBanControlRequest(ctx, dir, banControlRequest{Action: action, IP: ip, Reason: reason}, timeout)
+}
+
+// submitBanControlRequest is submitBanControl for a request that carries options (force, minutes); the id is set here.
+func submitBanControlRequest(ctx context.Context, dir string, req banControlRequest, timeout time.Duration) (banControlResult, error) {
 	id, err := newBanControlID()
 	if err != nil {
 		return banControlResult{}, err
 	}
-	if err := writeBanControlRequest(dir, banControlRequest{ID: id, Action: action, IP: ip, Reason: reason}); err != nil {
+	req.ID = id
+	if err := writeBanControlRequest(dir, req); err != nil {
 		return banControlResult{}, err
 	}
 	deadline := time.NewTimer(timeout)
@@ -244,7 +302,24 @@ func (oAdmin *OvpnAdmin) banControlHandler(action string) http.HandlerFunc {
 			return
 		}
 		_ = r.ParseForm()
-		ip, err := validateBanIP(r.PostFormValue("ip"))
+		force := false
+		minutes := 0
+		if action == "ban" {
+			var ferr, merr error
+			force, ferr = parseBanForce(r.PostFormValue("force"))
+			minutes, merr = validateBanMinutes(r.PostFormValue("minutes"))
+			if err := errors.Join(ferr, merr); err != nil {
+				writeBanControlJSON(w, http.StatusBadRequest, "error", err.Error())
+				return
+			}
+		}
+		var ip string
+		var err error
+		if action == "unban" {
+			ip, err = validateUnbanTarget(r.PostFormValue("ip"))
+		} else {
+			ip, err = validateBanTarget(r.PostFormValue("ip"), force)
+		}
 		if err != nil {
 			writeBanControlJSON(w, http.StatusBadRequest, "error", err.Error())
 			return
@@ -262,7 +337,7 @@ func (oAdmin *OvpnAdmin) banControlHandler(action string) http.HandlerFunc {
 			writeBanControlJSON(w, http.StatusInternalServerError, "error", "ban control is not available: no audit path is configured")
 			return
 		}
-		res, err := submitBanControl(r.Context(), dir, action, ip, reason, banControlWait)
+		res, err := submitBanControlRequest(r.Context(), dir, banControlRequest{Action: action, IP: ip, Reason: reason, Force: force, Minutes: minutes}, banControlWait)
 		switch {
 		case errors.Is(err, errBanControlTimeout):
 			log.Warnf("ban control: %s %s: no answer from the ban watcher", action, ip)

@@ -7,8 +7,10 @@
 The control directory is shared with the ovpn-admin container (a subdirectory "control" of the audit directory). It is owned by
 the user that runs this watcher (root) with mode 0700; the watcher refuses to start otherwise. A caller writes a request:
 
-    <id>.req     {"id":"<id>","action":"ban"|"unban","ip":"<address>","reason":"<note>"}
+    <id>.req     {"id":"<id>","action":"ban"|"unban","ip":"<address>","reason":"<note>","force":true|false,"minutes":<1..525600>}
 
+("reason", "force" and "minutes" are optional: force defaults to false, minutes to absent = permanent; "minutes" and "force" apply to "ban"
+only; an unban may name the network a ban list row shows, "2001:db8:1:2::/64", as well as an address)
 (a temporary file first, then a rename to <id>.req, so that a half written request is never read) and waits for
 
     <id>.result  {"ok":true|false,"message":"..."}
@@ -18,14 +20,19 @@ from the content. The watcher polls every 0.5 s and handles one request per poll
 
   1. the request is claimed by renaming it to <id>.proc (a request is processed at most once: an interrupted one found at the next
      start gets an error result, it is never run again; a request whose id already has a result is dropped and logged),
-  2. it is validated (size, JSON, keys, id, action, address pattern, reason pattern [A-Za-z0-9 ._:-]{0,120}),
-  3. "ban" runs   ovpn-ban.sh ban-manual IP [REASON]      "unban" runs   ovpn-ban.sh unban IP --force
+  2. it is validated (size, JSON, keys, id, action, address pattern, reason pattern [A-Za-z0-9 ._:-]{0,120}, force, minutes),
+  3. "ban" runs   ovpn-ban.sh ban-manual [--force] [--minutes N] IP [REASON]      "unban" runs   ovpn-ban.sh unban IP --force
+     (ovpn-ban.sh refuses a loopback, ignore-listed, VPN network and private address unless "force" is true; the refusal reason is the
+     result message and the ban is not applied)
      through subprocess with a fixed argument vector (no shell; IP and REASON are only ever arguments, never part of a command line),
   4. the result is written atomically (temporary file, rename), then <id>.proc is removed.
 
 A malformed request gets {"ok":false,...}. Nothing a request contains can stop the watcher: every failure is one log line on stderr,
 then the loop goes on. Result files older than 10 minutes are removed. All file access goes through the directory descriptor opened at
 start (no symlink is followed, only regular files of the owner are read), so replacing the path later cannot redirect the watcher.
+
+Between requests the watcher runs "ovpn-ban.sh expire" every OVPN_BAN_SWEEP_SECONDS (default 30) seconds: that is what lifts a temporary ban
+whose time has passed (the escalation lengths are longer than the bantime of the fail2ban jail, which only schedules its own unban).
 
 Environment: OVPN_BAN_TOOL (default /usr/local/sbin/ovpn-ban.sh) and everything ovpn-ban.sh reads (OVPN_BAN_STATE, OVPN_BAN_PORT, ...,
 and the OVPN_TELEGRAM_* settings for the notification of a new ban); OVPN_BAN_CONTROL_POLL (seconds, default 0.5, tests only).
@@ -46,11 +53,16 @@ POLL_SECONDS = 0.5
 RESULT_MAX_AGE = 600
 MAX_REQUEST_BYTES = 4096
 TOOL_TIMEOUT = 60
+SWEEP_SECONDS = 30
+SWEEP_TIMEOUT = 30
+MIN_MINUTES = 1
+MAX_MINUTES = 525600
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 REQ_RE = re.compile(r"^([A-Za-z0-9_-]{1,64})\.req$")
 IP_RE = re.compile(r"^[0-9A-Fa-f:.]{2,45}$")
+NET_RE = re.compile(r"^[0-9A-Fa-f:.]{2,45}(/[0-9]{1,3})?$")  # an unban may name the network of a ban list row
 REASON_RE = re.compile(r"^[A-Za-z0-9 ._:-]{0,120}$")
-KEYS = {"id", "action", "ip", "reason"}
+KEYS = {"id", "action", "ip", "reason", "force", "minutes"}
 
 running = True
 
@@ -115,25 +127,33 @@ def parse_request(data, stem):
     if not isinstance(req, dict):
         raise BadRequest("request must be a JSON object")
     if not set(req) <= KEYS or not {"id", "action", "ip"} <= set(req):
-        raise BadRequest("request needs id, action and ip (reason is optional); no other keys")
+        raise BadRequest("request needs id, action and ip (reason, force and minutes are optional); no other keys")
     rid, action, ip, reason = req["id"], req["action"], req["ip"], req.get("reason", "")
+    force, minutes = req.get("force", False), req.get("minutes")
     if not isinstance(rid, str) or not ID_RE.match(rid) or rid != stem:
         raise BadRequest("id must be [A-Za-z0-9_-]{1,64} and equal the request file name")
     if action not in ("ban", "unban"):
         raise BadRequest('action must be "ban" or "unban"')
-    if not isinstance(ip, str) or not IP_RE.match(ip):
+    if not isinstance(ip, str) or not (IP_RE if action == "ban" else NET_RE).match(ip):
         raise BadRequest("ip is not an address")
     if reason is None:
         reason = ""
     if not isinstance(reason, str) or not REASON_RE.fullmatch(reason):
         raise BadRequest("reason must match [A-Za-z0-9 ._:-]{0,120}")
-    return action, ip, reason
+    if not isinstance(force, bool):
+        raise BadRequest("force must be true or false")
+    if minutes is not None and (isinstance(minutes, bool) or not isinstance(minutes, int) or not MIN_MINUTES <= minutes <= MAX_MINUTES):
+        raise BadRequest(f"minutes must be a whole number from {MIN_MINUTES} to {MAX_MINUTES}")
+    if action == "unban" and (force or minutes is not None):
+        raise BadRequest("force and minutes apply to ban only")
+    return action, ip, reason, force, minutes
 
 
-def run_tool(tool, action, ip, reason):
+def run_tool(tool, action, ip, reason, force=False, minutes=None):
     """Fixed argument vectors, no shell. Returns (ok, message)."""
     if action == "ban":
-        argv = [tool, "ban-manual", ip] + ([reason] if reason.strip() else [])
+        argv = [tool, "ban-manual"] + (["--force"] if force else []) + (["--minutes", str(minutes)] if minutes is not None else [])
+        argv += [ip] + ([reason] if reason.strip() else [])
     else:
         argv = [tool, "unban", ip, "--force"]
     try:
@@ -144,11 +164,28 @@ def run_tool(tool, action, ip, reason):
     except OSError as exc:
         return False, f"cannot run the ban tool ({type(exc).__name__})"
     if proc.returncode == 0:
-        return True, f"banned {ip} permanently" if action == "ban" else f"unbanned {ip}"
+        if action == "unban":
+            return True, f"unbanned {ip}"
+        return True, f"banned {ip} permanently" if minutes is None else f"banned {ip} for {minutes} minutes"
     err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
     # the tool's own refusals ("ovpn-ban: ...") carry no secrets; anything else is reduced to the exit status
     line = next((ln for ln in err if ln.startswith("ovpn-ban: ")), "")
     return False, (line[len("ovpn-ban: "):][:200] if line else f"ban tool failed (exit {proc.returncode})")
+
+
+def sweep(tool):
+    """Lift the temporary bans that ran out (ovpn-ban.sh expire). A failure is one log line, never an error of the watcher."""
+    try:
+        proc = subprocess.run([tool, "expire"], shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=SWEEP_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired:
+        log(f"expiry sweep timed out after {SWEEP_TIMEOUT} s")
+        return
+    except OSError as exc:
+        log(f"expiry sweep cannot run the ban tool ({type(exc).__name__})")
+        return
+    if proc.returncode != 0:
+        log(f"expiry sweep failed (exit {proc.returncode})")
 
 
 def remove_entry(dfd, name):
@@ -176,8 +213,8 @@ def handle(dfd, name, stem, tool):
     os.rename(name, claimed, src_dir_fd=dfd, dst_dir_fd=dfd)  # claimed: it can never be picked up again
     try:
         try:
-            action, ip, reason = parse_request(read_request(dfd, claimed), stem)
-            ok, message = run_tool(tool, action, ip, reason)
+            action, ip, reason, force, minutes = parse_request(read_request(dfd, claimed), stem)
+            ok, message = run_tool(tool, action, ip, reason, force, minutes)
             log(f"request {stem}: {action} -> {'ok' if ok else 'failed'}")
         except BadRequest as exc:
             ok, message = False, str(exc)
@@ -248,6 +285,10 @@ def main(argv):
         poll = float(os.environ.get("OVPN_BAN_CONTROL_POLL", POLL_SECONDS))
     except ValueError:
         poll = POLL_SECONDS
+    try:
+        sweep_every = float(os.environ.get("OVPN_BAN_SWEEP_SECONDS", SWEEP_SECONDS))
+    except ValueError:
+        sweep_every = SWEEP_SECONDS
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     dfd = open_control_dir(path)
@@ -256,6 +297,7 @@ def main(argv):
     except OSError as exc:
         log(f"startup recovery failed ({type(exc).__name__})")
     log(f"watching {path} every {poll} s")
+    last_sweep = time.monotonic()
     while running:
         try:
             for name in sorted(n for n in os.listdir(dfd) if n.endswith(".req")):
@@ -265,6 +307,9 @@ def main(argv):
                     break  # one request per poll
                 drop_unnamed(dfd, name)
             expire_results(dfd, time.time())
+            if sweep_every > 0 and time.monotonic() - last_sweep >= sweep_every:
+                last_sweep = time.monotonic()
+                sweep(tool)
         except Exception as exc:  # a bad request or a full disk never stops the watcher
             log(f"error ({type(exc).__name__}), continuing")
         time.sleep(poll)
