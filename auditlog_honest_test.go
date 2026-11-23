@@ -183,3 +183,111 @@ func TestAuditEndpointsRefuseWithoutAdminCredentials(t *testing.T) {
 		}
 	}
 }
+
+// ---- card "audit verify must never go green after the records are gone" ----
+// Black box as well (open, record, close, restart, verify), so they are red on d0895b3 and b781022.
+
+// restartAudit opens the trail again at the same path and makes it the panel's.
+func restartAudit(t *testing.T, path string) *adminAuditLog {
+	t.Helper()
+	b, err := openAdminAuditLog(path, "")
+	if err != nil {
+		t.Fatalf("the panel must start: %v", err)
+	}
+	t.Cleanup(b.Close)
+	old := adminAudit
+	adminAudit = b
+	t.Cleanup(func() { adminAudit = old })
+	return b
+}
+
+// the sentinel of a trail at <dir>/audit/admin-audit.log: the directory above the trail directory
+func sentinelOf(path string) string {
+	return filepath.Join(filepath.Dir(filepath.Dir(path)), ".admin-audit-initialized")
+}
+
+// (a) every trail file and the checkpoint are gone, the sentinel is not: the third state, never verified
+func TestAuditNothingAtAllWithTheSentinelIsNotGreen(t *testing.T) {
+	asAdmin(t)
+	a := useAdminAudit(t, "")
+	a.noSync = true
+	for i := 0; i < 30; i++ {
+		mustRecord(t, a, auditActUserCreate, "u")
+	}
+	a.Close()
+	if _, err := os.Stat(sentinelOf(a.path)); err != nil {
+		t.Fatalf("the sentinel does not exist after 30 lines: %v", err)
+	}
+	all, _ := filepath.Glob(a.path + "*")
+	for _, p := range all {
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	restartAudit(t, a.path)
+	code, m := honestVerify(t)
+	reason, _ := m["reason"].(string)
+	if code != 200 || m["ok"] != false || m["state"] != "unverified" || !strings.Contains(reason, "cannot establish continuity") || !strings.Contains(reason, "admin-audit.log") {
+		t.Fatalf("every trail file was deleted but verify says %d %v", code, m)
+	}
+	// it stays so across more restarts and more lines, until an operator has moved the finding away
+	for i := 0; i < 3; i++ {
+		mustRecord(t, adminAudit, auditActUserCreate, "after-the-wipe")
+	}
+	adminAudit.Close()
+	restartAudit(t, a.path)
+	if _, m = honestVerify(t); m["ok"] != false || m["state"] != "unverified" {
+		t.Fatalf("the finding was forgotten at the next restart: %v", m)
+	}
+}
+
+// (b) sentinel gone as well: nothing inside the state says the trail existed. The answer is the one of a
+// new deployment and is explicit about what it covers: the records it holds, from seq 1, and since when.
+func TestAuditNothingAtAllWithoutTheSentinelVouchesOnlyForWhatItHolds(t *testing.T) {
+	asAdmin(t)
+	a := useAdminAudit(t, "")
+	a.noSync = true
+	for i := 0; i < 30; i++ {
+		mustRecord(t, a, auditActUserCreate, "u")
+	}
+	a.Close()
+	all, _ := filepath.Glob(a.path + "*")
+	all = append(all, sentinelOf(a.path))
+	for _, p := range all {
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := restartAudit(t, a.path)
+	mustRecord(t, b, auditActUserCreate, "new")
+	_, m := honestVerify(t)
+	if m["ok"] != true || m["lines"] != float64(1) || m["firstSeq"] != float64(1) || m["lastSeq"] != float64(1) || m["since"] == nil {
+		t.Fatalf("a new trail must say what it covers (1 line, from seq 1, since when): %v", m)
+	}
+}
+
+// (e) a genuinely fresh deployment: no sentinel, the first verify is verified with one line; the sentinel is
+// there once that line is
+func TestAuditFreshDeploymentFirstVerifyIsGreen(t *testing.T) {
+	asAdmin(t)
+	a := useAdminAudit(t, "")
+	if _, err := os.Stat(sentinelOf(a.path)); err == nil {
+		t.Fatal("the sentinel exists before the first line was written")
+	}
+	mustRecord(t, a, auditActLoginOK, "operator")
+	_, m := honestVerify(t)
+	if m["ok"] != true || m["state"] != "verified" || m["lines"] != float64(1) {
+		t.Fatalf("fresh deployment: %v", m)
+	}
+	fi, err := os.Stat(sentinelOf(a.path))
+	if err != nil || fi.Mode().Perm() != 0600 {
+		t.Fatalf("sentinel after the first line: %v %v", fi, err)
+	}
+	// a restart with no line written at all is still a fresh deployment, not a lost trail
+	b := useAdminAudit(t, "")
+	b.Close()
+	restartAudit(t, b.path)
+	if _, m = honestVerify(t); m["ok"] != true {
+		t.Fatalf("a start with no line written is not a lost trail: %v", m)
+	}
+}

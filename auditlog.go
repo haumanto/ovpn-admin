@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -64,6 +65,23 @@ import (
 // unreadable one) keeps the panel running, and writes <file>.continuity-lost so that the finding survives
 // further restarts; verify reports it until an operator has looked at it and moved that file away.
 //
+// A clean stop (SIGTERM, SIGINT: closeTrailOnSignal) closes the trail, and Close
+// writes the checkpoint at the newest line with the same sequence as any other (temporary file, fsync,
+// rename, fsync of the directory). So after a clean stop the checkpoint is the newest line, and a start
+// whose trail ends before it has lost records: the newest ones were cut off, whatever their number. After a
+// stop that is not clean (SIGKILL, power loss, an OOM kill) the checkpoint can be up to
+// adminAuditCheckpointEvery lines behind, and a cut of those newest lines is not seen.
+//
+// The sentinel. Nothing inside the trail directory can show that the whole directory was emptied, so the
+// panel keeps one more file outside it: <directory above the trail directory>/.admin-audit-initialized
+// (--admin-audit.sentinel), 0600, created and synced before the first line of a trail is ever written (or
+// at the first start with an older trail), never removed by the panel. A start that finds the sentinel and
+// no line anywhere (no file, no generation, no checkpoint naming one) writes a continuity-lost finding of
+// kind "unverified": "cannot establish continuity ... the trail <file> has no records at start". A start
+// without the sentinel and without a trail is a new deployment and is verified from its first line. When
+// both are deleted the state is the one of a new deployment; verify then answers for the records it holds
+// (firstSeq, since) and for nothing older.
+//
 // Limits that no code here removes. SHA-256 shows consistency, not who wrote a line: anybody who can write
 // the files can write a consistent history. The checkpoint sits next to the trail and shares the fate of
 // the volume unless it is protected separately (copy it elsewhere, or make the directory append-only). It
@@ -108,6 +126,9 @@ const (
 	adminAuditLoginOKWindow   = 30 * time.Minute // one auth.login.ok per user and source per window
 	adminAuditLoginFailWindow = 10 * time.Second // one auth.login.fail per source per window
 	adminAuditThrottleMaxKeys = 4096
+
+	// the sentinel lives in the directory above the trail directory
+	adminAuditSentinelName = ".admin-audit-initialized"
 
 	adminAuditCheckpointSuffix = ".checkpoint"
 	adminAuditNoticeSuffix     = ".continuity-lost"
@@ -157,6 +178,7 @@ const (
 var (
 	adminAuditFileFlag     = kingpin.Flag("admin-audit.file", "path of the admin audit trail (hash chained JSON lines, 10 MiB per file, 5 generations, plus <file>.checkpoint); the directory is created 0700 and the file 0600, a symlink at either path is refused, and the panel does not start when the file cannot be written").Default(adminAuditDefaultFile).Envar("OVPN_ADMIN_AUDIT_FILE").String()
 	adminAuditWebhookFlag  = kingpin.Flag("admin-audit.webhook", "optional URL that receives every admin audit line as a JSON POST (3 s timeout, queue of 256, a full queue drops lines); https only, plain http only for a loopback address").Default("").Envar("OVPN_ADMIN_AUDIT_WEBHOOK").String()
+	adminAuditSentinelFlag = kingpin.Flag("admin-audit.sentinel", "path of the sentinel file that proves a trail existed (created 0600 before the first line is ever written, never removed by the panel); empty = .admin-audit-initialized in the directory above the trail directory, i.e. outside it. With the sentinel present and no trail and no checkpoint, verify answers \"unverified\" instead of \"verified\"; the panel does not start when the sentinel cannot be created").Default("").Envar("OVPN_ADMIN_AUDIT_SENTINEL").String()
 	adminAuditRequiredFlag = kingpin.Flag("admin-audit.required", "when true an admin action whose audit line cannot be written is answered with HTTP 500 (the action itself has been carried out: the answer says so); when false, the default, the failure is only logged").Default("false").Envar("OVPN_ADMIN_AUDIT_REQUIRED").Bool()
 )
 
@@ -235,6 +257,12 @@ type adminAuditLog struct {
 	lastWriteErr  error
 	noSync        bool // tests only: skip the fsync of every line
 
+	// the sentinel: a file outside the trail directory that exists from before the first line is written
+	// (see ensureSentinelLocked). Empty path = none (unit tests that build the struct by hand).
+	sentinelPath string
+	sentinelOK   bool // the sentinel exists (found at start or created by this process)
+	closed       bool // Close ran: nothing is written any more, in particular no new file after a rotation
+
 	// the checkpoint file: the seq it holds, when it was written and how many lines came after it
 	cpSeq   int64
 	cpAt    time.Time
@@ -265,6 +293,12 @@ type adminAuditLost struct {
 // line that is not a valid link of the chain, or a checkpoint that cannot be written are errors the
 // caller turns into a failed start.
 func openAdminAuditLog(path string, webhookURL string) (*adminAuditLog, error) {
+	return openAdminAuditLogWithSentinel(path, webhookURL, "")
+}
+
+// openAdminAuditLogWithSentinel is openAdminAuditLog with the sentinel at an explicit path; "" means the
+// default, adminAuditSentinelName in the directory above the trail directory.
+func openAdminAuditLogWithSentinel(path string, webhookURL string, sentinel string) (*adminAuditLog, error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("the admin audit file path is empty")
 	}
@@ -277,6 +311,10 @@ func openAdminAuditLog(path string, webhookURL string) (*adminAuditLog, error) {
 		}
 	}
 	a := &adminAuditLog{path: filepath.Clean(path), maxBytes: adminAuditMaxBytes, now: time.Now, hook: hook}
+	if strings.TrimSpace(sentinel) == "" {
+		sentinel = filepath.Join(filepath.Dir(filepath.Dir(a.path)), adminAuditSentinelName)
+	}
+	a.sentinelPath = filepath.Clean(sentinel)
 	if err := a.open(); err != nil {
 		if hook != nil {
 			hook.Close()
@@ -321,6 +359,98 @@ func (a *adminAuditLog) syncDirectory() error {
 	return d.Sync()
 }
 
+// ---- the sentinel ----
+
+// adminAuditSentinel is the content of the sentinel file. Only its existence is read as a fact; the rest is
+// for the operator who finds it.
+type adminAuditSentinel struct {
+	V       int    `json:"v"`
+	Created string `json:"created"`
+	Trail   string `json:"trail"`
+	Note    string `json:"note"`
+}
+
+// readSentinel says whether the sentinel exists, and when it was created if its content says so. An
+// error other than "does not exist" is returned: the start cannot tell a new deployment from a wiped one
+// and must not guess.
+func (a *adminAuditLog) readSentinel() (seen bool, created string, err error) {
+	if a.sentinelPath == "" {
+		return false, "", nil
+	}
+	if _, err := os.Lstat(a.sentinelPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, "", nil
+		}
+		return false, "", fmt.Errorf("admin audit sentinel %s: %w (set --admin-audit.sentinel to a path the panel can read)", a.sentinelPath, err)
+	}
+	if f, err := openAuditRead(a.sentinelPath); err == nil {
+		data, _ := io.ReadAll(io.LimitReader(f, 4096))
+		f.Close()
+		var s adminAuditSentinel
+		if json.Unmarshal(data, &s) == nil {
+			created = s.Created
+		}
+	}
+	return true, created, nil
+}
+
+// ensureSentinelLocked creates the sentinel when it does not exist: before the first line of a trail is
+// written, and at the start of a trail that is older than the sentinel. It is created 0600, synced, and its
+// directory synced; nothing in the panel ever removes it. A failure is the failure of the line that
+// needed it (the record is counted as lost), and at a start it stops the panel.
+func (a *adminAuditLog) ensureSentinelLocked() error {
+	if a.sentinelPath == "" || a.sentinelOK {
+		return nil
+	}
+	wrap := func(err error) error {
+		return fmt.Errorf("admin audit sentinel %s cannot be created: %w (set --admin-audit.sentinel to a writable path outside the trail directory)", a.sentinelPath, err)
+	}
+	if err := a.injected("sentinel"); err != nil {
+		return wrap(err)
+	}
+	f, err := os.OpenFile(a.sentinelPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0600)
+	if errors.Is(err, os.ErrExist) {
+		a.sentinelOK = true
+		return nil
+	}
+	if err != nil {
+		return wrap(err)
+	}
+	abs, aerr := filepath.Abs(a.path)
+	if aerr != nil {
+		abs = a.path
+	}
+	data, _ := json.Marshal(adminAuditSentinel{V: 1, Created: a.now().UTC().Format(time.RFC3339), Trail: abs,
+		Note: "ovpn-admin: an admin audit trail was started here. Do not remove this file: with it present and the trail gone, verify cannot establish continuity."})
+	_, err = f.Write(append(data, '\n'))
+	if err == nil && !a.noSync {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil && !a.noSync {
+		err = syncPath(filepath.Dir(a.sentinelPath))
+	}
+	if err != nil {
+		// not an anchor yet: a half-made sentinel must not turn the next start into a false alarm
+		_ = os.Remove(a.sentinelPath)
+		return wrap(err)
+	}
+	a.sentinelOK = true
+	return nil
+}
+
+// syncPath fsyncs a directory.
+func syncPath(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
 func (a *adminAuditLog) open() error {
 	dir := filepath.Dir(a.path)
 	if err := ensureAuditDir(dir); err != nil {
@@ -332,6 +462,11 @@ func (a *adminAuditLog) open() error {
 		if _, err := os.Lstat(p); err == nil {
 			fresh = false
 		}
+	}
+	// the sentinel is read before anything is created: it is what says that a trail existed once
+	sentinelSeen, sentinelCreated, serr := a.readSentinel()
+	if serr != nil {
+		return serr
 	}
 	f, err := openAuditAppend(a.path)
 	if err != nil {
@@ -400,6 +535,20 @@ func (a *adminAuditLog) open() error {
 		notices = append(notices, adminAuditNotice{Kind: adminAuditNoticeUnverified, Reason: fmt.Sprintf(
 			"at start the checkpoint was unreadable (%v): nothing shows whether newer records were lost before this start", cpErr)})
 	}
+	// the sentinel says that a line was written once. A start that sees no line anywhere (no trail, no
+	// generation, and no checkpoint that names one) is therefore not a new deployment: the records are
+	// gone, or the volume of the trail is not the one the panel wrote to. Nothing can be said about the
+	// missing part, and the new trail must not read as continuous with it.
+	continuityUnknown := sentinelSeen && tipSeq == 0
+	if continuityUnknown {
+		when := ""
+		if sentinelCreated != "" {
+			when = " (created " + sentinelCreated + ")"
+		}
+		notices = append(notices, adminAuditNotice{Kind: adminAuditNoticeUnverified, Reason: fmt.Sprintf(
+			"cannot establish continuity: the trail %s has no records at start (no file, no older generation, no checkpoint that names one) but the sentinel %s%s shows that this panel wrote a trail before: the earlier records are missing, or this is not the volume they were written to; the trail starts again at seq 1",
+			filepath.Base(a.path), a.sentinelPath, when)})
+	}
 	for _, n := range notices {
 		log.Errorf("admin audit: %s", n.Reason)
 		if err := a.writeNotice(n); err != nil {
@@ -408,10 +557,24 @@ func (a *adminAuditLog) open() error {
 	}
 
 	a.seq, a.lastHash, a.pendingRotate = tipSeq, tipHash, fromGeneration
-	if cpState == adminAuditCheckpointOK && cp.Seq == tipSeq && cp.Hash == tipHash {
+	a.sentinelOK = sentinelSeen
+	if !sentinelSeen && tipSeq > 0 {
+		// a trail from before the sentinel existed (an upgrade): anchor it now
+		if err := a.ensureSentinelLocked(); err != nil {
+			return fail(err)
+		}
+	}
+	switch {
+	case cpState == adminAuditCheckpointOK && cp.Seq == tipSeq && cp.Hash == tipHash:
 		a.cpSeq, a.cpAt = cp.Seq, a.now()
-	} else if err := a.writeCheckpointLocked(); err != nil {
-		return fail(fmt.Errorf("admin audit checkpoint %s: %w", a.checkpointPath(), err))
+	case continuityUnknown:
+		// no checkpoint is written for a trail that has just lost its past: the first one comes with the
+		// first lines, and the finding above keeps verify at "unverified" until an operator has seen it
+		a.cpAt = a.now()
+	default:
+		if err := a.writeCheckpointLocked(); err != nil {
+			return fail(fmt.Errorf("admin audit checkpoint %s: %w", a.checkpointPath(), err))
+		}
 	}
 	return nil
 }
@@ -687,7 +850,10 @@ func (a *adminAuditLog) Lines() int64 {
 // Path is the file of the trail.
 func (a *adminAuditLog) Path() string { return a.path }
 
-// Close stops the webhook worker, writes the final checkpoint and closes the file.
+// Close stops the webhook worker, writes the final checkpoint and closes the file. It is what a clean stop
+// (SIGTERM, SIGINT: see serveUntilStopped) runs, and it makes the checkpoint name the newest line, so that a
+// trail that is shorter at the next start is found at once. Nothing is written after it: a record that
+// arrives later is refused, and a rotation that was left pending does not create a new file.
 func (a *adminAuditLog) Close() {
 	if a == nil {
 		return
@@ -697,12 +863,16 @@ func (a *adminAuditLog) Close() {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.f != nil {
-		if a.sinceCP > 0 {
-			if err := a.writeCheckpointLocked(); err != nil {
-				log.Errorf("admin audit: the final checkpoint was not written: %v", err)
-			}
+	if a.closed {
+		return
+	}
+	a.closed = true
+	if a.sinceCP > 0 || a.seq != a.cpSeq {
+		if err := a.writeCheckpointLocked(); err != nil {
+			log.Errorf("admin audit: the final checkpoint was not written: %v", err)
 		}
+	}
+	if a.f != nil {
 		_ = a.f.Close()
 		a.f = nil
 	}
@@ -729,6 +899,9 @@ func (a *adminAuditLog) Record(actor, action, target, source, result, detail str
 }
 
 func (a *adminAuditLog) recordLocked(actor, action, target, source, result, detail string, secrets []string) (adminAuditRecord, error) {
+	if a.closed {
+		return adminAuditRecord{}, errors.New("the admin audit trail is closed (the panel is stopping)")
+	}
 	if a.f == nil && !a.pendingRotate {
 		return adminAuditRecord{}, errors.New("the admin audit file is closed")
 	}
@@ -807,6 +980,12 @@ func (a *adminAuditLog) appendLocked(actor, action, target, source, result, deta
 	line, _ := json.Marshal(rec)
 	line = append(line, '\n')
 	a.lastWriteErr = nil
+	// the sentinel exists before the first line does: a crash in between leaves a sentinel and no line (a
+	// false alarm at the next start), never a line without its anchor
+	if err := a.ensureSentinelLocked(); err != nil {
+		a.lastWriteErr = err
+		return adminAuditRecord{}
+	}
 	if err := a.writeLineLocked(line); err != nil {
 		a.lastWriteErr = err
 		return adminAuditRecord{}
@@ -1079,6 +1258,11 @@ type adminAuditVerifyOK struct {
 	// covered by the memory of the running panel only.
 	CheckpointSeq int64 `json:"checkpointSeq"`
 	Unanchored    int64 `json:"unanchored"`
+	// FirstSeq and Since name the oldest record that was held against the chain: the answer vouches for
+	// seq FirstSeq..LastSeq and says nothing about anything older (a trail that starts at seq 1 on a
+	// deployment known to be older is the sign of a state directory that was emptied as a whole).
+	FirstSeq int64  `json:"firstSeq"`
+	Since    string `json:"since,omitempty"`
 	// Gaps counts the audit.gap lines of the retained files: records the panel knows it could not write.
 	Gaps        int64 `json:"gaps"`
 	FirstGapSeq int64 `json:"firstGapSeq,omitempty"`
@@ -1118,7 +1302,7 @@ func (a *adminAuditLog) Verify() (okRes *adminAuditVerifyOK, bad *adminAuditVeri
 	defer a.mu.Unlock()
 	var (
 		total, expect, firstSeq, gaps, firstGap int64
-		prevHash                                string
+		prevHash, since                         string
 		haveAny                                 bool
 		cpHashSeen                              string
 		cpSeen                                  bool
@@ -1197,6 +1381,7 @@ func (a *adminAuditLog) Verify() (okRes *adminAuditVerifyOK, bad *adminAuditVeri
 					return false
 				}
 				firstSeq = rec.Seq
+				since = rec.Ts
 			case rec.Prev != prevHash:
 				fail(want, fmt.Sprintf("%s: prev does not match the hash of the line before", filepath.Base(path)))
 				return false
@@ -1270,7 +1455,7 @@ func (a *adminAuditLog) Verify() (okRes *adminAuditVerifyOK, bad *adminAuditVeri
 		return nil, &adminAuditVerifyBroken{OK: false, State: adminAuditStateUnverified, Reason: strings.Join(unverified, "; "), Lines: total, LastSeq: lastSeq}
 	}
 	return &adminAuditVerifyOK{OK: true, State: adminAuditStateVerified, Lines: total, LastSeq: lastSeq, LastHash: lastHash,
-		CheckpointSeq: cp.Seq, Unanchored: lastSeq - cp.Seq, Gaps: gaps, FirstGapSeq: firstGap, Unrecorded: a.lost.n}, nil
+		CheckpointSeq: cp.Seq, Unanchored: lastSeq - cp.Seq, FirstSeq: firstSeq, Since: since, Gaps: gaps, FirstGapSeq: firstGap, Unrecorded: a.lost.n}, nil
 }
 
 // looseSeq reads seq out of a line that does not parse as a record, for the report only.
@@ -1864,15 +2049,82 @@ func (w *adminAuditWebhook) Close() {
 
 // initAdminAudit opens the trail named by the flags and logs the start line. The caller exits on error.
 func initAdminAudit() error {
-	a, err := openAdminAuditLog(*adminAuditFileFlag, *adminAuditWebhookFlag)
+	a, err := openAdminAuditLogWithSentinel(*adminAuditFileFlag, *adminAuditWebhookFlag, *adminAuditSentinelFlag)
 	if err != nil {
 		return err
 	}
 	adminAudit = a
+	// log.Fatal elsewhere in main() ends the process without a deferred call: logrus runs its exit
+	// handlers first, so the final checkpoint is written then as well
+	log.RegisterExitHandler(func() { a.Close() })
 	hook := "off"
 	if a.hook != nil {
 		hook = a.hook.target
 	}
-	log.Infof("admin audit trail: file=%s lines=%d seq=%d webhook=%s", a.path, a.Lines(), a.seq, hook)
+	log.Infof("admin audit trail: file=%s lines=%d seq=%d webhook=%s sentinel=%s", a.path, a.Lines(), a.seq, hook, a.sentinelPath)
 	return nil
+}
+
+// auditStopTimeout is how long a clean stop waits for requests in flight before it closes the trail anyway.
+const auditStopTimeout = 10 * time.Second
+
+var (
+	auditStopSrv  atomic.Pointer[http.Server] // the server a stop shuts down first, once there is one
+	auditStopOnce sync.Once
+)
+
+// closeTrailOnSignal makes SIGTERM and SIGINT (what a container runtime, systemd and a terminal send) a
+// clean stop: the server, when there is one, stops accepting requests and waits for the ones in flight,
+// then the trail is closed, which writes the checkpoint at the newest line. Without that the checkpoint
+// would describe an older line, and a trail cut after a clean stop could not be told from one that ended
+// there. main() calls it as soon as the trail is open (the panel can wait for the OpenVPN management
+// interface for twenty seconds before it serves); serveUntilStopped calls it too. The exit status is the
+// one a process that does not handle the signal gets (128 + signal), so a supervisor sees the same status
+// as before.
+func closeTrailOnSignal() {
+	auditStopOnce.Do(func() {
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
+		go func() {
+			sig := <-sigs
+			log.Infof("admin audit: %v received, stopping the panel and closing the trail", sig)
+			if srv := auditStopSrv.Load(); srv != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), auditStopTimeout)
+				if err := srv.Shutdown(ctx); err != nil {
+					log.Warnf("admin audit: requests still running after %v, closing the trail anyway: %v", auditStopTimeout, err)
+				}
+				cancel()
+			}
+			adminAudit.Close()
+			log.Infof("admin audit: the trail is closed, its checkpoint names seq %d", adminAuditSeq())
+			code := 128 + int(syscall.SIGTERM)
+			if sig == syscall.SIGINT {
+				code = 128 + int(syscall.SIGINT)
+			}
+			os.Exit(code)
+		}()
+	})
+}
+
+// serveUntilStopped serves handler on addr until a signal stops the process (see closeTrailOnSignal). It
+// returns only for an error of the listener.
+func serveUntilStopped(addr string, handler http.Handler) error {
+	closeTrailOnSignal()
+	srv := &http.Server{Addr: addr, Handler: handler}
+	auditStopSrv.Store(srv)
+	err := srv.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		select {} // a stop is shutting the server down: it ends the process when the trail is closed
+	}
+	return err
+}
+
+// adminAuditSeq is the seq of the newest line of the running trail (0 when there is none).
+func adminAuditSeq() int64 {
+	if adminAudit == nil {
+		return 0
+	}
+	adminAudit.mu.Lock()
+	defer adminAudit.mu.Unlock()
+	return adminAudit.seq
 }

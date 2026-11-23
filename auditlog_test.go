@@ -171,7 +171,7 @@ func TestAdminAuditLineFormatAndChain(t *testing.T) {
 		t.Errorf("verify: %+v, want 3 lines and last hash %s", res, prev)
 	}
 	b, _ := json.Marshal(res)
-	if string(b) != fmt.Sprintf(`{"ok":true,"state":"verified","lines":3,"lastSeq":3,"lastHash":"%s","checkpointSeq":0,"unanchored":3,"gaps":0}`, prev) {
+	if string(b) != fmt.Sprintf(`{"ok":true,"state":"verified","lines":3,"lastSeq":3,"lastHash":"%s","checkpointSeq":0,"unanchored":3,"firstSeq":1,"since":"%s","gaps":0}`, prev, parseAuditLines(t, lines[:1])[0].Ts) {
 		t.Errorf("verify JSON: %s", b)
 	}
 }

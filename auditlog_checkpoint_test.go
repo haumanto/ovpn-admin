@@ -1,17 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -700,5 +705,300 @@ func TestAuditRealRun(t *testing.T) {
 		show("after the space came back")
 	default:
 		t.Fatal("OVPN_AUDIT_REAL_MODE must be rotate or enospc")
+	}
+}
+
+// ---- card "audit verify must never go green after the records are gone": sentinel and clean stop ----
+
+func cutNewestLines(t *testing.T, path string, n int) {
+	t.Helper()
+	lines := readAuditFile(t, path)
+	if len(lines) <= n {
+		t.Fatalf("%s has %d lines, cannot cut %d", path, len(lines), n)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines[:len(lines)-n], "\n")+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The sentinel is created before the first line, 0600, outside the trail directory, and nothing removes it:
+// not the rotation, not a restart, not Close.
+func TestAuditSentinelLifecycle(t *testing.T) {
+	a := openTestAudit(t, "")
+	a.noSync = true
+	a.maxBytes = 1500
+	s := sentinelOf(a.path)
+	if filepath.Dir(s) == filepath.Dir(a.path) {
+		t.Fatalf("the sentinel %s is inside the trail directory", s)
+	}
+	if _, err := os.Lstat(s); err == nil {
+		t.Fatal("the sentinel exists before any line")
+	}
+	mustRecord(t, a, auditActUserCreate, "u")
+	fi, err := os.Lstat(s)
+	if err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm() != 0600 {
+		t.Fatalf("sentinel after the first line: %v %v", fi, err)
+	}
+	for len(gens(a)) < 2 {
+		mustRecord(t, a, auditActUserCreate, "u")
+	}
+	a.Close()
+	b, err := openAdminAuditLog(a.path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRecord(t, b, auditActUserCreate, "u")
+	b.Close()
+	if _, err := os.Lstat(s); err != nil {
+		t.Fatalf("the sentinel is gone after rotation, restart and close: %v", err)
+	}
+	if ns := b.readNotices(); len(ns) != 0 {
+		t.Fatalf("an ordinary restart wrote findings: %+v", ns)
+	}
+}
+
+// A trail from before the sentinel existed gets one at the first start, without a finding.
+func TestAuditSentinelIsAddedToAnOlderTrail(t *testing.T) {
+	a := openTestAudit(t, "")
+	a.noSync = true
+	for i := 0; i < 5; i++ {
+		mustRecord(t, a, auditActUserCreate, "u")
+	}
+	a.Close()
+	if err := os.Remove(sentinelOf(a.path)); err != nil {
+		t.Fatal(err)
+	}
+	b := restartAuditNoCleanup(t, a.path)
+	if _, err := os.Lstat(sentinelOf(a.path)); err != nil {
+		t.Fatalf("an older trail was not anchored at its start: %v", err)
+	}
+	if ns := b.readNotices(); len(ns) != 0 {
+		t.Fatalf("anchoring an older trail is not a finding: %+v", ns)
+	}
+}
+
+func restartAuditNoCleanup(t *testing.T, path string) *adminAuditLog {
+	t.Helper()
+	b, err := openAdminAuditLog(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Close)
+	return b
+}
+
+// Without a sentinel that can be created there is no first line (the record is counted as lost, the file
+// stays empty), and with a trail that exists the panel does not start.
+func TestAuditSentinelCannotBeCreated(t *testing.T) {
+	a := openTestAudit(t, "")
+	a.noSync = true
+	a.fault = func(op string) error {
+		if op == "sentinel" {
+			return errors.New("injected: read-only file system")
+		}
+		return nil
+	}
+	if _, err := a.Record("x", auditActUserCreate, "u", "s", adminAuditResultOK, "d"); err == nil || !strings.Contains(err.Error(), "sentinel") {
+		t.Fatalf("a line was written without the sentinel, or the error does not say why: %v", err)
+	}
+	if fi, _ := os.Stat(a.path); fi.Size() != 0 {
+		t.Fatalf("a line is in the file although the sentinel could not be created (%d bytes)", fi.Size())
+	}
+	a.fault = nil
+	mustRecord(t, a, auditActUserCreate, "u")
+	if _, err := os.Lstat(sentinelOf(a.path)); err != nil {
+		t.Fatal(err)
+	}
+	// the writer says what the gap was, as for any record that could not be written
+	if rs := parseAuditLines(t, readAuditFile(t, a.path)); len(rs) != 2 || rs[0].Action != auditActAuditGap || rs[1].Action != auditActUserCreate {
+		t.Fatalf("expected audit.gap then user.create, got %+v", rs)
+	}
+
+	// a trail with lines and no sentinel, in a place where none can be made: refused at the start
+	b := openTestAudit(t, "")
+	b.noSync = true
+	mustRecord(t, b, auditActUserCreate, "u")
+	b.Close()
+	if err := os.Remove(sentinelOf(b.path)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openAdminAuditLogWithSentinel(b.path, "", filepath.Join(t.TempDir(), "no-such-dir", "sentinel")); err == nil || !strings.Contains(err.Error(), "sentinel") {
+		t.Fatalf("started without being able to anchor the trail: %v", err)
+	}
+}
+
+// A start with nothing at all and no sentinel does not write a checkpoint that a later start could use to
+// call itself continuous with a trail that was never there; and with the sentinel it writes none either.
+func TestAuditStartWithNothingWritesNoAuthorisingCheckpoint(t *testing.T) {
+	a := openTestAudit(t, "")
+	a.noSync = true
+	for i := 0; i < 20; i++ {
+		mustRecord(t, a, auditActUserCreate, "u")
+	}
+	a.Close()
+	all, _ := filepath.Glob(a.path + "*")
+	for _, p := range all {
+		_ = os.Remove(p)
+	}
+	b := restartAuditNoCleanup(t, a.path)
+	if _, err := os.Lstat(b.checkpointPath()); err == nil {
+		t.Fatal("a start that lost its whole past wrote a checkpoint")
+	}
+	if ns := b.readNotices(); len(ns) != 1 || ns[0].Kind != adminAuditNoticeUnverified || !strings.Contains(ns[0].Reason, "cannot establish continuity") {
+		t.Fatalf("finding: %+v", ns)
+	}
+}
+
+// After Close nothing is written, not even by a rotation that was left pending.
+func TestAuditClosedTrailWritesNothing(t *testing.T) {
+	a := openTestAudit(t, "")
+	a.noSync = true
+	mustRecord(t, a, auditActUserCreate, "u")
+	a.Close()
+	a.Close() // idempotent
+	if _, err := a.Record("x", auditActUserCreate, "u", "s", adminAuditResultOK, "d"); err == nil {
+		t.Fatal("a record was accepted after Close")
+	}
+	if n := len(readAuditFile(t, a.path)); n != 1 {
+		t.Fatalf("%d lines after Close, want 1", n)
+	}
+	// the checkpoint names the line that was there at Close
+	cp, st, _ := readAdminAuditCheckpoint(a.checkpointPath())
+	if st != adminAuditCheckpointOK || cp.Seq != 1 {
+		t.Fatalf("checkpoint after Close: %v %+v", st, cp)
+	}
+}
+
+// ---- a real signal to a real process ----
+
+// TestAuditHelperProcessServe is not a test: it is the process TestAuditCleanStopWithARealSignal starts. It
+// returns at once when the variables are not set.
+func TestAuditHelperProcessServe(t *testing.T) {
+	dir, addr := os.Getenv("OVPN_AUDIT_HELPER_DIR"), os.Getenv("OVPN_AUDIT_HELPER_ADDR")
+	if dir == "" || addr == "" {
+		return
+	}
+	n, _ := strconv.Atoi(os.Getenv("OVPN_AUDIT_HELPER_LINES"))
+	a, err := openAdminAuditLog(filepath.Join(dir, "audit", "admin-audit.log"), "")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "helper: open:", err)
+		os.Exit(2)
+	}
+	adminAudit = a
+	for i := 0; i < n; i++ {
+		if _, err := a.Record("basic-auth:helper", auditActUserCreate, "u", "192.0.2.1", adminAuditResultOK, "helper line"); err != nil {
+			fmt.Fprintln(os.Stderr, "helper: record:", err)
+			os.Exit(2)
+		}
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "pong") })
+	err = serveUntilStopped(addr, mux)
+	fmt.Fprintln(os.Stderr, "helper: serve returned:", err)
+	os.Exit(3)
+}
+
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("no loopback listener: %v", err)
+	}
+	defer l.Close()
+	return l.Addr().String()
+}
+
+// runHelperAndStop starts the panel's serve loop in a child process with n records in its trail, waits until
+// it answers, sends sig and returns the exit code.
+func runHelperAndStop(t *testing.T, dir string, n int, sig syscall.Signal) int {
+	t.Helper()
+	addr := freeAddr(t)
+	cmd := exec.Command(os.Args[0], "-test.run=^TestAuditHelperProcessServe$")
+	cmd.Env = append(os.Environ(), "OVPN_AUDIT_HELPER_DIR="+dir, "OVPN_AUDIT_HELPER_ADDR="+addr, "OVPN_AUDIT_HELPER_LINES="+strconv.Itoa(n))
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait() }()
+	up := false
+	for i := 0; i < 200 && !up; i++ {
+		if resp, err := http.Get("http://" + addr + "/ping"); err == nil {
+			resp.Body.Close()
+			up = true
+			break
+		}
+		select {
+		case <-exited:
+			t.Fatalf("the helper ended before it served:\n%s", out.String())
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if !up {
+		_ = cmd.Process.Kill()
+		t.Fatalf("the helper never answered:\n%s", out.String())
+	}
+	if err := cmd.Process.Signal(sig); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-exited:
+	case <-time.After(30 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatalf("the helper did not stop after %v:\n%s", sig, out.String())
+	}
+	t.Logf("helper output after %v:\n%s", sig, out.String())
+	return cmd.ProcessState.ExitCode()
+}
+
+// SIGTERM and SIGINT close the trail: the checkpoint names the newest line, so a trail that was cut after
+// the stop (1, 3 or 15 whole records) is found at the next start, and so is a trail that is gone.
+func TestAuditCleanStopWithARealSignal(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("signals are tested on linux")
+	}
+	for _, tc := range []struct {
+		sig  syscall.Signal
+		code int
+		cut  int
+	}{
+		{syscall.SIGTERM, 143, 0},
+		{syscall.SIGTERM, 143, 1},
+		{syscall.SIGTERM, 143, 3},
+		{syscall.SIGTERM, 143, 15},
+		{syscall.SIGINT, 130, 1},
+	} {
+		t.Run(fmt.Sprintf("%v/cut %d", tc.sig, tc.cut), func(t *testing.T) {
+			asAdmin(t)
+			dir := t.TempDir()
+			const lines = 20 // one checkpoint at 16: only the stop can anchor 17..20
+			if code := runHelperAndStop(t, dir, lines, tc.sig); code != tc.code {
+				t.Fatalf("exit code %d, want %d", code, tc.code)
+			}
+			path := filepath.Join(dir, "audit", "admin-audit.log")
+			cp, st, err := readAdminAuditCheckpoint(path + ".checkpoint")
+			if st != adminAuditCheckpointOK || cp.Seq != lines {
+				t.Fatalf("checkpoint after the stop: %v %v %+v: the stop did not write it at seq %d", st, err, cp, lines)
+			}
+			if tc.cut > 0 {
+				cutNewestLines(t, path, tc.cut)
+			}
+			b := restartAudit(t, path)
+			_, m := honestVerify(t)
+			if tc.cut == 0 {
+				if m["ok"] != true || m["state"] != "verified" || m["checkpointSeq"] != float64(lines) {
+					t.Fatalf("an untouched trail after a clean stop: %v", m)
+				}
+				return
+			}
+			if m["ok"] != false || m["state"] != "broken" {
+				t.Fatalf("%d newest records were cut after a clean stop and verify says %v", tc.cut, m)
+			}
+			ns := b.readNotices()
+			if len(ns) != 1 || ns[0].Kind != adminAuditNoticeBroken || !strings.Contains(ns[0].Reason, fmt.Sprintf("the newest %d records are missing", tc.cut)) {
+				t.Fatalf("the start did not say what is missing: %+v", ns)
+			}
+		})
 	}
 }

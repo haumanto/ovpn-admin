@@ -609,6 +609,7 @@ func main() {
 	if err := initAdminAudit(); err != nil {
 		log.Fatalf("admin audit trail: %v", err)
 	}
+	closeTrailOnSignal() // SIGTERM/SIGINT close the trail with its final checkpoint, also while the panel is still starting
 
 	if *storageBackend == "kubernetes.secrets" {
 		err := app.run()
@@ -725,7 +726,8 @@ func main() {
 	if *basicUsername != "" {
 		log.Info("HTTP Basic Auth is enabled")
 	}
-	log.Fatal(http.ListenAndServe(listenAddress(*listenHost, *listenPort), handler))
+	// a stop by SIGTERM/SIGINT closes the audit trail first (its final checkpoint), see serveUntilStopped
+	log.Fatal(serveUntilStopped(listenAddress(*listenHost, *listenPort), handler))
 }
 
 // Public values that must never protect the sync: the token of the example compose files and the
