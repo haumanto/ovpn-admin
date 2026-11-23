@@ -78,7 +78,9 @@ import (
 // at the first start with an older trail), never removed by the panel. A start that finds the sentinel and
 // no line anywhere (no file, no generation, no checkpoint naming one) writes a continuity-lost finding of
 // kind "unverified": "cannot establish continuity ... the trail <file> has no records at start". A start
-// without the sentinel and without a trail is a new deployment and is verified from its first line. When
+// without the sentinel and without a trail is a new deployment and is verified from its first line; it
+// does not create the sentinel yet, but proves at start that it can (a file of its own is made and removed
+// next to the sentinel path), and refuses to start otherwise, naming the flag. When
 // both are deleted the state is the one of a new deployment; verify then answers for the records it holds
 // (firstSeq, since) and for nothing older.
 //
@@ -90,7 +92,7 @@ import (
 // the trail: the next line that can be written is an audit.gap saying how many were lost (a restart in
 // between forgets the count), and a green verify says how many audit.gap lines it saw and how many records it knows
 // are not accounted for yet ("unrecorded"): it vouches for the chain, not for the completeness of what was
-// audited.
+// audited. An answer with no line in the files and records not recorded is "unverified", never green.
 //
 // What is recorded (and nothing else): user.create, user.delete, user.revoke, user.unrevoke, user.rotate,
 // user.change-password, user.config.download (ok only when the configuration was rendered), user.ccd.apply,
@@ -441,6 +443,34 @@ func (a *adminAuditLog) ensureSentinelLocked() error {
 	return nil
 }
 
+// probeSentinelDir proves at start that the sentinel can be created where it will be needed: it makes and
+// removes a file of its own next to the sentinel path (O_EXCL, 0600, never the sentinel itself). It is only
+// called for a new deployment; an existing trail is refused by ensureSentinelLocked.
+func (a *adminAuditLog) probeSentinelDir() error {
+	if a.sentinelPath == "" {
+		return nil
+	}
+	wrap := func(err error) error {
+		return fmt.Errorf("admin audit sentinel %s cannot be created: %w (set --admin-audit.sentinel to a writable path outside the trail directory)", a.sentinelPath, err)
+	}
+	if err := a.injected("sentinel probe"); err != nil {
+		return wrap(err)
+	}
+	probe := a.sentinelPath + ".probe-" + strconv.Itoa(os.Getpid())
+	f, err := os.OpenFile(probe, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0600)
+	if err != nil {
+		return wrap(err)
+	}
+	err = f.Close()
+	if rerr := os.Remove(probe); err == nil {
+		err = rerr
+	}
+	if err != nil {
+		return wrap(err)
+	}
+	return nil
+}
+
 // syncPath fsyncs a directory.
 func syncPath(dir string) error {
 	d, err := os.Open(dir)
@@ -467,6 +497,15 @@ func (a *adminAuditLog) open() error {
 	sentinelSeen, sentinelCreated, serr := a.readSentinel()
 	if serr != nil {
 		return serr
+	}
+	if !sentinelSeen && fresh {
+		// a new deployment: the sentinel is created with the first line, not now (a start and a stop with no
+		// line must stay "verified"), so prove here that it can be created, or the panel would answer every
+		// admin action and record none of them. Before the trail file exists, so a refused start leaves nothing
+		// behind that the next start would read as an older trail.
+		if err := a.probeSentinelDir(); err != nil {
+			return err
+		}
 	}
 	f, err := openAuditAppend(a.path)
 	if err != nil {
@@ -548,6 +587,13 @@ func (a *adminAuditLog) open() error {
 		notices = append(notices, adminAuditNotice{Kind: adminAuditNoticeUnverified, Reason: fmt.Sprintf(
 			"cannot establish continuity: the trail %s has no records at start (no file, no older generation, no checkpoint that names one) but the sentinel %s%s shows that this panel wrote a trail before: the earlier records are missing, or this is not the volume they were written to; the trail starts again at seq 1",
 			filepath.Base(a.path), a.sentinelPath, when)})
+	}
+	if !sentinelSeen && tipSeq == 0 && !fresh {
+		// an empty trail file that is not a new deployment (a start that was cut off): same proof, before a
+		// finding is written for a start that is refused
+		if err := a.probeSentinelDir(); err != nil {
+			return fail(err)
+		}
 	}
 	for _, n := range notices {
 		log.Errorf("admin audit: %s", n.Reason)
@@ -1300,6 +1346,19 @@ const (
 func (a *adminAuditLog) Verify() (okRes *adminAuditVerifyOK, bad *adminAuditVerifyBroken) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	// a broken answer carries the finding of the start that saw the cut ("the newest N records are missing"),
+	// as the start log and <file>.continuity-lost do: the walk below often fails first, on the seq of the line
+	// written after the restart, which says only "seq is X, expected Y"
+	defer func() {
+		if bad == nil || bad.State != adminAuditStateBroken {
+			return
+		}
+		for _, n := range a.readNotices() {
+			if n.Kind == adminAuditNoticeBroken && !strings.Contains(bad.Reason, n.Reason) {
+				bad.Reason += fmt.Sprintf("; %s: %s (written %s; move %s away once it has been looked at)", filepath.Base(a.noticePath()), n.Reason, n.Ts, filepath.Base(a.noticePath()))
+			}
+		}
+	}()
 	var (
 		total, expect, firstSeq, gaps, firstGap int64
 		prevHash, since                         string
@@ -1450,6 +1509,10 @@ func (a *adminAuditLog) Verify() (okRes *adminAuditVerifyOK, bad *adminAuditVeri
 			return nil, bad
 		}
 		unverified = append(unverified, fmt.Sprintf("%s: %s (written %s; move %s away once it has been looked at)", filepath.Base(a.noticePath()), n.Reason, n.Ts, filepath.Base(a.noticePath())))
+	}
+	if total == 0 && a.lost.n > 0 {
+		// nothing in the files, and records the panel failed to write: an empty trail that vouches for nothing
+		unverified = append(unverified, fmt.Sprintf("the trail holds no record and the panel failed to record %d: the admin actions since the start are not in it", a.lost.n))
 	}
 	if len(unverified) > 0 {
 		return nil, &adminAuditVerifyBroken{OK: false, State: adminAuditStateUnverified, Reason: strings.Join(unverified, "; "), Lines: total, LastSeq: lastSeq}

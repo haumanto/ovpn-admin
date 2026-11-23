@@ -350,6 +350,9 @@ func TestAuditDurabilityOrderAndFailedSync(t *testing.T) {
 func TestAuditRequiredSwitch(t *testing.T) {
 	a := useAdminAudit(t, "")
 	a.noSync = true
+	// one record is in the trail before the disk fails: with no line at all a lost record is not a green
+	// verify (TestAuditVerifyWithNoLinesAndUnrecordedIsNotGreen)
+	mustRecord(t, a, auditActLoginOK, "operator")
 	h := func(w http.ResponseWriter, r *http.Request) {
 		_ = adminAudit.fromRequest(r, auditActUserCreate, "alice", true, "created")
 		w.WriteHeader(http.StatusOK)
@@ -995,10 +998,164 @@ func TestAuditCleanStopWithARealSignal(t *testing.T) {
 			if m["ok"] != false || m["state"] != "broken" {
 				t.Fatalf("%d newest records were cut after a clean stop and verify says %v", tc.cut, m)
 			}
+			if r, _ := m["reason"].(string); !strings.Contains(r, fmt.Sprintf("the newest %d records are missing", tc.cut)) {
+				t.Fatalf("the verify answer does not carry the finding: %v", m)
+			}
 			ns := b.readNotices()
 			if len(ns) != 1 || ns[0].Kind != adminAuditNoticeBroken || !strings.Contains(ns[0].Reason, fmt.Sprintf("the newest %d records are missing", tc.cut)) {
 				t.Fatalf("the start did not say what is missing: %+v", ns)
 			}
 		})
+	}
+}
+
+// N1: a new deployment whose sentinel cannot be created must not start (it would answer every admin action and
+// record none of them), the way an existing trail without a creatable sentinel already does. The refused start
+// leaves nothing behind that the next start would read as an older trail.
+func TestAuditNewDeploymentWithAnUncreatableSentinelDoesNotStart(t *testing.T) {
+	root := t.TempDir()
+	blocker := filepath.Join(root, "a-file")
+	if err := os.WriteFile(blocker, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for name, sentinel := range map[string]string{
+		"directory missing":   filepath.Join(root, "no-such-dir", ".admin-audit-initialized"),
+		"parent is not a dir": filepath.Join(blocker, ".admin-audit-initialized"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			trail := filepath.Join(t.TempDir(), "audit", "admin-audit.log")
+			a, err := openAdminAuditLogWithSentinel(trail, "", sentinel)
+			if err == nil {
+				a.Close()
+				t.Fatal("the panel started although the sentinel cannot be created: every admin action would go unrecorded")
+			}
+			if !strings.Contains(err.Error(), "--admin-audit.sentinel") || !strings.Contains(err.Error(), sentinel) {
+				t.Fatalf("the refusal must name the flag and the path: %v", err)
+			}
+			left, _ := filepath.Glob(trail + "*")
+			if len(left) != 0 {
+				t.Fatalf("the refused start left files of a trail behind: %v", left)
+			}
+			// the operator repairs the flag: a start on the same directory is a fresh deployment, verified
+			good := filepath.Join(t.TempDir(), ".admin-audit-initialized")
+			b, err := openAdminAuditLogWithSentinel(trail, "", good)
+			if err != nil {
+				t.Fatalf("a fresh deployment with a writable sentinel path must start: %v", err)
+			}
+			defer b.Close()
+			if ok, bad := b.Verify(); bad != nil || ok == nil || !ok.OK {
+				t.Fatalf("fresh deployment, no line yet: %+v %+v", ok, bad)
+			}
+			if _, err := os.Lstat(good); err == nil {
+				t.Fatal("the sentinel was created at the start: a start and a stop with no line would then read as a lost trail")
+			}
+			if left, _ := filepath.Glob(good + ".probe-*"); len(left) != 0 {
+				t.Fatalf("the probe file stays behind: %v", left)
+			}
+			mustRecord(t, b, auditActLoginOK, "operator")
+			if ok, bad := b.Verify(); bad != nil || ok == nil || ok.State != adminAuditStateVerified || ok.Lines != 1 {
+				t.Fatalf("first verify of the fresh deployment: %+v %+v", ok, bad)
+			}
+		})
+	}
+}
+
+// the same proof for an empty trail file left by a start that was cut off (not a new deployment, no sentinel)
+func TestAuditEmptyTrailFileWithAnUncreatableSentinelDoesNotStart(t *testing.T) {
+	trail := filepath.Join(t.TempDir(), "audit", "admin-audit.log")
+	good := filepath.Join(t.TempDir(), ".admin-audit-initialized")
+	a, err := openAdminAuditLogWithSentinel(trail, "", good)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Close()
+	_ = os.Remove(a.checkpointPath())
+	bad := filepath.Join(t.TempDir(), "no-such-dir", ".admin-audit-initialized")
+	if b, err := openAdminAuditLogWithSentinel(trail, "", bad); err == nil {
+		b.Close()
+		t.Fatal("started with an empty trail file and a sentinel that cannot be created")
+	} else if !strings.Contains(err.Error(), "--admin-audit.sentinel") {
+		t.Fatalf("the refusal must name the flag: %v", err)
+	}
+	if _, err := os.Lstat(trail + ".continuity-lost"); err == nil {
+		t.Fatal("a refused start wrote a finding")
+	}
+}
+
+// N1, belt and braces: no line in the files and records the panel failed to write is never "verified".
+func TestAuditVerifyWithNoLinesAndUnrecordedIsNotGreen(t *testing.T) {
+	asAdmin(t)
+	a := useAdminAudit(t, "")
+	a.noSync = true
+	a.fault = func(op string) error {
+		if op == "sentinel" {
+			return errors.New("injected: read-only file system")
+		}
+		return nil
+	}
+	for i := 0; i < 7; i++ {
+		if _, err := a.Record("x", auditActUserCreate, "u", "s", adminAuditResultOK, "d"); err == nil {
+			t.Fatal("a line was recorded without a sentinel")
+		}
+	}
+	code, m := honestVerify(t)
+	if code != 200 || m["ok"] != false || m["state"] != adminAuditStateUnverified {
+		t.Fatalf("0 lines and 7 records not recorded must not verify green: %d %v", code, m)
+	}
+	if r, _ := m["reason"].(string); !strings.Contains(r, "failed to record 7") {
+		t.Fatalf("the answer must say why: %v", m)
+	}
+}
+
+// N2: a broken answer carries the sentence of the start that saw the cut. After a restart the line written
+// next has the seq the checkpoint implies, so the walk fails first on "seq is X, expected Y"; the finding
+// ("the newest N records are missing") must be in the reason as well, as it is in the start log and in the
+// finding file. The fields that exist keep their meaning.
+func TestAuditBrokenAnswerCarriesTheFinding(t *testing.T) {
+	asAdmin(t)
+	for _, cut := range []int{1, 3} {
+		t.Run(fmt.Sprintf("cut %d", cut), func(t *testing.T) {
+			a := useAdminAudit(t, "")
+			a.noSync = true
+			for i := 0; i < 20; i++ {
+				mustRecord(t, a, auditActUserCreate, "u")
+			}
+			a.Close()
+			cutNewestLines(t, a.path, cut)
+			b := restartAudit(t, a.path)
+			mustRecord(t, b, auditActLoginOK, "operator") // what the first request after the restart does
+			code, m := honestVerify(t)
+			if code != 200 || m["ok"] != false || m["state"] != "broken" {
+				t.Fatalf("%d records cut after a clean stop: %d %v", cut, code, m)
+			}
+			reason, _ := m["reason"].(string)
+			want := fmt.Sprintf("the newest %d records are missing", cut)
+			if !strings.Contains(reason, want) {
+				t.Fatalf("the answer must carry %q: %v", want, m)
+			}
+			if wantSeq := float64(20 - cut + 1); m["brokenAt"] != wantSeq || !strings.Contains(reason, fmt.Sprintf("seq is 21, expected %d", 20-cut+1)) {
+				t.Fatalf("brokenAt and the walk's own reason must stay: %v", m)
+			}
+			if strings.Count(reason, want) != 1 {
+				t.Fatalf("the sentence must appear once: %v", reason)
+			}
+		})
+	}
+}
+
+// a broken answer with no finding on disk is not changed
+func TestAuditBrokenAnswerWithoutFindingIsUnchanged(t *testing.T) {
+	a := openTestAudit(t, "")
+	a.noSync = true
+	for i := 0; i < 5; i++ {
+		mustRecord(t, a, auditActUserCreate, "u")
+	}
+	data, _ := os.ReadFile(a.path)
+	if err := os.WriteFile(a.path, bytes.Replace(data, []byte(`"user.create"`), []byte(`"user.delete"`), 1), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, bad := a.Verify()
+	if bad == nil || bad.State != adminAuditStateBroken || strings.Contains(bad.Reason, "continuity-lost") {
+		t.Fatalf("%+v", bad)
 	}
 }
