@@ -137,6 +137,14 @@
 #       of the user of this process, or cannot be converted: init fails, naming the file, and so do setup, check, ban and unban; nothing is
 #       published from it. configure.sh stops the container with OVPN_BAN_REQUIRED=true (without it the container runs without the ban
 #       engine, loudly). The history is never reported as empty because it could not be read.
+#   Two more refusals, both for a history that is cut short and would otherwise lose permanent bans without a sound:
+#     - a history file (current or earlier format) that is not empty and does not end in a newline: every writer ends each row with one;
+#     - a migration or in-place conversion whose result lacks a permanent entry of the ban list of the earlier release (old_lists: the ban list
+#       of this engine, and bans.tsv in OVPN_BAN_LEGACY_DIR): a cut at a row end, or an emptied file, still parses. init fails and the message
+#       names the ban list and the history. To start without those bans on purpose, move both files away.
+#   Not covered: a history in the CURRENT format cut exactly at a row end, or emptied, is a valid history of fewer bans (that includes a
+#   zero-byte file that OVPN_BAN_HISTORY itself names: an operator who lifted every ban has exactly that file). The ban list is emptied and
+#   rebuilt from the history at every start, so there is no second record to compare it with, and none is compared.
 # A container restart keeps the bans in force: init empties the chains and the list, setup puts back every permanent ban and every
 # TEMPORARY ban that has not run out (restore_temporary) with its original end, from the history (rule and row together, so /api/bans and the
 # firewall agree; a ban that ran out while the container was down is not restored; one the operator lifted is not in the history any more).
@@ -495,6 +503,10 @@ def classify_file(path, bantime=3600):
             data = f.read()
         except UnicodeDecodeError:
             fail(7, "%s is not text: format not recognised" % path)
+    if data and not data.endswith("\n"):
+        # every writer ends each row with a newline: a last row without one is a file that was cut short, and a cut can leave a row that still
+        # parses (the rows after it are simply gone)
+        fail(7, "%s does not end in a newline: the file is cut short (every row of the ban history ends with one): format not recognised" % path)
     new, old = [], []
     for n, line in enumerate(data.split("\n"), 1):
         if line == "":
@@ -666,10 +678,50 @@ def cmd_temp(path, now):
         print("%s\t%d\t%d\t%s\t%d" % (entry_text(r.net), r.net.version, r.t, r.reason, r.sec))
 
 
-def cmd_migrate(bantime, *paths):
+def old_perm_entries(path):
+    """The permanent entries (expires_at 0) of the ban list of the earlier release at PATH, as (network, line number). A file that does not
+    exist has none. One that cannot be read exits 2; one that is cut short or has a row that is not a ban list row exits 7: its permanent
+    bans are then unknown and are never taken for "none". The ban list is written whole and atomically with a newline after every row."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return []
+    with os.fdopen(fd, encoding="utf-8", newline="") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            fail(2, "%s is not a regular file" % path)
+        try:
+            data = f.read()
+        except UnicodeDecodeError:
+            fail(7, "%s is not text: its permanent bans cannot be compared with the ban history" % path)
+    if data and not data.endswith("\n"):
+        fail(7, "the ban list %s does not end in a newline: the file is cut short, its permanent bans cannot be compared with the ban history" % path)
+    out = []
+    for n, line in enumerate(data.split("\n"), 1):
+        if line == "":
+            continue
+        p = line.split("\t")
+        try:
+            if len(p) < 3:
+                raise ValueError("fields")
+            net, exp = ipaddress.ip_network(p[0], strict=False), int(p[2])
+            if exp < 0:
+                raise ValueError("negative")
+        except ValueError:
+            fail(7, "the ban list %s: line %d is not a ban list row (address, banned_at, expires_at, ...): its permanent bans cannot be compared with the ban history" % (path, n))
+        if exp == 0:
+            out.append((net, n))
+    return out
+
+
+def cmd_migrate(bantime, nold, *rest):
     """The per-address history of the earlier releases (ban-history.tsv: ip, count, first, last, permanent, reason, failures) as offence
     rows; a legacy IPv6 address keeps its single-address scope (prefix 128). A path that does not exist is skipped; one that cannot be
-    read exits 2, one that is not entirely in the earlier format exits 7: nothing is produced from a file that is only partly understood."""
+    read exits 2, one that is not entirely in the earlier format exits 7: nothing is produced from a file that is only partly understood.
+    REST is NOLD ban lists of the earlier release followed by the history files. A ban list says what was banned: every permanent entry
+    in it must be a permanent row (or lie inside a permanent network) of the migrated history, else exit 7 and nothing is produced: a
+    history that was cut at a row end, or emptied, still parses, and the permanent bans after the cut would be lost without a sound."""
+    nold = int(nold)
+    olds, paths = rest[:nold], rest[nold:]
     rows, seen = [], set()
     for p in paths:
         kind, rs = classify_file(p, bantime)
@@ -680,6 +732,13 @@ def cmd_migrate(bantime, *paths):
             if r.line() not in seen:
                 seen.add(r.line())
                 rows.append(r)
+    perm = [r.net for r in rows if r.sec == 0]
+    for o in olds:
+        lost = [n for n, _ in old_perm_entries(o) if not any(n.version == q.version and n.subnet_of(q) for q in perm)]
+        if lost:
+            fail(7, "the ban list %s holds %d permanent ban(s) (%s%s) that the ban history %s does not: that history is cut short or incomplete. "
+                    "Nothing was migrated and the start is refused. Restore both files from a backup, or move both away to start without these bans"
+                 % (o, len(lost), ", ".join(entry_text(n) for n in lost[:5]), ", ..." if len(lost) > 5 else "", " and ".join(paths)))
     emit(rows)
 
 
@@ -1763,6 +1822,30 @@ hist_gate() {
   return 2
 }
 
+# old_lists: sets OLDL to the ban list(s) of the earlier release that exist (the ban list of this engine, which in the earlier layout is the one
+# the old release wrote, and bans.tsv in the directory of the earlier layout, OVPN_BAN_LEGACY_DIR). A migration is checked against them: every
+# permanent entry in them must be in the migrated history (cmd_migrate), because a history file that was cut short, or emptied, still parses and
+# its missing rows are not seen by any format check. Returns 1, the file named, when one exists and cannot be read, or lies in the directory of the
+# earlier layout and is not a plain file of ours: its permanent bans are unknown, so nothing is migrated.
+old_lists() {
+  local f st
+  local -a cand=("$STATE")
+  OLDL=()
+  [ "$LEGACY_DIR/bans.tsv" = "$STATE" ] || cand+=("$LEGACY_DIR/bans.tsv")
+  for f in "${cand[@]}"; do
+    st=0
+    file_state "$f" || st=$?
+    case "$st" in
+      1) ;;
+      0) OLDL+=("$f") ;;
+      *) echo "ovpn-ban: ERROR: the ban list $f exists but cannot be read (permissions, a link or an I/O error): its permanent bans cannot be compared with the history, not migrated" >&2; return 1 ;;
+    esac
+    if [ "$st" -eq 0 ] && [ "$f" != "$STATE" ]; then
+      pylib trust 0 "$f" >&2 || { echo "ovpn-ban: ERROR: the ban list $f is not trusted (see above): not migrated" >&2; return 1; }
+    fi
+  done
+}
+
 # migrate_legacy: the per-address history of the earlier releases (ban-history.tsv: 7 fields, one row per address with a counter and a
 # permanent flag) becomes offence rows (6 fields) in the history, once. A permanent address stays permanent. The old file is renamed to
 # ban-history.tsv.migrated, never deleted. The caller holds the lock. Returns 1 (and says which file) when it cannot do it, and then
@@ -1787,10 +1870,15 @@ migrate_legacy() {
         [ "$f" != "$HISTORY" ] && [ "$lst" -ne 1 ] && echo "ovpn-ban: WARNING: the ban history of the earlier releases $f exists next to the current history $HISTORY and is NOT used; check it for permanent bans and remove it" >&2
       done
       [ "$kind" = "legacy" ] || return 0
+      old_lists || return 1
       backup="${HISTORY}.legacy-format"
       [ -e "$backup" ] || [ -L "$backup" ] && backup="${backup}.$(date +%s)"
       cp -p -- "$HISTORY" "$backup" || { echo "ovpn-ban: ERROR: cannot keep a copy of $HISTORY as $backup: not converted" >&2; return 1; }
-      publish "$HISTORY" pylib migrate "$mig" "$HISTORY" || { echo "ovpn-ban: ERROR: cannot convert the ban history $HISTORY to the current format" >&2; return 1; }
+      publish "$HISTORY" pylib migrate "$mig" "${#OLDL[@]}" ${OLDL[@]+"${OLDL[@]}"} "$HISTORY" || {
+        rm -f -- "$backup"   # the copy of a file that stays as it is
+        echo "ovpn-ban: ERROR: cannot convert the ban history $HISTORY to the current format (see above): the file is left as it is" >&2
+        return 1
+      }
       echo "ovpn-ban: converted the ban history $HISTORY from the format of the earlier releases (the original is kept as $backup)" >&2
       return 0 ;;
     1) ;;
@@ -1809,7 +1897,8 @@ migrate_legacy() {
   [ "${#present[@]}" -gt 0 ] || return 0
   # a file in the directory of the earlier layout (the VPN hook user owned that directory) is read only when it is a plain file of ours
   pylib trust 0 "${present[@]}" >&2 || { echo "ovpn-ban: ERROR: the ban history of the earlier releases ${present[*]} is not trusted (see above): not migrated" >&2; return 1; }
-  publish "$HISTORY" pylib migrate "$mig" "${present[@]}" || { echo "ovpn-ban: ERROR: cannot migrate the ban history ${present[*]} to $HISTORY (see above): nothing migrated" >&2; return 1; }
+  old_lists || return 1
+  publish "$HISTORY" pylib migrate "$mig" "${#OLDL[@]}" ${OLDL[@]+"${OLDL[@]}"} "${present[@]}" || { echo "ovpn-ban: ERROR: cannot migrate the ban history ${present[*]} to $HISTORY (see above): nothing migrated" >&2; return 1; }
   for f in "${present[@]}"; do
     mv -f "$f" "${f}.migrated" 2>/dev/null || echo "ovpn-ban: WARNING: cannot rename $f to ${f}.migrated; the new history $HISTORY is used from now on" >&2
     echo "ovpn-ban: migrated the ban history $f to $HISTORY (the old file is kept as ${f}.migrated)" >&2
@@ -1839,14 +1928,23 @@ txn_housekeeping() {
 # init: DROP rules and ban list are cleared, the ban history stays (decayed offences are pruned, an old history is migrated); the start
 # time is recorded for the restart rule of the ban decision. Fails (status 1, the file named on stderr) when the history of the permanent
 # bans is unknown (hist_gate): the caller (configure.sh) stops the container with OVPN_BAN_REQUIRED=true. The chains and the list are
-# emptied here; the bans in force (permanent, and temporary ones that have not run out) are put back from the history by setup.
+# emptied here; the bans in force (permanent, and temporary ones that have not run out) are put back from the history by setup. The
+# migration runs before the list is emptied (it is checked against the old list, see old_lists), and a start that fails empties the chains
+# only: the list stays as the record of what was banned.
 cmd_init() {
   local rc=0
   mkdir -p "$(dirname "$STATE")" || die "cannot create $(dirname "$STATE")"
   trust_state || exit 1
-  with_state_lock txn_flush || die "cannot empty the ban chains and reset $STATE"
+  # Migration and gate first: the ban list of an earlier release is what a migration is checked against (old_lists), and the flush empties it.
   with_state_lock txn_housekeeping || true
   with_state_lock hist_gate || rc=1
+  if [ "$rc" -eq 0 ]; then
+    with_state_lock txn_flush || die "cannot empty the ban chains and reset $STATE"
+  else
+    # an unknown history: the chains are emptied, the ban list is NOT. It is the only record of the permanent bans left, and the next start
+    # compares the migration against it again (a start that is refused and tried again must not pass because the first one emptied it)
+    with_state_lock flush_chains || die "cannot empty the ban chains"
+  fi
   date +%s | write_file "$BOOT_FILE" || die "cannot write $BOOT_FILE"
   if [ "$rc" -ne 0 ]; then
     echo "ovpn-ban: ERROR: init: the history of the permanent bans is unknown (see above): the ban engine cannot restore them" >&2
