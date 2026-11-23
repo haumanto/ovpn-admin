@@ -294,6 +294,8 @@ func (oAdmin *OvpnAdmin) userCreateHandler(w http.ResponseWriter, r *http.Reques
 	}
 	_ = r.ParseForm()
 	userCreated, userCreateStatus, status := oAdmin.userCreateStatus(r.FormValue("username"), r.FormValue("password"))
+	adminAudit.fromRequest(r, auditActUserCreate, r.FormValue("username"), userCreated,
+		auditDetail(userCreated, "client certificate issued", userCreateStatus), r.FormValue("password"))
 
 	if userCreated {
 		oAdmin.clients = oAdmin.usersList()
@@ -315,6 +317,8 @@ func (oAdmin *OvpnAdmin) userRotateHandler(w http.ResponseWriter, r *http.Reques
 	}
 	_ = r.ParseForm()
 	err, msg := oAdmin.userRotate(r.FormValue("username"), r.FormValue("password"))
+	adminAudit.fromRequest(r, auditActUserRotate, r.FormValue("username"), err == nil,
+		auditErrDetail(err, "certificate rotated"), r.FormValue("password"))
 	if err != nil {
 		http.Error(w, err.Error(), userOpErrorStatus(err))
 	} else {
@@ -334,6 +338,8 @@ func (oAdmin *OvpnAdmin) userDeleteHandler(w http.ResponseWriter, r *http.Reques
 	}
 	_ = r.ParseForm()
 	err, msg := oAdmin.userDelete(r.FormValue("username"))
+	adminAudit.fromRequest(r, auditActUserDelete, r.FormValue("username"), err == nil,
+		auditErrDetail(err, "user deleted"))
 	if err != nil {
 		http.Error(w, err.Error(), userOpErrorStatus(err))
 	} else {
@@ -353,6 +359,8 @@ func (oAdmin *OvpnAdmin) userRevokeHandler(w http.ResponseWriter, r *http.Reques
 	}
 	_ = r.ParseForm()
 	err, msg := oAdmin.userRevoke(r.FormValue("username"))
+	adminAudit.fromRequest(r, auditActUserRevoke, r.FormValue("username"), err == nil,
+		auditErrDetail(err, "certificate revoked"))
 	if err != nil {
 		http.Error(w, err.Error(), userOpErrorStatus(err))
 	} else {
@@ -372,6 +380,8 @@ func (oAdmin *OvpnAdmin) userUnrevokeHandler(w http.ResponseWriter, r *http.Requ
 	}
 	_ = r.ParseForm()
 	err, msg := oAdmin.userUnrevoke(r.FormValue("username"))
+	adminAudit.fromRequest(r, auditActUserUnrevoke, r.FormValue("username"), err == nil,
+		auditErrDetail(err, "certificate restored"))
 	if err != nil {
 		http.Error(w, err.Error(), userOpErrorStatus(err))
 	} else {
@@ -392,6 +402,8 @@ func (oAdmin *OvpnAdmin) userChangePasswordHandler(w http.ResponseWriter, r *htt
 	_ = r.ParseForm()
 	if *authByPassword {
 		err, msg := oAdmin.userChangePassword(r.FormValue("username"), r.FormValue("password"))
+		adminAudit.fromRequest(r, auditActUserChangePassword, r.FormValue("username"), err == nil,
+			auditErrDetail(err, "password changed"), r.FormValue("password"))
 		status, code := "ok", http.StatusOK
 		if err != nil {
 			status, code = "error", http.StatusInternalServerError
@@ -404,6 +416,8 @@ func (oAdmin *OvpnAdmin) userChangePasswordHandler(w http.ResponseWriter, r *htt
 		w.WriteHeader(code)
 		_, _ = w.Write(body)
 	} else {
+		adminAudit.fromRequest(r, auditActUserChangePassword, r.FormValue("username"), false,
+			"password authentication is not enabled")
 		http.Error(w, `{"status":"error"}`, http.StatusNotImplemented)
 	}
 
@@ -412,7 +426,10 @@ func (oAdmin *OvpnAdmin) userChangePasswordHandler(w http.ResponseWriter, r *htt
 func (oAdmin *OvpnAdmin) userShowConfigHandler(w http.ResponseWriter, r *http.Request) {
 	log.Info(r.RemoteAddr, " ", r.URL.Path)
 	_ = r.ParseForm()
+	found := usernameIsPathSafe(r.FormValue("username")) && checkUserExist(r.FormValue("username"))
 	fmt.Fprint(w, oAdmin.renderClientConfig(r.FormValue("username")))
+	adminAudit.fromRequest(r, auditActUserConfigDownload, r.FormValue("username"), found,
+		auditDetail(found, "client configuration shown", "user not found"))
 }
 
 func (oAdmin *OvpnAdmin) userDisconnectHandler(w http.ResponseWriter, r *http.Request) {
@@ -421,6 +438,9 @@ func (oAdmin *OvpnAdmin) userDisconnectHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 	_ = r.ParseForm()
+	// the handler answers 200 but disconnects nobody (the call is commented out below): the trail says so
+	adminAudit.fromRequest(r, auditActUserDisconnect, r.FormValue("username"), false,
+		"not implemented: no session was disconnected")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	// 	fmt.Fprintf(w, "%s", userDisconnect(r.FormValue("username")))
 	fmt.Fprintf(w, "%s", r.FormValue("username"))
@@ -461,11 +481,14 @@ func (oAdmin *OvpnAdmin) userApplyCcdHandler(w http.ResponseWriter, r *http.Requ
 	err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&ccd)
 	if err != nil {
 		log.Errorln(err)
+		adminAudit.fromRequest(r, auditActUserCcdApply, "", false, "the request body was refused")
 		http.Error(w, "invalid request body: "+err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
 
 	ccdApplied, applyStatus := oAdmin.modifyCcd(ccd)
+	adminAudit.fromRequest(r, auditActUserCcdApply, ccd.User, ccdApplied,
+		auditDetail(ccdApplied, "client-config-dir entry written", applyStatus))
 
 	if ccdApplied {
 		w.WriteHeader(http.StatusOK)
@@ -509,6 +532,7 @@ func (oAdmin *OvpnAdmin) downloadCertsHandler(w http.ResponseWriter, r *http.Req
 	token := r.Form.Get("token")
 
 	if !syncTokenMatches(oAdmin.masterSyncToken, token) {
+		adminAudit.fromRequest(r, auditActSyncExport, certsArchiveFileName, false, "sync token rejected")
 		http.Error(w, `{"status":"error"}`, http.StatusForbidden)
 		return
 	}
@@ -517,6 +541,7 @@ func (oAdmin *OvpnAdmin) downloadCertsHandler(w http.ResponseWriter, r *http.Req
 	// and users.db, so it must not sit in /tmp afterwards
 	archive, err := archiveCerts()
 	if err != nil {
+		adminAudit.fromRequest(r, auditActSyncExport, certsArchiveFileName, false, "the archive could not be built")
 		log.Errorf("downloadCertsHandler: no archive is served: %s", err)
 		http.Error(w, `{"status":"error","msg":"the sync archive cannot be built: the identity of the CA signing key is not usable, see the admin log"}`, http.StatusInternalServerError)
 		return
@@ -524,6 +549,7 @@ func (oAdmin *OvpnAdmin) downloadCertsHandler(w http.ResponseWriter, r *http.Req
 	defer removeArchive(archive)
 	w.Header().Set("Content-Disposition", "attachment; filename="+certsArchiveFileName)
 	http.ServeFile(w, r, archive)
+	adminAudit.fromRequest(r, auditActSyncExport, certsArchiveFileName, true, "PKI archive served to the caller")
 }
 
 func (oAdmin *OvpnAdmin) downloadCcdHandler(w http.ResponseWriter, r *http.Request) {
@@ -540,12 +566,14 @@ func (oAdmin *OvpnAdmin) downloadCcdHandler(w http.ResponseWriter, r *http.Reque
 	token := r.Form.Get("token")
 
 	if !syncTokenMatches(oAdmin.masterSyncToken, token) {
+		adminAudit.fromRequest(r, auditActSyncExport, ccdArchiveFileName, false, "sync token rejected")
 		http.Error(w, `{"status":"error"}`, http.StatusForbidden)
 		return
 	}
 
 	archive, err := archiveCcd()
 	if err != nil {
+		adminAudit.fromRequest(r, auditActSyncExport, ccdArchiveFileName, false, "the archive could not be built")
 		log.Errorf("downloadCcdHandler: %s", err)
 		http.Error(w, `{"status":"error"}`, http.StatusInternalServerError)
 		return
@@ -553,6 +581,7 @@ func (oAdmin *OvpnAdmin) downloadCcdHandler(w http.ResponseWriter, r *http.Reque
 	defer removeArchive(archive)
 	w.Header().Set("Content-Disposition", "attachment; filename="+ccdArchiveFileName)
 	http.ServeFile(w, r, archive)
+	adminAudit.fromRequest(r, auditActSyncExport, ccdArchiveFileName, true, "client-config-dir archive served to the caller")
 }
 
 var app OpenVPNPKI
@@ -574,6 +603,11 @@ func main() {
 
 	if err := initNetworkConfig(); err != nil {
 		log.Fatal(err)
+	}
+
+	// no trail, no panel: a record that cannot be written must not be dropped silently
+	if err := initAdminAudit(); err != nil {
+		log.Fatalf("admin audit trail: %v", err)
 	}
 
 	if *storageBackend == "kubernetes.secrets" {
@@ -670,6 +704,8 @@ func main() {
 	http.HandleFunc(*listenBaseUrl+"api/unban", ovpnAdmin.unbanHandler)
 	http.HandleFunc(*listenBaseUrl+"api/user/ccd", ovpnAdmin.userShowCcdHandler)
 	http.HandleFunc(*listenBaseUrl+"api/user/ccd/apply", ovpnAdmin.userApplyCcdHandler)
+	http.HandleFunc(*listenBaseUrl+"api/audit/admin", ovpnAdmin.adminAuditListHandler)
+	http.HandleFunc(*listenBaseUrl+"api/audit/verify", ovpnAdmin.adminAuditVerifyHandler)
 
 	http.HandleFunc(*listenBaseUrl+"api/sync/last/try", ovpnAdmin.lastSyncTimeHandler)
 	http.HandleFunc(*listenBaseUrl+"api/sync/last/successful", ovpnAdmin.lastSuccessfulSyncTimeHandler)
@@ -792,11 +828,13 @@ func basicAuthMiddleware(next http.Handler, username, password string, openPaths
 			// proxy remote is the proxy address, so the line serves detection, not banning.
 			if r.Header.Get("Authorization") != "" {
 				log.Warnf("auth failed remote=%s path=%s", r.RemoteAddr, r.URL.Path)
+				adminAudit.loginFail(r, gotUser)
 			}
 			w.Header().Set("WWW-Authenticate", `Basic realm="ovpn-admin", charset="UTF-8"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+		adminAudit.loginOK(r, gotUser)
 		next.ServeHTTP(w, r)
 	})
 }
@@ -2589,6 +2627,9 @@ func (oAdmin *OvpnAdmin) crlRefresh(now time.Time) bool {
 			}
 		}()
 		return rebuildCrl()
+	}()
+	defer func() {
+		adminAudit.system(auditActCrlRebuild, "crl.pem", err == nil, auditErrDetail(err, "scheduled rebuild: "+why))
 	}()
 	if err == nil {
 		var after time.Time

@@ -302,6 +302,14 @@ func (oAdmin *OvpnAdmin) banControlHandler(action string) http.HandlerFunc {
 			return
 		}
 		_ = r.ParseForm()
+		auditAction := auditActBanManual
+		if action == "unban" {
+			auditAction = auditActUnban
+		}
+		// the answer of the ban watcher is its own text; the trail keeps a fixed sentence per outcome
+		record := func(ip string, ok bool, detail string) {
+			adminAudit.fromRequest(r, auditAction, ip, ok, detail)
+		}
 		force := false
 		minutes := 0
 		if action == "ban" {
@@ -309,6 +317,7 @@ func (oAdmin *OvpnAdmin) banControlHandler(action string) http.HandlerFunc {
 			force, ferr = parseBanForce(r.PostFormValue("force"))
 			minutes, merr = validateBanMinutes(r.PostFormValue("minutes"))
 			if err := errors.Join(ferr, merr); err != nil {
+				record(r.PostFormValue("ip"), false, "the request was refused: "+err.Error())
 				writeBanControlJSON(w, http.StatusBadRequest, "error", err.Error())
 				return
 			}
@@ -321,6 +330,7 @@ func (oAdmin *OvpnAdmin) banControlHandler(action string) http.HandlerFunc {
 			ip, err = validateBanTarget(r.PostFormValue("ip"), force)
 		}
 		if err != nil {
+			record(r.PostFormValue("ip"), false, "the address was refused: "+err.Error())
 			writeBanControlJSON(w, http.StatusBadRequest, "error", err.Error())
 			return
 		}
@@ -328,12 +338,14 @@ func (oAdmin *OvpnAdmin) banControlHandler(action string) http.HandlerFunc {
 		if action == "ban" {
 			reason = r.PostFormValue("reason")
 			if err := validateBanReason(reason); err != nil {
+				record(ip, false, "the reason was refused: "+err.Error())
 				writeBanControlJSON(w, http.StatusBadRequest, "error", err.Error())
 				return
 			}
 		}
 		dir := banControlDir()
 		if dir == "" {
+			record(ip, false, "ban control is not available")
 			writeBanControlJSON(w, http.StatusInternalServerError, "error", "ban control is not available: no audit path is configured")
 			return
 		}
@@ -341,18 +353,22 @@ func (oAdmin *OvpnAdmin) banControlHandler(action string) http.HandlerFunc {
 		switch {
 		case errors.Is(err, errBanControlTimeout):
 			log.Warnf("ban control: %s %s: no answer from the ban watcher", action, ip)
+			record(ip, false, "the ban watcher did not answer in time")
 			writeBanControlJSON(w, http.StatusGatewayTimeout, "error", "The ban watcher did not answer in time. Check that the OpenVPN container is running.")
 		case err != nil:
 			log.Warnf("ban control: %s %s: %v", action, ip, err)
+			record(ip, false, "the ban watcher could not be reached: "+banControlErrorKind(err))
 			writeBanControlJSON(w, http.StatusInternalServerError, "error", "Could not reach the ban watcher: "+banControlErrorKind(err))
 		case !res.OK:
 			msg := res.Message
 			if msg == "" {
 				msg = "The ban watcher rejected the request."
 			}
+			record(ip, false, "the ban watcher rejected the request")
 			writeBanControlJSON(w, http.StatusBadRequest, "error", msg)
 		default:
 			log.Infof("ban control: %s %s ok", action, ip)
+			record(ip, true, "request carried out by the ban watcher")
 			writeBanControlJSON(w, http.StatusOK, "ok", res.Message)
 		}
 	}
