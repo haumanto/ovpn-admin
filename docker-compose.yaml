@@ -87,9 +87,10 @@ services:
       OVPN_TELEGRAM_THREAD_ID: "${OVPN_TELEGRAM_THREAD_ID:-}"
       OVPN_TELEGRAM_API_BASE: "${OVPN_TELEGRAM_API_BASE:-https://api.telegram.org}"
       OVPN_TELEGRAM_ALLOW_HTTP: "${OVPN_TELEGRAM_ALLOW_HTTP:-false}"
-      # The ban and unban messages carry the reason, the offence number, the duration and the host, and no address and no user name.
-      # true adds the address (the network for an IPv6 ban) to the message.
-      OVPN_TELEGRAM_INCLUDE_ADDRESS: "${OVPN_TELEGRAM_INCLUDE_ADDRESS:-false}"
+      # The ban message carries the address (the network for an IPv6 ban), the reason, the user name when the audit log knows it, the offence
+      # number, the duration and the host; the unban message carries the address. true is the default (v0.1.11 sent neither address nor name);
+      # false leaves the address and the user name out.
+      OVPN_TELEGRAM_INCLUDE_ADDRESS: "${OVPN_TELEGRAM_INCLUDE_ADDRESS:-true}"
     cap_add:
       - NET_ADMIN
     sysctls:

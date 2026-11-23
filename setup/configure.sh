@@ -36,8 +36,8 @@ BAN_MAX_ENTRIES="${OVPN_BAN_MAX_ENTRIES:-500}"
 # seconds between two runs of the expiry of temporary bans (the watcher, and the supervisor while the watcher is down)
 BAN_SWEEP_SECONDS="${OVPN_BAN_SWEEP_SECONDS:-30}"
 export OVPN_BAN_SWEEP_SECONDS="${BAN_SWEEP_SECONDS}"
-# the Telegram ban message carries no address and no user name unless this is true
-TG_INCLUDE_ADDRESS="${OVPN_TELEGRAM_INCLUDE_ADDRESS:-false}"
+# the Telegram ban message carries the address and the user name unless this is false (default true since v0.1.12; v0.1.11 left both out)
+TG_INCLUDE_ADDRESS="${OVPN_TELEGRAM_INCLUDE_ADDRESS:-true}"
 # The enforced port and transport are derived below from OVPN_SERVER_PORT and OVPN_PROTO, the values of the openvpn command
 # line. OVPN_BAN_PORT is only an optional assertion: when set it must equal the derived listener port or the container stops.
 BAN_PORT_ASSERT="${OVPN_BAN_PORT:-}"

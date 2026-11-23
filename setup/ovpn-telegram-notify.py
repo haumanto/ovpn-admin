@@ -2,12 +2,15 @@
 """Telegram notification for a new ban and the lifting of a ban of the ovpn-admin ban engine (called by ovpn-ban.sh, installed by
 configure.sh as /usr/local/sbin/ovpn-telegram-notify).
 
-    ovpn-telegram-notify ban ADDRESS REASON OFFENCE BAN_SECONDS
+    ovpn-telegram-notify ban ADDRESS REASON OFFENCE BAN_SECONDS [USER]
     ovpn-telegram-notify unban ADDRESS
     ovpn-telegram-notify --check-api-base URL      validate OVPN_TELEGRAM_API_BASE (and OVPN_TELEGRAM_ALLOW_HTTP) only: exit 0 valid,
                                                    2 invalid + reason on stderr
 
-ADDRESS is an address, a network or "-" (none): it only reaches the message with OVPN_TELEGRAM_INCLUDE_ADDRESS=true (default false).
+ADDRESS is an address, a network or "-" (none). USER is optional: the user name that the OpenVPN audit log knows for the address (ovpn-ban.sh
+looks it up), "-" = none. It must match [A-Za-z0-9][A-Za-z0-9._-]{0,63} (so no space, no newline, at most 64 characters): anything else is
+exit 2 with one line on stderr and nothing is sent (ovpn-ban.sh drops an invalid name itself, so the alert still goes out without it).
+ADDRESS and USER only reach the message with OVPN_TELEGRAM_INCLUDE_ADDRESS=true (the default); with false the message names neither.
 
 Configuration comes from the environment only, never from argv, a file or the output:
     OVPN_TELEGRAM_BOT_TOKEN    bot token (secret: never printed, never part of an error message)
@@ -16,21 +19,26 @@ Configuration comes from the environment only, never from argv, a file or the ou
     OVPN_TELEGRAM_API_BASE     default https://api.telegram.org; https:// always; http:// only with OVPN_TELEGRAM_ALLOW_HTTP=true
                                (see api_base for the rules on host, port, user info, query and fragment)
     OVPN_TELEGRAM_ALLOW_HTTP   default false; exactly "true" allows an http:// API base (local mock tests only)
-    OVPN_TELEGRAM_INCLUDE_ADDRESS  default false; exactly "true" adds the address to the message
+    OVPN_TELEGRAM_INCLUDE_ADDRESS  default true (unset or empty = true); "true" adds the address and the user name to the message, "false"
+                               leaves both out. Any other value is treated like "false" here (ovpn-ban.sh and configure.sh refuse it at start)
 
-The message is plain text (no parse_mode), at most 4000 characters, and carries no address and no user name by default:
-    🚫 ovpn-admin: banned            (with OVPN_TELEGRAM_INCLUDE_ADDRESS=true: "banned <address>")
+The message is plain text (no parse_mode) and at most 4000 characters. Since v0.1.12 it carries the address and, when known, the user name
+(v0.1.11 left both out as a privacy measure; the owner reversed that, OVPN_TELEGRAM_INCLUDE_ADDRESS=false restores the address-free text):
+    🚫 ovpn-admin: banned <address>   (address only with OVPN_TELEGRAM_INCLUDE_ADDRESS=true; the network for an IPv6 ban)
     Reason: <reason>                 (a manual ban: "manual", its note is never sent)
+    User: <name>                     (only with an address-including message and a USER argument other than "-")
     Offence: <n>                     (left out when 0: a manual ban of an address without offences)
     Duration: <10 minutes | 1 hour | 24 hours | permanent | ...>
+    Until: <YYYY-MM-DD HH:MM UTC | permanent>
     Server: <hostname>
 
-    ✅ ovpn-admin: ban lifted         (with OVPN_TELEGRAM_INCLUDE_ADDRESS=true: "ban lifted for <address>")
+    ✅ ovpn-admin: ban lifted for <address>   (no address with OVPN_TELEGRAM_INCLUDE_ADDRESS=false; never a user name)
     Server: <hostname>
+The user name is what the client typed at the login that failed: it is not verified, anybody can type any name. Treat it as a hint.
 
 Exit status: 0 sent, 1 delivery failed, 2 invalid input or configuration. On failure exactly one line starting with
 "ovpn-telegram-notify: WARNING" goes to stderr. It names the kind of message and of failure (HTTP status, error class), never the
-address; the response body is never printed because Telegram can echo the request, and the token is part of the request URL.
+address or the user name; the response body is never printed because Telegram can echo the request, and the token is part of the request URL.
 """
 
 import ipaddress
@@ -39,6 +47,7 @@ import os
 import re
 import socket
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -62,6 +71,7 @@ THREAD_ID_RE = re.compile(r"^[1-9][0-9]{0,15}$")
 MANUAL_REASON_RE = re.compile(r"^manual: [A-Za-z0-9._:-]([A-Za-z0-9 ._:-]{0,118}[A-Za-z0-9._:-])?$")
 FAILURES_RE = re.compile(r"^(0|[1-9][0-9]{0,9})$")
 EXPIRES_RE = re.compile(r"^(0|[1-9][0-9]{0,11})$")
+USER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")  # used with fullmatch: "$" would also match before a trailing newline
 HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
 BRACKET_RE = re.compile(r"^\[[0-9A-Fa-f:.]+\](:[0-9]+)?$")
 
@@ -141,22 +151,47 @@ def human_duration(seconds):
     return f"{seconds} seconds"
 
 
+def until_text(seconds, now=None):
+    """The end of the ban in UTC (now + seconds: the message is sent right after the ban), or "permanent"."""
+    if seconds == 0:
+        return "permanent"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(int(time.time() if now is None else now) + seconds))
+    except (OverflowError, ValueError, OSError):
+        return "beyond year 9999"
+
+
+def include_address(env):
+    """OVPN_TELEGRAM_INCLUDE_ADDRESS: unset or empty = the default (true), exactly "true" = true; "false" and anything else = no address."""
+    return env.get("OVPN_TELEGRAM_INCLUDE_ADDRESS", "") in ("", "true")
+
+
+def checked_user(value):
+    """The optional USER argument: None for "-", the name when it matches USER_RE, otherwise Invalid (the caller exits 2 and sends nothing)."""
+    if value == "-":
+        return None
+    if not USER_RE.fullmatch(value):
+        raise Invalid("USER is not a valid user name (1 to 64 characters of A-Za-z0-9._-, starting with a letter or digit), or \"-\"")
+    return value
+
+
 def shown_address(address, env):
-    """The address as it may appear in the message: None unless OVPN_TELEGRAM_INCLUDE_ADDRESS is exactly "true"; "-" means "none given"."""
+    """The address as it may appear in the message: None when OVPN_TELEGRAM_INCLUDE_ADDRESS says no; "-" means "none given"."""
     if address == "-":
         return None
     try:
         net = ipaddress.ip_network(address, strict=False)
     except ValueError:
         raise Invalid("ADDRESS is not an IPv4 or IPv6 address or network, or \"-\"") from None
-    if env.get("OVPN_TELEGRAM_INCLUDE_ADDRESS", "") != "true":
+    if not include_address(env):
         return None
     return str(net.network_address) if net.prefixlen == net.max_prefixlen else str(net)
 
 
-def build_message(kind, args, env):
-    """The text of a "ban" (ADDRESS REASON OFFENCE BAN_SECONDS) or "unban" (ADDRESS) message. It carries no address and no user name:
-    only the fixed vocabulary of the ban engine, numbers and the host name; the address is added only with OVPN_TELEGRAM_INCLUDE_ADDRESS=true."""
+def build_message(kind, args, env, now=None):
+    """The text of a "ban" (ADDRESS REASON OFFENCE BAN_SECONDS [USER]) or "unban" (ADDRESS) message: the fixed vocabulary of the ban engine,
+    numbers, the host name and, unless OVPN_TELEGRAM_INCLUDE_ADDRESS is false, the address and the validated user name. The free text of a
+    manual ban (its note) is never part of it."""
     host = socket.gethostname()
     if kind == "unban":
         if len(args) != 1:
@@ -164,9 +199,10 @@ def build_message(kind, args, env):
         addr = shown_address(args[0], env)
         head = "\u2705 ovpn-admin: ban lifted" + (f" for {addr}" if addr else "")
         return "\n".join([head, f"Server: {host}"])[:MAX_TEXT]
-    if len(args) != 4:
-        raise Invalid("ban needs ADDRESS REASON OFFENCE BAN_SECONDS")
-    address, reason, offence, seconds = args
+    if len(args) not in (4, 5):
+        raise Invalid("ban needs ADDRESS REASON OFFENCE BAN_SECONDS [USER]")
+    address, reason, offence, seconds = args[:4]
+    name = checked_user(args[4]) if len(args) == 5 else None
     addr = shown_address(address, env)
     if reason not in REASONS and not MANUAL_REASON_RE.fullmatch(reason):
         raise Invalid("REASON is not a known ban reason")
@@ -177,9 +213,11 @@ def build_message(kind, args, env):
     if not EXPIRES_RE.match(seconds):
         raise Invalid("BAN_SECONDS must be a number of seconds, or 0 for a permanent ban")
     lines = ["\U0001F6AB ovpn-admin: banned" + (f" {addr}" if addr else ""), f"Reason: {reason}"]
+    if name and include_address(env):  # with the address left out, the name is left out too
+        lines.append(f"User: {name}")
     if int(offence) > 0:
         lines.append(f"Offence: {int(offence)}")
-    lines += [f"Duration: {human_duration(int(seconds))}", f"Server: {host}"]
+    lines += [f"Duration: {human_duration(int(seconds))}", f"Until: {until_text(int(seconds), now)}", f"Server: {host}"]
     return "\n".join(lines)[:MAX_TEXT]
 
 
@@ -239,7 +277,7 @@ def main(argv):
             return 2
         return 0
     if len(argv) < 2 or argv[1] not in ("ban", "unban"):
-        print(f"usage: {PROG} ban ADDRESS REASON OFFENCE BAN_SECONDS | unban ADDRESS | --check-api-base URL", file=sys.stderr)
+        print(f"usage: {PROG} ban ADDRESS REASON OFFENCE BAN_SECONDS [USER] | unban ADDRESS | --check-api-base URL", file=sys.stderr)
         return 2
     kind = argv[1]
     try:

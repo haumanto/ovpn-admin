@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -936,90 +937,511 @@ func mockTelegram(t *testing.T) (*httptest.Server, func() []string) {
 	return srv, func() []string { mu.Lock(); defer mu.Unlock(); return append([]string{}, texts...) }
 }
 
-func TestBanScriptTelegramMessage(t *testing.T) {
-	t.Parallel()
+// writeBanAudit writes an audit log (setup/audit.sh format) and returns its path.
+func writeBanAudit(t *testing.T, rows ...string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "audit.tsv")
+	if err := os.WriteFile(p, []byte(strings.Join(rows, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// auditRow is one audit.tsv line: event time username real_ip real_port virtual_ip4 virtual_ip6 bytes_received bytes_sent
+func auditRow(event string, at int64, user, ip string) string {
+	return strings.Join([]string{event, fmt.Sprint(at), user, ip, "40000", "-", "-", "-", "-"}, "\t")
+}
+
+func tgEnv(srv *httptest.Server) []string {
+	return []string{
+		"OVPN_TELEGRAM_ENABLED=true", "OVPN_TELEGRAM_BOT_TOKEN=123456:TESTTOKENTESTTOKEN", "OVPN_TELEGRAM_CHAT_ID=42",
+		"OVPN_TELEGRAM_API_BASE=" + srv.URL, "OVPN_TELEGRAM_ALLOW_HTTP=true",
+	}
+}
+
+// realNotifier installs a wrapper of the real notifier in the rig and returns the environment entry that selects it.
+func realNotifier(t *testing.T, r *banRig) []string {
+	t.Helper()
 	notifier, err := filepath.Abs(filepath.Join("setup", "ovpn-telegram-notify.py"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, texts := mockTelegram(t)
-	tg := []string{
-		"OVPN_TELEGRAM_ENABLED=true", "OVPN_TELEGRAM_BOT_TOKEN=123456:TESTTOKENTESTTOKEN", "OVPN_TELEGRAM_CHAT_ID=42",
-		"OVPN_TELEGRAM_API_BASE=" + srv.URL, "OVPN_TELEGRAM_ALLOW_HTTP=true",
-	}
-	r := newBanRig(t, tg...)
 	wrapper := filepath.Join(r.dir, "bin", "real-notify")
 	if err := os.WriteFile(wrapper, []byte("#!/usr/bin/env bash\nexec python3 "+notifier+" \"$@\"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	withNotifier := []string{"OVPN_BAN_NOTIFY_BIN=" + wrapper}
-	// the OpenVPN log names the user: the message must not
-	logLine := "2026-11-23 20:00:00 1.2.3.4:5555 [alice] PLUGIN_CALL: POST /etc/openvpn/auth.sh status=1\n2026-11-23 20:00:01 1.2.3.4:5555 AUTH_FAILED alice\n"
+	return []string{"OVPN_BAN_NOTIFY_BIN=" + wrapper}
+}
+
+// msgLines splits a Telegram message into its lines.
+func msgLines(msg string) []string { return strings.Split(msg, "\n") }
+
+func lastLine(msg string) string { l := msgLines(msg); return l[len(l)-1] }
+
+func hasLinePrefix(msg, prefix string) bool {
+	for _, l := range msgLines(msg) {
+		if strings.HasPrefix(l, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestBanScriptTelegramMessage(t *testing.T) {
+	t.Parallel()
+	srv, texts := mockTelegram(t)
+	audit := writeBanAudit(t, auditRow("auth_fail", rigStart-30, "alice", "203.0.113.7"))
+	// the default of OVPN_TELEGRAM_INCLUDE_ADDRESS is true: the rig leaves it empty
+	r := newBanRig(t, append(tgEnv(srv), "OVPN_AUDIT_LOG="+audit)...)
+	withNotifier := realNotifier(t, r)
+	logLine := "2026-11-23 20:00:00 203.0.113.7:5555 [alice] PLUGIN_CALL: POST /etc/openvpn/auth.sh status=1\n2026-11-23 20:00:01 203.0.113.7:5555 AUTH_FAILED alice\n"
 	if err := os.WriteFile(filepath.Join(r.dir, "audit", "openvpn.log"), []byte(logLine), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if out, code := r.run(withNotifier, "ban", "1.2.3.4", "3"); code != 0 {
+	if out, code := r.run(withNotifier, "ban", "203.0.113.7", "3"); code != 0 {
 		t.Fatalf("ban: %d %s", code, out)
 	}
 	got := texts()
 	if len(got) != 1 {
 		t.Fatalf("%d messages: %q", len(got), got)
 	}
-	msg := got[0]
-	for _, want := range []string{"banned", "Reason: auth-failed", "Offence: 1", "Duration: 10 minutes", "Server: "} {
-		if !strings.Contains(msg, want) {
-			t.Errorf("message lacks %q: %q", want, msg)
-		}
+	// the literal text, line by line (the end of the ban is now + 600 s, the host is the machine's)
+	lines := msgLines(got[0])
+	if len(lines) != 7 || lines[0] != "\U0001F6AB ovpn-admin: banned 203.0.113.7" || lines[1] != "Reason: auth-failed" || lines[2] != "User: alice" ||
+		lines[3] != "Offence: 1" || lines[4] != "Duration: 10 minutes" || !strings.HasPrefix(lines[5], "Until: 20") || !strings.HasSuffix(lines[5], " UTC") ||
+		!strings.HasPrefix(lines[6], "Server: ") {
+		t.Errorf("ban message %q", got[0])
 	}
-	for _, leak := range []string{"1.2.3.4", "alice", "123456"} {
-		if strings.Contains(msg, leak) {
-			t.Errorf("message contains %q: %q", leak, msg)
-		}
+	if strings.Contains(got[0], "123456") {
+		t.Errorf("the token is in the message: %q", got[0])
 	}
-	// the unban message names only the host
-	if out, code := r.run(withNotifier, "unban", "1.2.3.4", "--force"); code != 0 {
+	// the unban message names the address and no user
+	if out, code := r.run(withNotifier, "unban", "203.0.113.7", "--force"); code != 0 {
 		t.Fatalf("unban: %d %s", code, out)
 	}
-	if got := texts(); len(got) != 2 || !strings.Contains(got[1], "ban lifted") || strings.Contains(got[1], "1.2.3.4") || !strings.Contains(got[1], "Server: ") || strings.Count(got[1], "\n") != 1 {
+	got = texts()
+	if len(got) != 2 || got[1] != "\u2705 ovpn-admin: ban lifted for 203.0.113.7\nServer: "+strings.TrimPrefix(lastLine(got[0]), "Server: ") {
 		t.Errorf("unban message %q", got)
 	}
-	// the fourth ban says permanent, a manual ban only "manual", never its note
-	r.setNow(rigStart + 1)
+	// the fourth ban says permanent twice, a manual ban only "manual", never its note, and no user line
 	for i := 0; i < 3; i++ {
 		r.setNow(rigStart + int64(i+1)*200000)
-		r.run(withNotifier, "ban", "1.2.3.4", "3")
+		r.run(withNotifier, "ban", "203.0.113.7", "3")
 		r.setNow(rigStart + int64(i+1)*200000 + 100000)
-		r.run(withNotifier, "unban", "1.2.3.4")
+		r.run(withNotifier, "unban", "203.0.113.7")
 	}
 	r.setNow(rigStart + 1000000)
-	r.run(withNotifier, "ban", "1.2.3.4", "3")
-	if got := texts(); !strings.Contains(strings.Join(got, "\n"), "Duration: permanent") {
-		t.Errorf("no permanent message in %q", got)
+	r.run(withNotifier, "ban", "203.0.113.7", "3")
+	all := texts()
+	if last := all[len(all)-1]; !strings.Contains(last, "Duration: permanent\nUntil: permanent\n") || !strings.Contains(last, "Offence: 4") {
+		t.Errorf("no permanent message in %q", last)
 	}
-	n := len(texts())
+	n := len(all)
 	if out, code := r.run(withNotifier, "ban-manual", "5.6.7.8", "call alice back"); code != 0 {
 		t.Fatalf("manual: %d %s", code, out)
 	}
-	if got := texts(); len(got) <= n || !strings.Contains(strings.Join(got[n:], "\n"), "Reason: manual") || strings.Contains(strings.Join(got[n:], "\n"), "alice") || strings.Contains(strings.Join(got[n:], "\n"), "5.6.7.8") {
-		t.Errorf("manual message %q", got[n:])
+	all = texts()
+	if len(all) != n+1 || !strings.Contains(all[n], "banned 5.6.7.8\nReason: manual\n") || strings.Contains(all[n], "alice") || hasLinePrefix(all[n], "User:") {
+		t.Errorf("manual message %q", all[n:])
 	}
-	// OVPN_TELEGRAM_INCLUDE_ADDRESS=true restores the address
-	inc := newBanRig(t, append(tg, "OVPN_TELEGRAM_INCLUDE_ADDRESS=true")...)
-	n = len(texts())
-	if out, code := inc.run([]string{"OVPN_BAN_NOTIFY_BIN=" + wrapper}, "ban", "1.2.3.4", "3"); code != 0 {
+
+	// OVPN_TELEGRAM_INCLUDE_ADDRESS=false: the same ban, a message with neither the address nor the user name
+	srv2, texts2 := mockTelegram(t)
+	off := newBanRig(t, append(tgEnv(srv2), "OVPN_AUDIT_LOG="+audit, "OVPN_TELEGRAM_INCLUDE_ADDRESS=false")...)
+	offNotifier := realNotifier(t, off)
+	if out, code := off.run(offNotifier, "ban", "203.0.113.7", "3"); code != 0 {
 		t.Fatalf("ban: %d %s", code, out)
 	}
-	if got := texts(); len(got) <= n || !strings.Contains(strings.Join(got[n:], "\n"), "banned 1.2.3.4") {
-		t.Errorf("with the address: %q", got)
+	if out, code := off.run(offNotifier, "unban", "203.0.113.7", "--force"); code != 0 {
+		t.Fatalf("unban: %d %s", code, out)
+	}
+	got = texts2()
+	if len(got) != 2 {
+		t.Fatalf("%d messages: %q", len(got), got)
+	}
+	for _, m := range got {
+		for _, leak := range []string{"203.0.113.7", "alice", "User:", "123456"} {
+			if strings.Contains(m, leak) {
+				t.Errorf("address-free message contains %q: %q", leak, m)
+			}
+		}
+	}
+	if !strings.HasPrefix(got[0], "\U0001F6AB ovpn-admin: banned\nReason: ") || !strings.HasPrefix(got[1], "\u2705 ovpn-admin: ban lifted\nServer: ") {
+		t.Errorf("address-free messages %q", got)
+	}
+	// explicit true is the same as the default
+	srv3, texts3 := mockTelegram(t)
+	on := newBanRig(t, append(tgEnv(srv3), "OVPN_AUDIT_LOG="+audit, "OVPN_TELEGRAM_INCLUDE_ADDRESS=true")...)
+	if out, code := on.run(realNotifier(t, on), "ban", "203.0.113.7", "3"); code != 0 {
+		t.Fatalf("ban: %d %s", code, out)
+	}
+	if got := texts3(); len(got) != 1 || !strings.Contains(got[0], "banned 203.0.113.7\n") || !strings.Contains(got[0], "\nUser: alice\n") {
+		t.Errorf("with true: %q", got)
+	}
+}
+
+// the arguments of the notifier, the queue line and the event line for the name cases
+const fakeQueueNotify = `#!/usr/bin/env bash
+echo "$*" >> "$FAKE_NOTIFY_LOG"
+cat "${OVPN_BAN_STATE}".notify.* >> "$FAKE_QUEUE_LOG" 2>/dev/null
+`
+
+func TestBanScriptUserNameLookup(t *testing.T) {
+	t.Parallel()
+	const ip = "203.0.113.7"
+	at := rigStart
+	longOK := strings.Repeat("a", 64)
+	cases := []struct {
+		name string
+		rows []string
+		ban  string // the address to ban, default ip
+		want string // the user name, "-" for none
+		as   string // the entry that is banned, default ip
+	}{
+		{name: "newest auth_fail row", rows: []string{auditRow("auth_fail", at-30, "alice", ip)}, want: "alice"},
+		{name: "newest of several rows wins", rows: []string{auditRow("auth_fail", at-100, "alice", ip), auditRow("auth_fail", at-20, "bob", ip), auditRow("auth_fail", at-60, "carol", ip)}, want: "bob"},
+		{name: "a newer row of another address is not used", rows: []string{auditRow("auth_fail", at-100, "alice", ip), auditRow("auth_fail", at-10, "mallory", "203.0.113.8")}, want: "alice"},
+		{name: "row exactly 600 s old", rows: []string{auditRow("auth_fail", at-600, "alice", ip)}, want: "alice"},
+		{name: "row 601 s old is ignored", rows: []string{auditRow("auth_fail", at-601, "alice", ip)}, want: "-"},
+		{name: "old row ignored, newer inside the window used", rows: []string{auditRow("auth_fail", at-5000, "alice", ip), auditRow("auth_fail", at-5, "bob", ip)}, want: "bob"},
+		{name: "no row for the address", rows: []string{auditRow("auth_fail", at-30, "alice", "203.0.113.8")}, want: "-"},
+		{name: "auth_ok and connect rows are not failures", rows: []string{auditRow("auth_ok", at-30, "alice", ip), auditRow("connect", at-20, "alice", ip)}, want: "-"},
+		{name: "dash user", rows: []string{auditRow("auth_fail", at-30, "-", ip)}, want: "-"},
+		{name: "newest row has no user: no guess from an older row", rows: []string{auditRow("auth_fail", at-90, "alice", ip), auditRow("auth_fail", at-30, "-", ip)}, want: "-"},
+		{name: "space in the name", rows: []string{auditRow("auth_fail", at-30, "ali ce", ip)}, want: "-"},
+		{name: "newline in the name splits the row", rows: []string{"auth_fail\t" + fmt.Sprint(at-30) + "\tali\nce\t" + ip + "\t1\t-\t-\t-\t-"}, want: "-"},
+		{name: "shell metacharacters", rows: []string{auditRow("auth_fail", at-30, "$(touch${IFS}x)", ip)}, want: "-"},
+		{name: "semicolon", rows: []string{auditRow("auth_fail", at-30, "a;b", ip)}, want: "-"},
+		{name: "leading dash", rows: []string{auditRow("auth_fail", at-30, "-alice", ip)}, want: "-"},
+		{name: "non-ASCII", rows: []string{auditRow("auth_fail", at-30, "ali\u00e7e", ip)}, want: "-"},
+		{name: "65 characters", rows: []string{auditRow("auth_fail", at-30, longOK+"a", ip)}, want: "-"},
+		{name: "64 characters", rows: []string{auditRow("auth_fail", at-30, longOK, ip)}, want: longOK},
+		{name: "dots, dashes and underscores", rows: []string{auditRow("auth_fail", at-30, "a.b_c-d9", ip)}, want: "a.b_c-d9"},
+		{name: "time is not a number", rows: []string{"auth_fail\tsoon\talice\t" + ip + "\t1\t-\t-\t-\t-"}, want: "-"},
+		{name: "too few fields", rows: []string{"auth_fail\t" + fmt.Sprint(at-30) + "\talice"}, want: "-"},
+		{name: "invalid UTF-8 row", rows: []string{"auth_fail\t" + fmt.Sprint(at-30) + "\t\xff\xfe\t" + ip + "\t1\t-\t-\t-\t-"}, want: "-"},
+		{name: "real_ip is not an address", rows: []string{auditRow("auth_fail", at-30, "alice", "not-an-ip")}, want: "-"},
+		{name: "IPv4-mapped real_ip is the IPv4 address", rows: []string{auditRow("auth_fail", at-30, "alice", "::ffff:"+ip)}, want: "alice"},
+		{name: "IPv6 /64 ban: a row inside the prefix", rows: []string{auditRow("auth_fail", at-30, "alice", "2001:db8:1:2:aaaa::1")}, ban: "2001:db8:1:2::5", as: "2001:db8:1:2::/64", want: "alice"},
+		{name: "IPv6 /64 ban: a row outside the prefix", rows: []string{auditRow("auth_fail", at-30, "alice", "2001:db8:1:3::1")}, ban: "2001:db8:1:2::5", as: "2001:db8:1:2::/64", want: "-"},
+		{name: "IPv6 /64 ban: newest row inside the prefix wins", rows: []string{auditRow("auth_fail", at-80, "alice", "2001:db8:1:2::1"), auditRow("auth_fail", at-40, "bob", "2001:db8:1:2:1::9")}, ban: "2001:db8:1:2::5", as: "2001:db8:1:2::/64", want: "bob"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			addr, entry := ip, ip
+			if tc.ban != "" {
+				addr, entry = tc.ban, tc.as
+			}
+			audit := writeBanAudit(t, tc.rows...)
+			r := newBanRig(t, "OVPN_TELEGRAM_ENABLED=true", "OVPN_AUDIT_LOG="+audit)
+			if err := os.WriteFile(filepath.Join(r.dir, "bin", "fake-notify"), []byte(fakeQueueNotify), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			r.env = append(r.env, "FAKE_QUEUE_LOG="+filepath.Join(r.dir, "queue.log"))
+			if out, code := r.run(nil, "ban", addr, "3"); code != 0 {
+				t.Fatalf("the ban failed (exit %d): %s", code, out)
+			}
+			if got := r.rules("4"); entry == ip && len(got) != 1 {
+				t.Errorf("rules %v", got)
+			}
+			argv := "ban " + entry + " fail2ban 1 600"
+			queue := "ban\t" + entry + "\tfail2ban\t1\t600\t" + tc.want + "\n"
+			if tc.want != "-" {
+				argv += " " + tc.want
+			}
+			if got := r.read("notify.log"); got != argv+"\n" {
+				t.Errorf("notifier argv %q, want %q", got, argv)
+			}
+			if got := r.read("queue.log"); got != queue {
+				t.Errorf("queue line %q, want %q", got, queue)
+			}
+			ev := r.lastEvent("ban")
+			if ev == nil || ev["user"] != tc.want {
+				t.Fatalf("event %v, want user %q", ev, tc.want)
+			}
+			// the new field is the last one of the line and the earlier ones are where they were
+			line := strings.TrimSpace(r.read("events/ban-events.log"))
+			wantTail := `"action":"ban","user":"` + tc.want + `"}`
+			if !strings.HasSuffix(line, wantTail) || !strings.Contains(line, `"address":"`+strings.SplitN(addr, "/", 2)[0]+`","prefix":`) {
+				t.Errorf("event line %q", line)
+			}
+		})
+	}
+}
+
+func TestBanScriptUserNameEdges(t *testing.T) {
+	t.Parallel()
+	const ip = "203.0.113.7"
+	banWith := func(t *testing.T, audit string, extra ...string) *banRig {
+		t.Helper()
+		r := newBanRig(t, append([]string{"OVPN_TELEGRAM_ENABLED=true", "OVPN_AUDIT_LOG=" + audit}, extra...)...)
+		if out, code := r.run(nil, "ban", ip, "3"); code != 0 {
+			t.Fatalf("the ban failed (exit %d): %s", code, out)
+		}
+		if len(r.rules("4")) != 1 {
+			t.Errorf("rules %v", r.rules("4"))
+		}
+		return r
+	}
+	plain := "ban " + ip + " fail2ban 1 600\n"
+	row := auditRow("auth_fail", rigStart-30, "alice", ip) + "\n"
+	dir := t.TempDir()
+
+	t.Run("missing file", func(t *testing.T) {
+		t.Parallel()
+		r := banWith(t, filepath.Join(dir, "missing.tsv"))
+		if got := r.read("notify.log"); got != plain {
+			t.Errorf("argv %q", got)
+		}
+		if ev := r.lastEvent("ban"); ev["user"] != "-" {
+			t.Errorf("event %v", ev)
+		}
+	})
+	t.Run("a directory in its place", func(t *testing.T) {
+		t.Parallel()
+		d := filepath.Join(t.TempDir(), "audit.tsv")
+		if err := os.Mkdir(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if got := banWith(t, d).read("notify.log"); got != plain {
+			t.Errorf("argv %q", got)
+		}
+	})
+	t.Run("a link to a file with a matching row", func(t *testing.T) {
+		t.Parallel()
+		target := writeBanAudit(t, strings.TrimSpace(row))
+		link := filepath.Join(t.TempDir(), "audit.tsv")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		if got := banWith(t, link).read("notify.log"); got != plain {
+			t.Errorf("argv %q: the link was followed", got)
+		}
+	})
+	t.Run("a named pipe in its place does not block the ban", func(t *testing.T) {
+		t.Parallel()
+		p := filepath.Join(t.TempDir(), "audit.tsv")
+		if err := syscall.Mkfifo(p, 0o600); err != nil {
+			t.Skipf("mkfifo: %v", err)
+		}
+		done := make(chan string, 1)
+		go func() { done <- banWith(t, p).read("notify.log") }()
+		select {
+		case got := <-done:
+			if got != plain {
+				t.Errorf("argv %q", got)
+			}
+		case <-time.After(60 * time.Second):
+			t.Fatal("the ban waited for the pipe")
+		}
+	})
+	t.Run("an unreadable file", func(t *testing.T) {
+		t.Parallel()
+		if os.Geteuid() == 0 {
+			t.Skip("root reads any file; the missing-file, directory and pipe cases cover the open failures")
+		}
+		p := writeBanAudit(t, strings.TrimSpace(row))
+		if err := os.Chmod(p, 0); err != nil {
+			t.Fatal(err)
+		}
+		if got := banWith(t, p).read("notify.log"); got != plain {
+			t.Errorf("argv %q", got)
+		}
+	})
+	t.Run("a huge log is read from its tail", func(t *testing.T) {
+		t.Parallel()
+		// 6 MB of rows of other addresses, then the matching one: found; the first (cut) line of the tail is never used
+		var b strings.Builder
+		filler := auditRow("auth_fail", rigStart-30, "noise", "198.51.100.9") + "\n"
+		for b.Len() < 6<<20 {
+			b.WriteString(filler)
+		}
+		b.WriteString(row)
+		p := filepath.Join(t.TempDir(), "audit.tsv")
+		if err := os.WriteFile(p, []byte(b.String()), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got := banWith(t, p).read("notify.log"); got != plain[:len(plain)-1]+" alice\n" {
+			t.Errorf("argv %q", got)
+		}
+	})
+	t.Run("OVPN_TELEGRAM_INCLUDE_ADDRESS=false: no address, no user in the argv, the event keeps the name", func(t *testing.T) {
+		t.Parallel()
+		r := banWith(t, writeBanAudit(t, strings.TrimSpace(row)), "OVPN_TELEGRAM_INCLUDE_ADDRESS=false")
+		if got := r.read("notify.log"); got != "ban - fail2ban 1 600\n" {
+			t.Errorf("argv %q", got)
+		}
+		if ev := r.lastEvent("ban"); ev["user"] != "alice" {
+			t.Errorf("event %v", ev)
+		}
+	})
+	t.Run("default and true pass the address and the user", func(t *testing.T) {
+		t.Parallel()
+		for _, extra := range [][]string{nil, {"OVPN_TELEGRAM_INCLUDE_ADDRESS=true"}} {
+			r := banWith(t, writeBanAudit(t, strings.TrimSpace(row)), extra...)
+			if got := r.read("notify.log"); got != plain[:len(plain)-1]+" alice\n" {
+				t.Errorf("%v: argv %q", extra, got)
+			}
+		}
+	})
+	t.Run("a queue line of the earlier format is sent without a name", func(t *testing.T) {
+		t.Parallel()
+		r := newBanRig(t, "OVPN_TELEGRAM_ENABLED=true", "OVPN_AUDIT_LOG="+filepath.Join(dir, "missing.tsv"))
+		if err := os.WriteFile(filepath.Join(r.dir, "audit", "bans.tsv.notify"), []byte("ban\t"+ip+"\tfail2ban\t2\t3600\nunban\t"+ip+"\t\t\t\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		r.must("expire")
+		if got := r.read("notify.log"); got != "ban "+ip+" fail2ban 2 3600\nunban "+ip+"\n" {
+			t.Errorf("argv %q", got)
+		}
+	})
+	t.Run("a bad name in a queue line is dropped", func(t *testing.T) {
+		t.Parallel()
+		r := newBanRig(t, "OVPN_TELEGRAM_ENABLED=true", "OVPN_AUDIT_LOG="+filepath.Join(dir, "missing.tsv"))
+		if err := os.WriteFile(filepath.Join(r.dir, "audit", "bans.tsv.notify"), []byte("ban\t"+ip+"\tfail2ban\t2\t3600\tali ce\nban\t"+ip+"\tfail2ban\t2\t3600\t$(x)\nban\t"+ip+"\tfail2ban\t2\t3600\tbob\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		r.must("expire")
+		want := "ban " + ip + " fail2ban 2 3600\n"
+		if got := r.read("notify.log"); got != want+want+want[:len(want)-1]+" bob\n" {
+			t.Errorf("argv %q", got)
+		}
+	})
+}
+
+// notifierRun runs the real notifier with the mock Telegram API; it returns the exit status and the stderr text.
+func notifierRun(t *testing.T, srv *httptest.Server, extraEnv []string, args ...string) (int, string) {
+	t.Helper()
+	notifier, err := filepath.Abs(filepath.Join("setup", "ovpn-telegram-notify.py"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("python3", append([]string{notifier}, args...)...)
+	cmd.Env = append(append(os.Environ(), "OVPN_TELEGRAM_INCLUDE_ADDRESS="), tgEnv(srv)...)
+	cmd.Env = append(cmd.Env, extraEnv...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	err = cmd.Run()
+	code := 0
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	return code, stderr.String()
+}
+
+func TestTelegramNotifierUser(t *testing.T) {
+	t.Parallel()
+	srv, texts := mockTelegram(t)
+	// a valid name: its own line between Reason and Offence
+	if code, errText := notifierRun(t, srv, nil, "ban", "203.0.113.7", "auth-failed", "2", "3600", "alice"); code != 0 || errText != "" {
+		t.Fatalf("exit %d: %s", code, errText)
+	}
+	got := texts()
+	if len(got) != 1 {
+		t.Fatalf("%q", got)
+	}
+	l := msgLines(got[0])
+	if len(l) != 7 || l[0] != "\U0001F6AB ovpn-admin: banned 203.0.113.7" || l[1] != "Reason: auth-failed" || l[2] != "User: alice" || l[3] != "Offence: 2" ||
+		l[4] != "Duration: 1 hour" || !strings.HasPrefix(l[5], "Until: 20") || !strings.HasPrefix(l[6], "Server: ") {
+		t.Errorf("message %q", got[0])
+	}
+	// "-" and no sixth argument: no User line; offence 0 is left out
+	for _, args := range [][]string{
+		{"ban", "203.0.113.7", "auth-failed", "2", "3600", "-"}, {"ban", "203.0.113.7", "auth-failed", "2", "3600"},
+	} {
+		n := len(texts())
+		if code, errText := notifierRun(t, srv, nil, args...); code != 0 || errText != "" {
+			t.Fatalf("%v: exit %d: %s", args, code, errText)
+		}
+		if m := texts()[n]; strings.Contains(m, "User:") || !strings.Contains(m, "banned 203.0.113.7\n") || !strings.Contains(m, "Offence: 2\n") {
+			t.Errorf("%v: %q", args, m)
+		}
+	}
+	// permanent: Until says so; a manual ban of an address without offences
+	n := len(texts())
+	if code, _ := notifierRun(t, srv, nil, "ban", "2001:db8:1:2::/64", "manual: call alice back", "0", "0", "alice"); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if m := texts()[n]; m != "\U0001F6AB ovpn-admin: banned 2001:db8:1:2::/64\nReason: manual\nUser: alice\nDuration: permanent\nUntil: permanent\nServer: "+strings.TrimPrefix(lastLine(got[0]), "Server: ") {
+		t.Errorf("manual message %q", m)
+	}
+	// OVPN_TELEGRAM_INCLUDE_ADDRESS=false: neither the address nor the user name, even when both are given
+	n = len(texts())
+	if code, errText := notifierRun(t, srv, []string{"OVPN_TELEGRAM_INCLUDE_ADDRESS=false"}, "ban", "203.0.113.7", "auth-failed", "2", "3600", "alice"); code != 0 || errText != "" {
+		t.Fatalf("exit %d: %s", code, errText)
+	}
+	if m := texts()[n]; strings.Contains(m, "203.0.113.7") || strings.Contains(m, "alice") || strings.Contains(m, "User:") || !strings.HasPrefix(m, "\U0001F6AB ovpn-admin: banned\nReason: auth-failed\nOffence: 2\n") {
+		t.Errorf("address-free message %q", m)
+	}
+	// unban: the address, never a name, and no sixth argument
+	n = len(texts())
+	if code, _ := notifierRun(t, srv, nil, "unban", "203.0.113.7"); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if m := texts()[n]; !strings.HasPrefix(m, "\u2705 ovpn-admin: ban lifted for 203.0.113.7\nServer: ") {
+		t.Errorf("unban message %q", m)
+	}
+	n = len(texts())
+	if code, _ := notifierRun(t, srv, []string{"OVPN_TELEGRAM_INCLUDE_ADDRESS=false"}, "unban", "203.0.113.7"); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if m := texts()[n]; strings.Contains(m, "203.0.113.7") || !strings.HasPrefix(m, "\u2705 ovpn-admin: ban lifted\nServer: ") {
+		t.Errorf("address-free unban message %q", m)
+	}
+	n = len(texts())
+	if code, errText := notifierRun(t, srv, nil, "unban", "203.0.113.7", "alice"); code != 2 || len(texts()) != n || !strings.Contains(errText, "WARNING") {
+		t.Errorf("unban with a user: exit %d %q", code, errText)
+	}
+	// a bad sixth argument: exit 2, one line on stderr, the name never echoed, nothing sent
+	for _, bad := range []string{"ali ce", "ali\nce", "alice\n", "", "-alice", ".alice", "a;b", "$(id)", "ali\u00e7e", strings.Repeat("a", 65), "al\tice"} {
+		n := len(texts())
+		code, errText := notifierRun(t, srv, nil, "ban", "203.0.113.7", "auth-failed", "2", "3600", bad)
+		if code != 2 || len(texts()) != n {
+			t.Errorf("name %q: exit %d, sent %d messages", bad, code, len(texts())-n)
+		}
+		if strings.Count(errText, "\n") != 1 || !strings.HasPrefix(errText, "ovpn-telegram-notify: WARNING: notification (ban) not sent: USER") || (bad != "" && strings.Contains(errText, bad)) {
+			t.Errorf("name %q: stderr %q", bad, errText)
+		}
+	}
+	// a 64 character name is fine; the sixth argument is checked before the address and also with the address left out
+	if code, errText := notifierRun(t, srv, nil, "ban", "203.0.113.7", "auth-failed", "2", "3600", strings.Repeat("a", 64)); code != 0 || errText != "" {
+		t.Errorf("64 characters: exit %d %q", code, errText)
+	}
+	n = len(texts())
+	if code, _ := notifierRun(t, srv, []string{"OVPN_TELEGRAM_INCLUDE_ADDRESS=false"}, "ban", "-", "auth-failed", "2", "3600", "ali ce"); code != 2 || len(texts()) != n {
+		t.Errorf("a bad name with the address left out: exit %d", code)
+	}
+	// seven arguments are a usage error
+	if code, _ := notifierRun(t, srv, nil, "ban", "203.0.113.7", "auth-failed", "2", "3600", "alice", "bob"); code != 2 {
+		t.Errorf("six extra arguments: exit %d", code)
+	}
+	// --check-api-base stays
+	if code, _ := notifierRun(t, srv, nil, "--check-api-base", "https://api.telegram.org"); code != 0 {
+		t.Errorf("--check-api-base: exit %d", code)
+	}
+	if code, _ := notifierRun(t, srv, nil, "--check-api-base", "ftp://x"); code != 2 {
+		t.Errorf("--check-api-base ftp: exit %d", code)
 	}
 }
 
 func TestBanScriptNotifierArgument(t *testing.T) {
 	t.Parallel()
-	r := newBanRig(t, "OVPN_TELEGRAM_ENABLED=true")
+	// the default is true: the address goes to the notifier
+	r := newBanRig(t, "OVPN_TELEGRAM_ENABLED=true", "OVPN_AUDIT_LOG="+filepath.Join(t.TempDir(), "missing.tsv"))
 	r.must("ban", "1.2.3.4", "3")
 	r.must("unban", "1.2.3.4", "--force")
-	if got := r.read("notify.log"); got != "ban - fail2ban 1 600\nunban -\n" {
+	if got := r.read("notify.log"); got != "ban 1.2.3.4 fail2ban 1 600\nunban 1.2.3.4\n" {
+		t.Errorf("notifier calls %q", got)
+	}
+	// false is the escape hatch: "-" instead of the address
+	f := newBanRig(t, "OVPN_TELEGRAM_ENABLED=true", "OVPN_TELEGRAM_INCLUDE_ADDRESS=false")
+	f.must("ban", "1.2.3.4", "3")
+	f.must("unban", "1.2.3.4", "--force")
+	if got := f.read("notify.log"); got != "ban - fail2ban 1 600\nunban -\n" {
 		t.Errorf("notifier calls %q", got)
 	}
 	i := newBanRig(t, "OVPN_TELEGRAM_ENABLED=true", "OVPN_TELEGRAM_INCLUDE_ADDRESS=true")

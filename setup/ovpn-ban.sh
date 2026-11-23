@@ -53,8 +53,9 @@
 # still running at the restart (or that is permanent) is the same ban, not a new offence: it is not counted again.
 #
 # Ban event log: OVPN_BAN_EVENTS_LOG, default /var/lib/ovpn-admin/audit/ban-events.log, root:root 0600 (umask 077), JSON lines:
-#   {"time","time_unix","address","prefix","reason","offence","ban_seconds","action"}   action: ban, unban, refuse, expire, cap-evict, cap-refuse,
-#   orphan-removed (the sweep removed a rule that nothing could lift)
+#   {"time","time_unix","address","prefix","reason","offence","ban_seconds","action"[,"forced":true],"user"}   action: ban, unban, refuse, expire,
+#   cap-evict, cap-refuse, orphan-removed (the sweep removed a rule that nothing could lift). "user" is the last field of every line: the user
+#   name of a "ban" line when the audit log names one (see "User name" below), "-" otherwise and on every other action.
 #
 # Scope: the INPUT chain jumps to the ban chains only for the OpenVPN listener: the port and transport that configure.sh
 # derives from the same variables as the openvpn command line. Other listeners in the same network namespace, such as the
@@ -86,15 +87,27 @@
 #   OVPN_BAN_SWEEP_SECONDS  seconds between two sweeps of the watcher (default 30, read by ovpn-ban-control and configure.sh)
 #   OVPN_BAN_EVENTS_LOG ban event log (default /var/lib/ovpn-admin/audit/ban-events.log)
 #   OVPN_BAN_LOG        OpenVPN log, only read to name the reason of a ban (default /var/lib/ovpn-admin/openvpn.log)
+#   OVPN_AUDIT_LOG      OpenVPN audit log (default /etc/openvpn/audit/audit.tsv, written by audit.sh), only read to name the user of a ban
 #   OVPN_BAN_NOTIFY_LOG  file that receives the warning when a Telegram notification fails (set by configure.sh to the fail2ban log)
 #   OVPN_TELEGRAM_ENABLED  set by configure.sh (true only when the Telegram settings are valid); with true, a new ban (or offence) and the
 #                       lifting of a ban run /usr/local/sbin/ovpn-telegram-notify ban|unban ... after the DROP rule and the row are
-#                       written, outside the lock. The message carries the reason, the offence number, the duration and the host, and NO
-#                       address and NO user name; the address is only added with OVPN_TELEGRAM_INCLUDE_ADDRESS=true (default false: the
-#                       notifier then gets "-" instead of the address). The bot token and chat id reach the notifier through its
+#                       written, outside the lock. The message carries the address (the network of an IPv6 ban), the reason, the user name
+#                       when the audit log knows it, the offence number, the duration, the end of the ban and the host. Since v0.1.12
+#                       OVPN_TELEGRAM_INCLUDE_ADDRESS defaults to true (v0.1.11 sent neither address nor name: the owner reversed that);
+#                       false is the escape hatch: the notifier then gets "-" instead of the address and no user name, and the message
+#                       names neither. The bot token and chat id reach the notifier through its
 #                       environment only (inherited from the fail2ban server, set by configure.sh), never through an argument. A notifier
 #                       failure is one warning in the fail2ban log, which the container log mirrors; the ban stays successful and the
 #                       exit status is not affected.
+#
+# User name (ban messages and the "user" field of the event log): before a ban is queued for the notifier, the audit log is searched for
+# the newest "auth_fail" row (event time username real_ip real_port virtual_ip4 virtual_ip6 rx tx, tab separated) whose real_ip is the banned
+# address (for an IPv6 /64 ban: lies inside the banned prefix) and whose time is within 600 seconds of the ban. Its user name is used when it
+# matches [A-Za-z0-9][A-Za-z0-9._-]{0,63}. A missing, unreadable, non-regular or link file, no such row, a row of another kind, a "-" user, an
+# unreadable row or an invalid name mean NO name: the line is left out and the event log says "-". A name is never guessed from an older row
+# and the lookup never fails or delays a ban (the file is read through a bounded tail, 5 s limit). The name is what the client typed at the
+# failed login: it is not verified. The audit directory is writable only by the VPN hook user; the name is validated again before the queue
+# file, the event log and the notifier argument, so the audit file cannot inject a line.
 #
 # Locking: every command that changes the firewall chains or the ban list/history (init, setup, check, ban, ban-manual, unban, flush,
 # teardown) does so inside ONE exclusive flock (OVPN_BAN_STATE.lock, wait at most 30 s): the firewall check/add and the state decision of a
@@ -207,7 +220,9 @@ RESTART_GRACE=120
 OVPN_LOG="${OVPN_BAN_LOG:-/var/lib/ovpn-admin/openvpn.log}"
 NOTIFY_BIN="${OVPN_BAN_NOTIFY_BIN:-/usr/local/sbin/ovpn-telegram-notify}"
 NOTIFY_LOG="${OVPN_BAN_NOTIFY_LOG:-}"
-TG_INCLUDE_ADDRESS="${OVPN_TELEGRAM_INCLUDE_ADDRESS:-false}"
+TG_INCLUDE_ADDRESS="${OVPN_TELEGRAM_INCLUDE_ADDRESS:-true}"
+AUDIT_LOG="${OVPN_AUDIT_LOG:-/etc/openvpn/audit/audit.tsv}"
+AUDIT_WINDOW=600
 IPV6_PREFIX="${OVPN_BAN_IPV6_PREFIX:-64}"
 MAX_ENTRIES="${OVPN_BAN_MAX_ENTRIES:-500}"
 DECAY_DAYS="${OVPN_BAN_DECAY_DAYS:-30}"
@@ -789,7 +804,62 @@ def cmd_state_find(path, target):
         print(entry_text(best))
 
 
-def cmd_event(path, when, action, address, prefix, reason, off, sec, forced):
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")   # fullmatch only: "$" would also match before a trailing newline
+AUDIT_TAIL = 4 * 1024 * 1024
+
+
+def cmd_auditname(path, entry, now, window):
+    """The user name of the newest auth_fail row of the audit log (event time username real_ip ...) whose real_ip is ENTRY (an address, or a
+    network: an address inside it) and whose time is within WINDOW seconds of NOW. Prints the name, or nothing: no file, no row, a "-" user, an
+    unreadable row, an invalid name. Only the last AUDIT_TAIL bytes are read and only a regular file is opened (a FIFO or a link in its place
+    must not block or redirect the ban). Always status 0: no name is not an error."""
+    net = ipaddress.ip_network(entry, strict=False)
+    now, window = int(now), int(window)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return
+        with os.fdopen(fd, "rb") as f:
+            fd = -1
+            size = os.fstat(f.fileno()).st_size
+            start = max(0, size - AUDIT_TAIL)
+            f.seek(start)
+            data = f.read(AUDIT_TAIL)
+    except OSError:
+        return
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    lines = data.split(b"\n")
+    if start > 0:
+        lines = lines[1:]    # the first line of a tail starts in the middle of a row
+    best_t, best_user = None, None
+    for raw in lines:
+        try:
+            f = raw.decode("utf-8").split("\t")
+        except UnicodeError:
+            continue
+        if len(f) < 4 or f[0] != "auth_fail" or not re.fullmatch(r"[0-9]{1,12}", f[1]):
+            continue
+        t = int(f[1])
+        if abs(now - t) > window:
+            continue
+        try:
+            a = unwrap(ipaddress.ip_address(f[3]))
+        except ValueError:
+            continue
+        if a.version != net.version or a not in net:
+            continue
+        if best_t is None or t >= best_t:    # the newest row; on a tie the later line
+            best_t, best_user = t, f[2]
+    if best_user is not None and NAME_RE.fullmatch(best_user):
+        print(best_user)
+
+
+def cmd_event(path, when, action, address, prefix, reason, off, sec, forced, user="-"):
     rec = {
         "time": datetime.datetime.fromtimestamp(int(when), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "time_unix": int(when),
@@ -802,6 +872,7 @@ def cmd_event(path, when, action, address, prefix, reason, off, sec, forced):
     }
     if forced == "1":
         rec["forced"] = True
+    rec["user"] = user if NAME_RE.fullmatch(user) else "-"
     d = os.path.dirname(path) or "."
     os.makedirs(d, mode=0o700, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -817,7 +888,7 @@ CMDS = {
     "forget": (cmd_forget, 2), "has": (cmd_has, 2), "has_exact": (cmd_has_exact, 2), "is_perm": (cmd_is_perm, 2), "perm": (cmd_perm, 1),
     "migrate": (cmd_migrate, None), "hist_kind": (cmd_hist_kind, 1), "trust": (cmd_trust, None), "live": (cmd_live, 3), "cover": (cmd_cover, 2),
     "state_find": (cmd_state_find, 2), "sweep": (cmd_sweep, None), "temp": (cmd_temp, 2),
-    "event": (cmd_event, 9),
+    "event": (cmd_event, 10), "auditname": (cmd_auditname, 4),
 }
 try:
     fn, n = CMDS[sys.argv[1]]
@@ -1111,44 +1182,70 @@ warn_log() {
   return 0
 }
 
-# ban_event ACTION ADDRESS PREFIX REASON OFFENCE SECONDS [FORCED]: one JSON line in the ban event log (OVPN_BAN_EVENTS_LOG, default
-# /var/lib/ovpn-admin/audit/ban-events.log, created 0600 with umask 077): time, address, prefix, reason, offence, ban_seconds, action. One line per
-# ban, unban and refusal, plus "expire" (a ban ran out) and "cap-evict" (a temporary ban was dropped for room). The panel audit trail is
-# separate (it carries a hash chain that is only written by ovpn-admin). A log that cannot be written is a warning, never a failed ban.
+# valid_name NAME: 0 when NAME is a user name the alert may carry: [A-Za-z0-9][A-Za-z0-9._-]{0,63}, nothing else (no space, no newline, no
+# "-"). The one shell validator, used before the name reaches the queue file, the event log and the argument of the notifier.
+valid_name() {
+  local LC_ALL=C
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
+}
+
+# audit_user ENTRY NOW: sets AUDIT_USER to the user name the audit log has for the ban of ENTRY (see "User name" in the header), "-" when it
+# has none. Never fails and never prints.
+audit_user() {
+  local out=""
+  AUDIT_USER="-"
+  out="$(timeout 5 python3 -c "$PYLIB" auditname "$AUDIT_LOG" "$1" "$2" "$AUDIT_WINDOW" 2>/dev/null </dev/null)" || return 0
+  if valid_name "$out"; then AUDIT_USER="$out"; fi
+  return 0
+}
+
+# ban_event ACTION ADDRESS PREFIX REASON OFFENCE SECONDS [FORCED [USER]]: one JSON line in the ban event log (OVPN_BAN_EVENTS_LOG, default
+# /var/lib/ovpn-admin/audit/ban-events.log, created 0600 with umask 077): time, address, prefix, reason, offence, ban_seconds, action, user
+# ("-" when none). One line per ban, unban and refusal, plus "expire" (a ban ran out) and "cap-evict" (a temporary ban was dropped for room).
+# The panel audit trail is separate (it carries a hash chain that is only written by ovpn-admin). A log that cannot be written is a warning,
+# never a failed ban.
 ban_event() {
-  pylib event "$EVENTS_LOG" "$(date +%s)" "$1" "$2" "$3" "$4" "$5" "$6" "${7:-0}" 2>/dev/null \
+  local user="${8:--}"
+  [ "$user" = "-" ] || valid_name "$user" || user="-"
+  pylib event "$EVENTS_LOG" "$(date +%s)" "$1" "$2" "$3" "$4" "$5" "$6" "${7:-0}" "$user" 2>/dev/null \
     || warn_log "ovpn-ban: WARNING: cannot write the ban event log $EVENTS_LOG"
   return 0
 }
 
-# Telegram. The message carries the reason, the offence number, the duration and the host, and neither an address nor a user name; the
-# address is added only with OVPN_TELEGRAM_INCLUDE_ADDRESS=true. A ban reason of a manual ban is cut to the word "manual" here: its note is
-# free text of the operator. Messages are queued under the lock (queue_notify) and sent after it is released (flush_notify): a slow or
-# failing Telegram API never holds up the firewall.
+# Telegram. The message carries the address (the network of an IPv6 ban), the reason, the user name when the audit log knows it, the offence
+# number, the duration, the end of the ban and the host. OVPN_TELEGRAM_INCLUDE_ADDRESS=false leaves the address and the user name out (the
+# notifier then gets "-" and no user). A ban reason of a manual ban is cut to the word "manual" here: its note is free text of the operator.
+# Messages are queued under the lock (queue_notify) and sent after it is released (flush_notify): a slow or failing Telegram API never holds
+# up the firewall.
 NOTIFY_QUEUE="${STATE}.notify"
-# queue_notify ban ENTRY REASON OFFENCE SECONDS | queue_notify unban ENTRY
+# queue_notify ban ENTRY REASON OFFENCE SECONDS [USER] | queue_notify unban ENTRY
+# queue line (tab separated; no field is ever empty, so the tabs are not collapsed on reading): ban ENTRY REASON OFFENCE SECONDS USER ("-" = none)
 queue_notify() {
   [ "${OVPN_TELEGRAM_ENABLED:-false}" = "true" ] || return 0
-  local kind="$1" entry="$2" reason="${3:-}"
+  local kind="$1" entry="$2" reason="${3:-}" user="${6:--}"
   case "$reason" in manual*) reason="manual" ;; esac
+  [ "$user" = "-" ] || valid_name "$user" || user="-"
   if [ "$kind" = "ban" ]; then
-    printf 'ban\t%s\t%s\t%s\t%s\n' "$entry" "$reason" "$4" "$5" >> "$NOTIFY_QUEUE" 2>/dev/null || true
+    printf 'ban\t%s\t%s\t%s\t%s\t%s\n' "$entry" "$reason" "$4" "$5" "$user" >> "$NOTIFY_QUEUE" 2>/dev/null || true
   else
-    printf 'unban\t%s\t\t\t\n' "$entry" >> "$NOTIFY_QUEUE" 2>/dev/null || true
+    printf 'unban\t%s\t\t\t\t\n' "$entry" >> "$NOTIFY_QUEUE" 2>/dev/null || true
   fi
   return 0
 }
 
-# send_notify KIND ENTRY REASON OFFENCE SECONDS: one notifier call. Never fails the caller. The notifier prints at most one line, never the
-# token or a response body; the line is cut to its first 300 characters.
+# send_notify KIND ENTRY REASON OFFENCE SECONDS [USER]: one notifier call. Never fails the caller. The notifier prints at most one line, never
+# the token or a response body; the line is cut to its first 300 characters. The user name is an argument only with an address-including
+# message and a valid name.
 send_notify() {
-  local kind="$1" entry="$2" rc=0 msg="" shown="-"
+  local kind="$1" entry="$2" rc=0 msg="" shown="-" user="${6:--}"
+  local -a extra=()
   [ "$TG_INCLUDE_ADDRESS" = "true" ] && shown="$entry"
+  if [ "$TG_INCLUDE_ADDRESS" = "true" ] && [ "$user" != "-" ] && valid_name "$user"; then extra=("$user"); fi
   if [ ! -x "$NOTIFY_BIN" ]; then
     msg="ovpn-ban: WARNING: Telegram notification ($kind) not sent: $NOTIFY_BIN is not installed"
   else
     if [ "$kind" = "ban" ]; then
-      msg="$(timeout 20 "$NOTIFY_BIN" ban "$shown" "$3" "$4" "$5" 2>&1 </dev/null)" || rc=$?
+      msg="$(timeout 20 "$NOTIFY_BIN" ban "$shown" "$3" "$4" "$5" ${extra[@]+"${extra[@]}"} 2>&1 </dev/null)" || rc=$?
     else
       msg="$(timeout 20 "$NOTIFY_BIN" unban "$shown" 2>&1 </dev/null)" || rc=$?
     fi
@@ -1161,12 +1258,15 @@ send_notify() {
 
 # flush_notify: send what the transactions queued. The queue file is claimed by a rename first, so two callers never send a line twice.
 flush_notify() {
-  local claimed="${NOTIFY_QUEUE}.$$" kind entry reason off sec
+  local claimed="${NOTIFY_QUEUE}.$$" kind entry reason off sec user
   [ "${OVPN_TELEGRAM_ENABLED:-false}" = "true" ] || return 0
   mv -f "$NOTIFY_QUEUE" "$claimed" 2>/dev/null || return 0
-  while IFS=$'\t' read -r kind entry reason off sec; do
+  while IFS=$'\t' read -r kind entry reason off sec user; do
     case "$kind" in
-      ban) [[ "$off" =~ ^[0-9]{1,10}$ && "$sec" =~ ^[0-9]{1,10}$ ]] && send_notify ban "$entry" "$reason" "$off" "$sec" ;;
+      ban)
+        # a name that is not valid (or a queue line of the earlier format, no sixth field) is dropped: the message goes out without it
+        [ "${user:--}" = "-" ] || valid_name "$user" || user="-"
+        [[ "$off" =~ ^[0-9]{1,10}$ && "$sec" =~ ^[0-9]{1,10}$ ]] && send_notify ban "$entry" "$reason" "$off" "$sec" "${user:--}" ;;
       unban) send_notify unban "$entry" ;;
     esac
   done < "$claimed"
@@ -1301,7 +1401,7 @@ txn_sweep() {
 # lock): complete a pending removal, lift expired bans, make room (OVPN_BAN_MAX_ENTRIES), decide the offence number and the length from the
 # history (pylib decide), check/add the DROP rule for ENTRY, record the offence and the row. The firewall check and the state decision can
 # therefore not be separated by an unban of the same entry. MODE is auto (fail2ban: escalation) or manual (MANUAL_SECONDS, 0 = permanent).
-# Prints "OFFENCE SECONDS EXPIRES_AT ADDED APPENDED" on stdout (SECONDS and EXPIRES_AT 0 = permanent). When the history cannot be
+# Prints "OFFENCE SECONDS EXPIRES_AT ADDED APPENDED ACTIVE USER" on stdout (USER: the name of the audit log, "-" = none) (SECONDS and EXPIRES_AT 0 = permanent). When the history cannot be
 # written, a rule added here is taken out again; a firewall read error refuses the ban.
 txn_ban_fw() {
   local addr="$1" entry="$2" fam="$3" pfx="$4" fails="$5" reason="$6" mode="$7" msec="$8"
@@ -1383,8 +1483,13 @@ txn_ban_fw() {
     return 1
   fi
   # a new ban (no DROP rule before) or a new offence is announced once; the same ban that is only re-applied is not announced again
-  if [ "$added" -eq 1 ] || [ "$append" = "1" ]; then queue_notify ban "$entry" "$reason" "$off" "$sec"; fi
-  echo "$off $sec $expires $added $append $active"
+  # The user name is looked up here, before the message is queued (the audit log is read through a bounded tail: no waiting inside the lock).
+  AUDIT_USER="-"
+  if [ "$added" -eq 1 ] || [ "$append" = "1" ]; then
+    audit_user "$entry" "$now"
+    queue_notify ban "$entry" "$reason" "$off" "$sec" "$AUDIT_USER"
+  fi
+  echo "$off $sec $expires $added $append $active $AUDIT_USER"
 }
 
 # fw_listed CHAIN IP: reads "iptables -S CHAIN" on stdin; 0 when it lists the rule "-A CHAIN -s IP -j DROP" (the source printed as IP, IP/32 or
@@ -2034,17 +2139,18 @@ cmd_check() {
 # it and the Telegram message follows the unlock.
 do_ban() {
   local addr="$1" entry="$2" fam="$3" pfx="$4" fails="$5" reason="$6" mode="$7" msec="$8" forced="$9"
-  local out off sec expires added append active status
+  local out off sec expires added append active status user
   need_listener
   out="$(with_state_lock txn_ban_fw "$addr" "$entry" "$fam" "$pfx" "$fails" "$reason" "$mode" "$msec")" || { flush_notify; die "ban of $entry not completed"; }
-  read -r off sec expires added append active <<< "$out"
+  read -r off sec expires added append active user <<< "$out"
+  [ "${user:--}" = "-" ] || valid_name "$user" || user="-"
   if ! [[ "$off" =~ ^[0-9]{1,10}$ && "$sec" =~ ^[0-9]{1,10}$ && "$expires" =~ ^[0-9]{1,12}$ && "$added" =~ ^[01]$ && "$append" =~ ^[01]$ && "$active" =~ ^[01]$ ]]; then
     flush_notify
     die "internal error: unexpected result of the ban transaction"
   fi
   # a new ban (the entry had no DROP rule) or a new offence is recorded once; the same ban that is only re-applied is not recorded again.
   # The ban is complete at this point.
-  if [ "$added" -eq 1 ] || [ "$append" -eq 1 ]; then ban_event ban "$addr" "$pfx" "$reason" "$off" "$sec" "$forced"; fi
+  if [ "$added" -eq 1 ] || [ "$append" -eq 1 ]; then ban_event ban "$addr" "$pfx" "$reason" "$off" "$sec" "$forced" "${user:--}"; fi
   flush_notify
   if [ "$sec" -eq 0 ]; then
     echo "ovpn-ban: $entry banned permanently (offence $off)" >&2
