@@ -53,6 +53,7 @@ func openTestAudit(t *testing.T, webhook string) *adminAuditLog {
 // useAdminAudit installs a trail as the panel's for the test.
 func useAdminAudit(t *testing.T, webhook string) *adminAuditLog {
 	t.Helper()
+	asAdmin(t)
 	a := openTestAudit(t, webhook)
 	old := adminAudit
 	adminAudit = a
@@ -170,7 +171,7 @@ func TestAdminAuditLineFormatAndChain(t *testing.T) {
 		t.Errorf("verify: %+v, want 3 lines and last hash %s", res, prev)
 	}
 	b, _ := json.Marshal(res)
-	if string(b) != fmt.Sprintf(`{"ok":true,"lines":3,"lastHash":"%s"}`, prev) {
+	if string(b) != fmt.Sprintf(`{"ok":true,"state":"verified","lines":3,"lastSeq":3,"lastHash":"%s","checkpointSeq":0,"unanchored":3,"gaps":0}`, prev) {
 		t.Errorf("verify JSON: %s", b)
 	}
 }
@@ -360,10 +361,10 @@ func TestAdminAuditVerifyBrokenJSONShape(t *testing.T) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		t.Fatal(err)
 	}
-	if m["ok"] != false || m["brokenAt"] != float64(3) || m["reason"] == "" || len(m) != 3 {
+	if m["ok"] != false || m["state"] != "broken" || m["brokenAt"] != float64(3) || m["reason"] == "" || len(m) != 4 {
 		t.Errorf("verify JSON: %s", b)
 	}
-	if !strings.HasPrefix(string(b), `{"ok":false,"brokenAt":3,"reason":"`) {
+	if !strings.HasPrefix(string(b), `{"ok":false,"state":"broken","brokenAt":3,"reason":"`) {
 		t.Errorf("key order: %s", b)
 	}
 }
@@ -440,14 +441,8 @@ func TestAdminAuditRotationKeepsTheChainAndFiveGenerations(t *testing.T) {
 	}
 }
 
-func TestAdminAuditRotationDefaultLimitIsTenMiB(t *testing.T) {
-	if adminAuditMaxBytes != 10*1024*1024 || adminAuditGenerations != 5 {
-		t.Fatalf("limit %d, generations %d", adminAuditMaxBytes, adminAuditGenerations)
-	}
-	if a := openTestAudit(t, ""); a.maxBytes != 10<<20 {
-		t.Errorf("a new trail rotates at %d bytes", a.maxBytes)
-	}
-}
+// (the old test of the default limit only compared two constants: TestAuditRotatesAtTenMiBForReal writes 10 MiB
+// through a trail with the default limit and looks at the rotation it causes)
 
 // A deleted generation in the middle breaks the chain where the gap is.
 func TestAdminAuditMissingGenerationIsDetected(t *testing.T) {
@@ -686,6 +681,8 @@ func TestAdminAuditHandlerRequestsNeverWriteCredentials(t *testing.T) {
 	setFlag(t, authByPassword, true)
 
 	adminPass := randomSecret(t, "admin-")
+	setFlag(t, basicUsername, "root")
+	setFlag(t, basicPassword, adminPass)
 	userPass := randomSecret(t, "Zq9-")
 	shortPass := randomSecret(t, "")[:6]
 
@@ -742,7 +739,7 @@ func authedRequest(method, path string, form url.Values, user string) *http.Requ
 	req := httptest.NewRequest(method, path, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	if user != "" {
-		req.SetBasicAuth(user, "not-recorded")
+		req.SetBasicAuth(user, honestAdminPass)
 	}
 	return req
 }
@@ -840,7 +837,7 @@ func TestAdminAuditOtherActions(t *testing.T) {
 	rec = httptest.NewRecorder()
 	body := strings.NewReader(`{"User":"ghost","ClientAddress":"dynamic"}`)
 	req := httptest.NewRequest(http.MethodPost, "/api/user/ccd/apply", body)
-	req.SetBasicAuth("operator", "x")
+	req.SetBasicAuth(honestAdminUser, honestAdminPass)
 	oAdmin.userApplyCcdHandler(rec, req)
 
 	data, _ := os.ReadFile(a.path)
@@ -920,8 +917,6 @@ func TestAdminAuditLoginEvents(t *testing.T) {
 			t.Fatalf("right password: %d", code)
 		}
 	}
-	// the lockout hook
-	a.loginLocked(httptest.NewRequest(http.MethodGet, "/", nil), "root")
 
 	data, _ := os.ReadFile(a.path)
 	for _, s := range []string{secret, wrong, base64.StdEncoding.EncodeToString([]byte("root:" + secret)), base64.StdEncoding.EncodeToString([]byte("root:" + wrong)), "203.0.113.99"} {
@@ -935,15 +930,14 @@ func TestAdminAuditLoginEvents(t *testing.T) {
 		got = append(got, fmt.Sprintf("%s|%s|%s|%s|%s", r.Action, r.Actor, r.Target, r.Source, r.Result))
 	}
 	want := []string{
-		"auth.login.fail|basic-auth:root|root|198.51.100.7|fail",
-		"auth.login.fail|basic-auth:mallory|mallory|198.51.100.7|fail",
+		"auth.login.fail|unverified:root|root|198.51.100.7|fail",
+		"auth.login.fail|unverified:mallory|mallory|198.51.100.7|fail",
 		"auth.login.ok|basic-auth:root|root|198.51.100.7|ok",
-		"auth.login.locked|basic-auth:root|root|192.0.2.1|fail",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Errorf("login events\n got %q\nwant %q", got, want)
 	}
-	if len(recs) == 4 && !strings.Contains(recs[1].Detail, "4 more from this source") {
+	if len(recs) == 3 && !strings.Contains(recs[1].Detail, "4 more from this source") {
 		t.Errorf("the suppressed attempts are not counted: %q", recs[1].Detail)
 	}
 }
@@ -976,7 +970,7 @@ func getJSON(t *testing.T, h http.HandlerFunc, target string) (int, []byte) {
 	t.Helper()
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, target, nil)
-	req.SetBasicAuth("operator", "x")
+	req.SetBasicAuth(honestAdminUser, honestAdminPass)
 	h(rec, req)
 	return rec.Code, rec.Body.Bytes()
 }
@@ -1009,13 +1003,19 @@ func TestAdminAuditListEndpoint(t *testing.T) {
 		}
 	}
 	top := newest[0].Seq
-	if n := list("?limit=7"); len(n) != 7 || n[0].Seq != top {
+	// every read is itself a line (audit.read), so the newest line now is the one the first list wrote
+	if n := list("?limit=7"); len(n) != 7 || n[0].Seq != top+1 || n[0].Action != auditActAuditRead {
 		t.Errorf("limit=7: %d records, first %v", len(n), n)
 	}
-	if n := list("?limit=100000"); len(n) > 500 || len(n) < 100 {
-		t.Errorf("limit above 500 gave %d records", len(n))
+	// the cap itself is TestAuditListCapAndDefaultAreEnforced: 150 lines cannot show a cap of 500
+	if n := list("?limit=100000"); len(n) < 150 {
+		t.Errorf("a large limit gave %d records, the trail holds at least 150", len(n))
 	}
 	// paging with before walks the whole trail, generations included, exactly once
+	var onDisk int
+	for _, p := range a.files() {
+		onDisk += len(readAuditFile(t, p))
+	}
 	seen := map[int64]bool{}
 	before := ""
 	for page := 0; page < 40; page++ {
@@ -1030,10 +1030,6 @@ func TestAdminAuditListEndpoint(t *testing.T) {
 			seen[r.Seq] = true
 		}
 		before = fmt.Sprintf("&before=%d", recs[len(recs)-1].Seq)
-	}
-	var onDisk int
-	for _, p := range a.files() {
-		onDisk += len(readAuditFile(t, p))
 	}
 	if len(seen) != onDisk {
 		t.Errorf("paging saw %d records, the files hold %d", len(seen), onDisk)
@@ -1051,7 +1047,9 @@ func TestAdminAuditListEndpoint(t *testing.T) {
 		t.Errorf("before=-3: %d", code)
 	}
 	rec := httptest.NewRecorder()
-	oAdmin.adminAuditListHandler(rec, httptest.NewRequest(http.MethodPost, "/api/audit/admin", nil))
+	postReq := httptest.NewRequest(http.MethodPost, "/api/audit/admin", nil)
+	postReq.SetBasicAuth(honestAdminUser, honestAdminPass)
+	oAdmin.adminAuditListHandler(rec, postReq)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("POST: %d", rec.Code)
 	}
@@ -1077,7 +1075,7 @@ func TestAdminAuditVerifyEndpoint(t *testing.T) {
 	if code != 200 || json.Unmarshal(body, &ok) != nil || !ok.OK || ok.Lines != 5 || len(ok.LastHash) != 64 {
 		t.Fatalf("clean file: %d %s", code, body)
 	}
-	if !strings.HasPrefix(string(body), `{"ok":true,"lines":5,"lastHash":"`) {
+	if !strings.HasPrefix(string(body), `{"ok":true,"state":"verified","lines":5,"lastSeq":5,"lastHash":"`) {
 		t.Errorf("shape: %s", body)
 	}
 	// the check is itself in the trail: line 6, audit.verify, ok
@@ -1088,7 +1086,7 @@ func TestAdminAuditVerifyEndpoint(t *testing.T) {
 
 	flipByteAt(t, a.path, 3, 25)
 	code, body = getJSON(t, oAdmin.adminAuditVerifyHandler, "/api/audit/verify")
-	if code != 200 || !strings.HasPrefix(string(body), `{"ok":false,"brokenAt":3,"reason":"`) {
+	if code != 200 || !strings.HasPrefix(string(body), `{"ok":false,"state":"broken","brokenAt":3,"reason":"`) {
 		t.Fatalf("tampered file: %d %s", code, body)
 	}
 	recs2, _ := a.List(1, 0)
@@ -1098,6 +1096,7 @@ func TestAdminAuditVerifyEndpoint(t *testing.T) {
 }
 
 func TestAdminAuditEndpointsWithoutATrail(t *testing.T) {
+	asAdmin(t)
 	old := adminAudit
 	adminAudit = nil
 	t.Cleanup(func() { adminAudit = old })

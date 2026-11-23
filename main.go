@@ -426,10 +426,10 @@ func (oAdmin *OvpnAdmin) userChangePasswordHandler(w http.ResponseWriter, r *htt
 func (oAdmin *OvpnAdmin) userShowConfigHandler(w http.ResponseWriter, r *http.Request) {
 	log.Info(r.RemoteAddr, " ", r.URL.Path)
 	_ = r.ParseForm()
-	found := usernameIsPathSafe(r.FormValue("username")) && checkUserExist(r.FormValue("username"))
-	fmt.Fprint(w, oAdmin.renderClientConfig(r.FormValue("username")))
-	adminAudit.fromRequest(r, auditActUserConfigDownload, r.FormValue("username"), found,
-		auditDetail(found, "client configuration shown", "user not found"))
+	conf, err := oAdmin.renderClientConfigChecked(r.FormValue("username"))
+	adminAudit.fromRequest(r, auditActUserConfigDownload, r.FormValue("username"), err == nil,
+		auditErrDetail(err, "client configuration rendered (the answer is written after this line)"))
+	fmt.Fprint(w, conf)
 }
 
 func (oAdmin *OvpnAdmin) userDisconnectHandler(w http.ResponseWriter, r *http.Request) {
@@ -440,7 +440,7 @@ func (oAdmin *OvpnAdmin) userDisconnectHandler(w http.ResponseWriter, r *http.Re
 	_ = r.ParseForm()
 	// the handler answers 200 but disconnects nobody (the call is commented out below): the trail says so
 	adminAudit.fromRequest(r, auditActUserDisconnect, r.FormValue("username"), false,
-		"not implemented: no session was disconnected")
+		"not implemented: the request was answered with HTTP 200 but no session was disconnected")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	// 	fmt.Fprintf(w, "%s", userDisconnect(r.FormValue("username")))
 	fmt.Fprintf(w, "%s", r.FormValue("username"))
@@ -720,7 +720,7 @@ func main() {
 	log.Printf("Bind: %s", bindURL(*listenHost, *listenPort, *listenBaseUrl))
 	// /ping stays open for health checks; everything else, /metrics included, needs credentials
 	handler := securityHeadersMiddleware(
-		basicAuthMiddleware(http.DefaultServeMux, *basicUsername, *basicPassword, *listenBaseUrl+"ping"),
+		basicAuthMiddleware(auditRequiredMiddleware(http.DefaultServeMux), *basicUsername, *basicPassword, *listenBaseUrl+"ping"),
 		*listenBaseUrl+"api/")
 	if *basicUsername != "" {
 		log.Info("HTTP Basic Auth is enabled")
@@ -834,7 +834,10 @@ func basicAuthMiddleware(next http.Handler, username, password string, openPaths
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		adminAudit.loginOK(r, gotUser)
+		if err := adminAudit.loginOK(r, gotUser); err != nil && auditRequired() {
+			http.Error(w, `{"status":"error","message":"the login could not be recorded in the audit trail (OVPN_ADMIN_AUDIT_REQUIRED is on)"}`, http.StatusInternalServerError)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -984,6 +987,14 @@ func (oAdmin *OvpnAdmin) getClientConfigTemplate() *template.Template {
 }
 
 func (oAdmin *OvpnAdmin) renderClientConfig(username string) string {
+	conf, _ := oAdmin.renderClientConfigChecked(username)
+	return conf
+}
+
+// renderClientConfigChecked is renderClientConfig and the error that says why the text is not a
+// configuration: the user does not exist, or the template failed (the text is then what was rendered up to
+// the failure).
+func (oAdmin *OvpnAdmin) renderClientConfigChecked(username string) (string, error) {
 	if usernameIsPathSafe(username) && checkUserExist(username) {
 		hosts := slices.Clone(ovpnServers)
 
@@ -1018,14 +1029,15 @@ func (oAdmin *OvpnAdmin) renderClientConfig(username string) string {
 		if err != nil {
 			log.Errorf("something goes wrong during rendering config for %s", username)
 			log.Debugf("rendering config for %s failed with error %v", username, err)
+			err = errors.New("the client configuration template failed: the text sent is what was rendered up to the failure")
 		}
 
 		log.Tracef("Rendered config for user %s: %+v", username, tmp.String())
 
-		return fmt.Sprintf("%+v", tmp.String())
+		return fmt.Sprintf("%+v", tmp.String()), err
 	}
 	log.Warnf("user \"%s\" not found", username)
-	return fmt.Sprintf("user \"%s\" not found", username)
+	return fmt.Sprintf("user \"%s\" not found", username), errors.New("user not found")
 }
 
 func validateUsername(username string) error {
