@@ -832,7 +832,8 @@ func TestBanScriptExistingBehaviour(t *testing.T) {
 	if _, code := r.run([]string{"OVPN_BAN_PORT="}, "check"); code == 0 {
 		t.Errorf("check without a listener port")
 	}
-	// state survives a restart: temporary bans are cleared by init, permanent ones are restored; the history stays
+	// state survives a restart: init empties the chains and the list, setup puts back from the history the permanent bans and the
+	// temporary bans that have not run out (5.5.5.5 runs until +100600, original end); the history stays
 	r.must("ban", "5.5.5.5", "3")
 	r.must("ban-manual", "6.6.6.6")
 	r.setNow(rigStart + 100010)
@@ -842,8 +843,11 @@ func TestBanScriptExistingBehaviour(t *testing.T) {
 	}
 	r.must("setup")
 	r.must("check")
-	if got := strings.Join(r.rules("4"), "|"); got != "-A OVPN_BAN -s 6.6.6.6/32 -j DROP" {
+	if got := strings.Join(r.rules("4"), "|"); got != "-A OVPN_BAN -s 6.6.6.6/32 -j DROP|-A OVPN_BAN -s 5.5.5.5/32 -j DROP" {
 		t.Errorf("after the restart: %s", got)
+	}
+	if row := r.stateRow("5.5.5.5"); row == nil || row[1] != fmt.Sprint(rigStart+100000) || row[2] != fmt.Sprint(rigStart+100600) {
+		t.Errorf("the restored temporary ban keeps its time and its end: %v", row)
 	}
 	// a ban that fail2ban re-derives right after the start, while the old one would still run, is the same ban: not a new offence
 	r.setNow(rigStart + 100030)

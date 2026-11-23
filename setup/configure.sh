@@ -33,6 +33,9 @@ BAN_REPEAT_COUNT="${OVPN_BAN_REPEAT_COUNT:-}"
 BAN_DECAY_DAYS="${OVPN_BAN_DECAY_DAYS:-30}"
 BAN_IPV6_PREFIX="${OVPN_BAN_IPV6_PREFIX:-64}"
 BAN_MAX_ENTRIES="${OVPN_BAN_MAX_ENTRIES:-500}"
+# seconds between two runs of the expiry of temporary bans (the watcher, and the supervisor while the watcher is down)
+BAN_SWEEP_SECONDS="${OVPN_BAN_SWEEP_SECONDS:-30}"
+export OVPN_BAN_SWEEP_SECONDS="${BAN_SWEEP_SECONDS}"
 # the Telegram ban message carries no address and no user name unless this is true
 TG_INCLUDE_ADDRESS="${OVPN_TELEGRAM_INCLUDE_ADDRESS:-false}"
 # The enforced port and transport are derived below from OVPN_SERVER_PORT and OVPN_PROTO, the values of the openvpn command
@@ -54,7 +57,7 @@ for ban_bool in OVPN_BAN_ENABLED:"${BAN_ENABLED}" OVPN_BAN_REQUIRED:"${BAN_REQUI
     exit 1
   fi
 done
-for ban_num in OVPN_BAN_MAXRETRY:"${BAN_MAXRETRY}" OVPN_BAN_FINDTIME:"${BAN_FINDTIME}" OVPN_BAN_BANTIME:"${BAN_BANTIME:-3600}" OVPN_BAN_REPEAT_COUNT:"${BAN_REPEAT_COUNT:-2}" OVPN_BAN_DECAY_DAYS:"${BAN_DECAY_DAYS}" OVPN_BAN_MAX_ENTRIES:"${BAN_MAX_ENTRIES}" OVPN_LOG_MAX_BYTES:"${LOG_MAX_BYTES}" OVPN_LOG_KEEP:"${LOG_KEEP}" OVPN_LOG_ROTATE_INTERVAL:"${LOG_ROTATE_INTERVAL}"; do
+for ban_num in OVPN_BAN_MAXRETRY:"${BAN_MAXRETRY}" OVPN_BAN_FINDTIME:"${BAN_FINDTIME}" OVPN_BAN_BANTIME:"${BAN_BANTIME:-3600}" OVPN_BAN_REPEAT_COUNT:"${BAN_REPEAT_COUNT:-2}" OVPN_BAN_DECAY_DAYS:"${BAN_DECAY_DAYS}" OVPN_BAN_MAX_ENTRIES:"${BAN_MAX_ENTRIES}" OVPN_BAN_SWEEP_SECONDS:"${BAN_SWEEP_SECONDS}" OVPN_LOG_MAX_BYTES:"${LOG_MAX_BYTES}" OVPN_LOG_KEEP:"${LOG_KEEP}" OVPN_LOG_ROTATE_INTERVAL:"${LOG_ROTATE_INTERVAL}"; do
   if ! [[ "${ban_num#*:}" =~ ^[1-9][0-9]{0,9}$ ]]; then
     echo "ERROR: ${ban_num%%:*} must be a positive integer, got \"${ban_num#*:}\"" >&2
     exit 1
@@ -402,8 +405,26 @@ export OVPN_BAN_TOOL="${BAN_TOOL}" OVPN_BAN_CONTROL_DIR="${BAN_CONTROL_DIR}"
 # the jail bantime is the first escalation step: fail2ban only schedules its own unban with it, the length of a ban is decided by
 # ovpn-ban.sh and enforced by its "expire" (also run every 30 s by the watcher); a bad OVPN_BAN_ESCALATION stops the container here
 BAN_JAIL_BANTIME="$("${BAN_TOOL}" jail-bantime)"
-# clear the ban list once, before fail2ban starts: a fresh network namespace has no bans, so no stale rows
-"${BAN_TOOL}" init
+# Clear the ban list once, before fail2ban starts: a fresh network namespace has no bans, so no stale rows. init also migrates the ban
+# history of an earlier release and fails (the file named on stderr) when the history of the PERMANENT bans is not known: unreadable,
+# not in a recognised format, or an earlier-release file that could not be converted. A fresh installation (no history anywhere) is
+# fine, and so is a history file that is readable and empty. With the ban engine required the container stops here: it never serves
+# with a set of permanent bans that is empty only because it could not be read.
+if ! "${BAN_TOOL}" init; then
+  if [ "${BAN_ENABLED}" != "true" ]; then
+    echo "WARNING: the ban engine state could not be initialised (see above); OVPN_BAN_ENABLED=false, so no ban is enforced anyway" >&2
+  elif [ "${BAN_REQUIRED}" = "true" ]; then
+    echo "################################################################################" >&2
+    echo "ERROR: the ban engine cannot start: the history of the permanent bans is unreadable, not in a recognised format or untrusted (the file is named above). OVPN_BAN_REQUIRED=true, stopping the container instead of serving without the bans of the operator. Fix or move the file named above, then start again." >&2
+    echo "################################################################################" >&2
+    exit 1
+  else
+    echo "################################################################################" >&2
+    echo "ERROR: the ban engine cannot start (see above): permanent bans are NOT enforced. OVPN_BAN_REQUIRED=false, continuing without the ban engine." >&2
+    echo "################################################################################" >&2
+    BAN_ENABLED=false
+  fi
+fi
 
 # start_ban_control: the queue watcher of the manual ban control (see ovpn-ban-control.py), in the background for the life of the
 # container. Started with the Telegram settings in its environment (the notification of a manual ban comes from ovpn-ban.sh, like
@@ -426,6 +447,29 @@ start_ban_control() {
     return 1
   fi
   echo "ban control: watching ${BAN_CONTROL_DIR}"
+}
+
+# ban_control_alive PID: the watcher process exists and is not a zombie (the container's init does not reap a child that died)
+ban_control_alive() {
+  local st
+  [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null || return 1
+  st="$(sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | cut -c1)"
+  [ -n "${st}" ] && [ "${st}" != "Z" ]
+}
+
+# supervise_ban_control: background loop for the life of the container. When the watcher is not running it says so (an error line each
+# time), runs the expiry of the temporary bans itself (ovpn-ban.sh expire: lifts what ran out, reconciles rules and ban list) and starts
+# the watcher again. Runs without a trace (a line per check would drown the log).
+supervise_ban_control() {
+  set +ex
+  while :; do
+    sleep "${BAN_SWEEP_SECONDS}"
+    ban_control_alive "${BAN_CONTROL_PID:-}" && continue
+    echo "ERROR: the ban control watcher is not running: running the expiry of temporary bans from the supervisor and starting it again" >&2
+    "${BAN_TOOL}" expire >/dev/null || echo "ERROR: the expiry of temporary bans failed" >&2
+    start_ban_control >/dev/null || echo "ERROR: the ban control watcher could not be started again" >&2
+    { set +x; } 2>/dev/null
+  done
 }
 
 # start_fail2ban: writes the fail2ban config from the validated values above (always rebuilt, so nothing stale
@@ -538,8 +582,16 @@ if [ "${BAN_ENABLED}" = "true" ]; then
   fi
   if start_fail2ban && "${BAN_TOOL}" check; then
     echo "fail2ban: jail ovpn-admin running (maxretry=${BAN_MAXRETRY} findtime=${BAN_FINDTIME}s jail-bantime=${BAN_JAIL_BANTIME}s escalation=\"${BAN_ESCALATION:-default 10m,1h,24h,0}\" decay-days=${BAN_DECAY_DAYS} ipv6-prefix=/${BAN_IPV6_PREFIX} max-entries=${BAN_MAX_ENTRIES})"
-    # after the jail start (its start action rebuilt the chains and restored the permanent bans), before OpenVPN
-    start_ban_control || true
+    # after the jail start (its start action rebuilt the chains and restored the permanent bans), before OpenVPN. The watcher is what lifts
+    # a 1 h or 24 h ban when it runs out (nothing in the kernel does): a start that fails is a loud error, a watcher that dies is
+    # restarted, and while it is down the expiry runs from here. Whether the expiry gates readiness is the owner's decision (open): the
+    # container keeps running, as before.
+    if ! start_ban_control; then
+      echo "################################################################################" >&2
+      echo "ERROR: the ban control watcher is not running: temporary bans are lifted by the supervisor every ${BAN_SWEEP_SECONDS}s, manual ban control is NOT available." >&2
+      echo "################################################################################" >&2
+    fi
+    supervise_ban_control &
   else
     ban_rc=$?
     if [ "${ban_rc}" -eq 3 ]; then

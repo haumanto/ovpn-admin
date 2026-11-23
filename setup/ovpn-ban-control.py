@@ -149,6 +149,63 @@ def parse_request(data, stem):
     return action, ip, reason, force, minutes
 
 
+def duration_text(seconds):
+    if seconds == 0:
+        return "permanently"
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds % size == 0:
+            n = seconds // size
+            return f"for {n} {unit}{'' if n == 1 else 's'}"
+    return f"for {seconds} seconds"
+
+
+def result_fields(stdout, kind):
+    """The key=value fields of the \"ovpn-ban-result KIND ...\" line the tool prints on success, or None."""
+    for ln in stdout.splitlines():
+        parts = ln.split()
+        if len(parts) >= 2 and parts[0] == "ovpn-ban-result" and parts[1] == kind:
+            fields = dict(p.split("=", 1) for p in parts[2:] if "=" in p)
+            return fields
+    return None
+
+
+def describe_result(action, ip, minutes, stdout):
+    """The reply states what the tool ENFORCED (its result line), never what was requested: the whole prefix of an IPv6 address, the step
+    and the end that the history decided (a permanent ban on record overrides the minutes asked for)."""
+    f = result_fields(stdout, action)
+    if f is None:
+        # a tool without a result line: success is all that is known, and the reply says no more than that
+        return f"{action} of {ip} succeeded; the ban tool gave no summary of what is enforced"
+    entry = f.get("entry", "?")
+    if action == "unban":
+        had = f.get("had") == "1"
+        still = f.get("still", "-")
+        text = f"unbanned {entry}" if had else f"nothing was banned for {entry}: no rule, row or history to remove"
+        if entry != ip:
+            text += f" (requested {ip})"
+        if still != "-":
+            text += f"; NOTE {still} overlaps it and is still banned (its rule and history are untouched)"
+        return text
+    try:
+        seconds, expires = int(f.get("seconds", "")), int(f.get("expires", ""))
+    except ValueError:
+        return f"ban of {ip} succeeded; the ban tool gave no usable summary of what is enforced"
+    when = "" if seconds == 0 else " until " + time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(expires))
+    text = f"banned {entry} {duration_text(seconds)}{when}"
+    if f.get("requested") and f["requested"] != entry:
+        text += f" (requested {f['requested']})"
+    text += f", offence {f.get('offence', '?')}"
+    status = f.get("status")
+    if status == "unchanged":
+        text += ", already banned: nothing changed"
+    elif status == "renewed":
+        text += ", already banned: recorded again"
+    asked = None if minutes is None else minutes * 60
+    if asked is not None and asked != seconds:
+        text += f"; NOT the {minutes} minutes asked for: an earlier ban on record decides the length"
+    return text
+
+
 def run_tool(tool, action, ip, reason, force=False, minutes=None):
     """Fixed argument vectors, no shell. Returns (ok, message)."""
     if action == "ban":
@@ -164,9 +221,7 @@ def run_tool(tool, action, ip, reason, force=False, minutes=None):
     except OSError as exc:
         return False, f"cannot run the ban tool ({type(exc).__name__})"
     if proc.returncode == 0:
-        if action == "unban":
-            return True, f"unbanned {ip}"
-        return True, f"banned {ip} permanently" if minutes is None else f"banned {ip} for {minutes} minutes"
+        return True, describe_result(action, ip, minutes, proc.stdout.decode("utf-8", "replace"))
     err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
     # the tool's own refusals ("ovpn-ban: ...") carry no secrets; anything else is reduced to the exit status
     line = next((ln for ln in err if ln.startswith("ovpn-ban: ")), "")
@@ -174,9 +229,10 @@ def run_tool(tool, action, ip, reason, force=False, minutes=None):
 
 
 def sweep(tool):
-    """Lift the temporary bans that ran out (ovpn-ban.sh expire). A failure is one log line, never an error of the watcher."""
+    """Lift the temporary bans that ran out and reconcile the rules with the ban list (ovpn-ban.sh expire). A failure is a log line with the
+    first diagnostic of the tool, never an error of the watcher."""
     try:
-        proc = subprocess.run([tool, "expire"], shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        proc = subprocess.run([tool, "expire"], shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                               timeout=SWEEP_TIMEOUT, check=False)
     except subprocess.TimeoutExpired:
         log(f"expiry sweep timed out after {SWEEP_TIMEOUT} s")
@@ -185,7 +241,9 @@ def sweep(tool):
         log(f"expiry sweep cannot run the ban tool ({type(exc).__name__})")
         return
     if proc.returncode != 0:
-        log(f"expiry sweep failed (exit {proc.returncode})")
+        err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        line = next((ln for ln in err if ln.startswith("ovpn-ban: ")), "")
+        log(f"expiry sweep failed (exit {proc.returncode}){': ' + line[len('ovpn-ban: '):][:200] if line else ''}")
 
 
 def remove_entry(dfd, name):
@@ -297,6 +355,9 @@ def main(argv):
     except OSError as exc:
         log(f"startup recovery failed ({type(exc).__name__})")
     log(f"watching {path} every {poll} s")
+    # one sweep right at the start: what ran out while no watcher was running is lifted at once, and a rule left by an interrupted ban is
+    # adopted or removed
+    sweep(tool)
     last_sweep = time.monotonic()
     while running:
         try:
