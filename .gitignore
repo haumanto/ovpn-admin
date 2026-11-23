@@ -4,11 +4,16 @@ ovpn-admin
 easyrsa
 easyrsa_master
 easyrsa_slave
+/easyrsa_*/
 ccd
 ccd_master
 ccd_slave
+/ccd_*/
 audit_master/
 audit_slave/
+state_master/
+state_slave/
+backups/
 frontend/node_modules
 
 main-packr.go

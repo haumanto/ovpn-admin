@@ -30,7 +30,7 @@
 #   ovpn-ban.sh flush            remove every DROP rule of both chains and clear the ban list
 #   ovpn-ban.sh teardown         remove the INPUT jumps, flush, delete both chains (actionstop, ban engine disabled)
 #
-# Ban list (read by ovpn-admin): OVPN_BAN_STATE, default /etc/openvpn/audit/bans.tsv, root:root 0600, no header, one
+# Ban list (read by ovpn-admin): OVPN_BAN_STATE, default /var/lib/ovpn-admin/bans.tsv, root:root 0600, no header, one
 # tab-separated row per active ban: ip, banned_at_unix, expires_at_unix, failures, reason. IPv4 and IPv6 share the file;
 # the ip column holds the canonical text form of the address, or for an IPv6 ban of a prefix the network with the prefix length it was
 # banned with ("2001:db8:1:2::/64"): the unban removes exactly that rule. OVPN_BAN_MAX_ENTRIES (default 500) bounds the rows of the list
@@ -85,7 +85,7 @@
 #                       (default /etc/openvpn/audit)
 #   OVPN_BAN_SWEEP_SECONDS  seconds between two sweeps of the watcher (default 30, read by ovpn-ban-control and configure.sh)
 #   OVPN_BAN_EVENTS_LOG ban event log (default /var/lib/ovpn-admin/audit/ban-events.log)
-#   OVPN_BAN_LOG        OpenVPN log, only read to name the reason of a ban (default /etc/openvpn/audit/openvpn.log)
+#   OVPN_BAN_LOG        OpenVPN log, only read to name the reason of a ban (default /var/lib/ovpn-admin/openvpn.log)
 #   OVPN_BAN_NOTIFY_LOG  file that receives the warning when a Telegram notification fails (set by configure.sh to the fail2ban log)
 #   OVPN_TELEGRAM_ENABLED  set by configure.sh (true only when the Telegram settings are valid); with true, a new ban (or offence) and the
 #                       lifting of a ban run /usr/local/sbin/ovpn-telegram-notify ban|unban ... after the DROP rule and the row are
@@ -189,7 +189,7 @@ V6="${OVPN_BAN_IPV6:-false}"
 V6_REQUIRED="${OVPN_BAN_IPV6_REQUIRED:-true}"
 ADMIN_PORT="${OVPN_LISTEN_PORT:-8080}"
 MGMT_PORT="8989"
-STATE="${OVPN_BAN_STATE:-/etc/openvpn/audit/bans.tsv}"
+STATE="${OVPN_BAN_STATE:-/var/lib/ovpn-admin/bans.tsv}"
 LOCK="${STATE}.lock"
 REMOVALS="${STATE}.removals"
 CAP_HITS="${STATE}.caphits"
@@ -204,7 +204,7 @@ LEGACY_FILES=("$LEGACY_HISTORY")
 BOOT_FILE="${STATE}.boot"
 EVENTS_LOG="${OVPN_BAN_EVENTS_LOG:-/var/lib/ovpn-admin/audit/ban-events.log}"
 RESTART_GRACE=120
-OVPN_LOG="${OVPN_BAN_LOG:-/etc/openvpn/audit/openvpn.log}"
+OVPN_LOG="${OVPN_BAN_LOG:-/var/lib/ovpn-admin/openvpn.log}"
 NOTIFY_BIN="${OVPN_BAN_NOTIFY_BIN:-/usr/local/sbin/ovpn-telegram-notify}"
 NOTIFY_LOG="${OVPN_BAN_NOTIFY_LOG:-}"
 TG_INCLUDE_ADDRESS="${OVPN_TELEGRAM_INCLUDE_ADDRESS:-false}"

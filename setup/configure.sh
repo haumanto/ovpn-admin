@@ -324,17 +324,14 @@ done
 echo "script-security 2" | tee -a /etc/openvpn/openvpn.conf
 echo "client-connect /etc/openvpn/scripts/client-connect.sh" | tee -a /etc/openvpn/openvpn.conf
 echo "client-disconnect /etc/openvpn/scripts/client-disconnect.sh" | tee -a /etc/openvpn/openvpn.conf
-# the hooks run as the unprivileged "user nobody" of openvpn.conf, so it owns the directory (and an existing log);
-# the directory is 700 and the log is created 600 (umask 077 in audit.sh)
-AUDIT_LOG_FILE="${OVPN_AUDIT_LOG:-/etc/openvpn/audit/audit.tsv}"
-AUDIT_LOG_DIR="$(dirname "${AUDIT_LOG_FILE}")"
-mkdir -p "${AUDIT_LOG_DIR}"
-chown nobody:nogroup "${AUDIT_LOG_DIR}"
-chmod 700 "${AUDIT_LOG_DIR}"
-if [ -f "${AUDIT_LOG_FILE}" ]; then
-  chown nobody:nogroup "${AUDIT_LOG_FILE}"
-  chmod 600 "${AUDIT_LOG_FILE}"
-fi
+# The hooks run as the unprivileged "user nobody" of openvpn.conf, so only the event file lives in a tree nobody owns
+# (/etc/openvpn/audit, 0700, audit.tsv 0600 from the umask 077 in audit.sh). Everything that drives bans, locks or the admin audit is
+# in the root-only tree /var/lib/ovpn-admin (0700): a compromised VPN process cannot rewrite it. layout.sh creates both trees, refuses
+# symbolic links, copies the ban state of an older deployment once, and does nothing on a second run (see the header of layout.sh).
+# Both trees are bind mounts of ./audit_<role> and ./state_<role> in the compose files.
+# shellcheck source=layout.sh
+. "$(dirname "${BASH_SOURCE[0]}")/layout.sh"
+ovpn_layout_prepare
 
 if [ "${OVPN_PASSWD_AUTH:-false}" = "true" ]; then
   cp -f /etc/openvpn/setup/auth.sh /etc/openvpn/scripts/auth.sh
@@ -356,7 +353,7 @@ mkdir -p /etc/openvpn/ccd
 # --- OpenVPN log, ban engine -------------------------------------------------------------------------------
 # OpenVPN writes its log to a file (--log-append below) that fail2ban watches; tail -F mirrors the file to stdout
 # so "docker compose logs" still shows it. The file is created before OpenVPN so that the jail can open it.
-OPENVPN_LOG="${AUDIT_LOG_DIR}/openvpn.log"
+OPENVPN_LOG="${STATE_DIR}/openvpn.log"
 FAIL2BAN_LOG="/var/log/fail2ban.log"
 
 # rotate_log FILE: when FILE is larger than OVPN_LOG_MAX_BYTES, FILE.(N-1) becomes FILE.N (N = OVPN_LOG_KEEP, the oldest is
@@ -379,14 +376,16 @@ rotate_log() {
 }
 rotate_log "${OPENVPN_LOG}" || true
 rotate_log "${FAIL2BAN_LOG}" || true
+# root-owned: OpenVPN opens its log (--log-append) as root before it drops to "nobody", fail2ban and tail run as root
+[ ! -L "${OPENVPN_LOG}" ] || { echo "ERROR: ${OPENVPN_LOG} is a symbolic link; refusing to continue" >&2; exit 1; }
 touch "${OPENVPN_LOG}"
-chown nobody:nogroup "${OPENVPN_LOG}"
+chown -h root:root "${OPENVPN_LOG}"
 chmod 600 "${OPENVPN_LOG}"
 tail -n 0 -F "${OPENVPN_LOG}" &
 
 # ban list and enforcement, see ovpn-ban.sh (installed fresh at every start). The ban history (bans-history.tsv, same directory) keeps
 # the offences and the permanent bans across restarts; "init" below leaves it alone and "setup" restores the permanent bans.
-BAN_STATE_FILE="${AUDIT_LOG_DIR}/bans.tsv"
+BAN_STATE_FILE="${STATE_DIR}/bans.tsv"
 export OVPN_BAN_STATE="${BAN_STATE_FILE}" OVPN_BAN_LOG="${OPENVPN_LOG}" OVPN_BAN_ESCALATION="${BAN_ESCALATION}" OVPN_BAN_BANTIME="${BAN_BANTIME}" OVPN_BAN_REPEAT_COUNT="${BAN_REPEAT_COUNT}" OVPN_IPTABLES_BIN="${IPTABLES_BIN}" OVPN_IP6TABLES_BIN="${IP6TABLES_BIN}"
 export OVPN_BAN_DECAY_DAYS="${BAN_DECAY_DAYS}" OVPN_BAN_IPV6_PREFIX="${BAN_IPV6_PREFIX}" OVPN_BAN_MAX_ENTRIES="${BAN_MAX_ENTRIES}" OVPN_TELEGRAM_INCLUDE_ADDRESS="${TG_INCLUDE_ADDRESS}"
 # the manual ban guard refuses these unless the request carries force: the ignore list and the VPN client networks
@@ -399,9 +398,9 @@ install -D -m 0755 /etc/openvpn/setup/ovpn-ban.sh "${BAN_TOOL}"
 # manual ban/unban queue shared with the ovpn-admin container: a directory next to bans.tsv, owned by root, mode 0700 (the admin
 # container runs as root too); the watcher (started below, only with the ban engine) executes the requests through ovpn-ban.sh
 BAN_CONTROL_TOOL="/usr/local/sbin/ovpn-ban-control"
-BAN_CONTROL_DIR="${AUDIT_LOG_DIR}/control"
+BAN_CONTROL_DIR="${STATE_CONTROL_DIR}"
 install -D -m 0755 /etc/openvpn/setup/ovpn-ban-control.py "${BAN_CONTROL_TOOL}"
-export OVPN_BAN_TOOL="${BAN_TOOL}" OVPN_BAN_CONTROL_DIR="${BAN_CONTROL_DIR}"
+export OVPN_BAN_TOOL="${BAN_TOOL}" OVPN_BAN_CONTROL_DIR="${BAN_CONTROL_DIR}" OVPN_BAN_EVENTS_LOG="${STATE_AUDIT_DIR}/ban-events.log"
 # the jail bantime is the first escalation step: fail2ban only schedules its own unban with it, the length of a ban is decided by
 # ovpn-ban.sh and enforced by its "expire" (also run every 30 s by the watcher); a bad OVPN_BAN_ESCALATION stops the container here
 BAN_JAIL_BANTIME="$("${BAN_TOOL}" jail-bantime)"
@@ -431,7 +430,7 @@ fi
 # the one of fail2ban), set the same way as for the fail2ban server: one-command environment, no trace while the token is expanded.
 # A watcher that does not come up is an error line, not a reason to stop the VPN.
 start_ban_control() {
-  mkdir -p "${BAN_CONTROL_DIR}" && chown root:root "${BAN_CONTROL_DIR}" && chmod 0700 "${BAN_CONTROL_DIR}" || {
+  mkdir -p "${BAN_CONTROL_DIR}" && chown -h root:root "${BAN_CONTROL_DIR}" && chmod 0700 "${BAN_CONTROL_DIR}" || {
     echo "ERROR: cannot create the ban control directory ${BAN_CONTROL_DIR}: manual ban control is NOT available" >&2
     return 1
   }

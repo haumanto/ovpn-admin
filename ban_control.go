@@ -60,12 +60,13 @@ type banControlResult struct {
 	Message string `json:"message"`
 }
 
-// banControlDir is <audit dir>/control, "" without an audit path.
+// banControlDir is <state dir>/control (--state.dir), or <audit dir>/control without one, "" with neither.
 func banControlDir() string {
-	if *auditPath == "" {
+	base := banStateBase()
+	if base == "" {
 		return ""
 	}
-	return filepath.Join(filepath.Dir(*auditPath), banControlDirName)
+	return filepath.Join(base, banControlDirName)
 }
 
 // validBanControlID: 1 to 64 characters of [A-Za-z0-9_-]. Anything else could name another path.

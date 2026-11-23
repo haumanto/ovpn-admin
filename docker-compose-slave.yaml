@@ -14,13 +14,15 @@ services:
       OVPN_PROTO: "tcp6"
       # IPv4 firewall backend; older Docker hosts set iptables-legacy
       OVPN_IPTABLES_BIN: "${OVPN_IPTABLES_BIN:-iptables}"
-      # connection audit log and ban list (bans.tsv) written into the shared ./audit_slave mount, read by ovpn-admin
+      # connection audit log written by the OpenVPN hooks into the shared ./audit_slave mount, read by ovpn-admin. It is the only file
+      # in that tree (owned by nobody, the user the hooks run as). The OpenVPN log, the ban list (bans.tsv) and history, the ban control
+      # queue, the admin audit trail and the ban event log live in the root-only ./state_slave mount (/var/lib/ovpn-admin).
       OVPN_AUDIT_LOG: "/etc/openvpn/audit/audit.tsv"
       # Ban engine (fail2ban inside this container, IPv4 and IPv6): bans a source address after OVPN_BAN_MAXRETRY failed
       # logins (AUTH_FAILED) or revoked-certificate attempts within OVPN_BAN_FINDTIME seconds, for OVPN_BAN_BANTIME seconds.
       # Ban rules live in the OVPN_BAN chain (iptables, IPv4) and the OVPN_BAN6 chain (ip6tables, IPv6); both are only
       # reached for traffic to the OpenVPN listener port OVPN_SERVER_PORT (derived with its transport from OVPN_PROTO), never for the ovpn-admin port 8080.
-      # The active bans are listed in bans.tsv in the audit directory. Temporary bans are not kept across container restarts; permanent bans (see OVPN_BAN_REPEAT_COUNT) are.
+      # The active bans are listed in bans.tsv in the state directory (/var/lib/ovpn-admin). Temporary bans are not kept across container restarts; permanent bans (see OVPN_BAN_REPEAT_COUNT) are.
       # IPv6 firewall backend; set ip6tables-legacy together with iptables-legacy
       OVPN_IP6TABLES_BIN: "${OVPN_IP6TABLES_BIN:-ip6tables}"
       # OpenVPN listener port inside the container. The same value is the --port of openvpn, the right side of the port
@@ -41,8 +43,8 @@ services:
       OVPN_BAN_MAXRETRY: "${OVPN_BAN_MAXRETRY:-3}"
       OVPN_BAN_FINDTIME: "${OVPN_BAN_FINDTIME:-600}"
       OVPN_BAN_BANTIME: "${OVPN_BAN_BANTIME:-3600}"
-      # The Nth ban of the same address is permanent (never expires, survives container restarts; kept in ban-history.tsv in the
-      # audit directory). 2 = the second ban is permanent; 1 = every ban is permanent. A permanent ban is lifted by hand only.
+      # The Nth ban of the same address is permanent (never expires, survives container restarts; kept in the ban history in the
+      # state directory). 2 = the second ban is permanent; 1 = every ban is permanent. A permanent ban is lifted by hand only.
       OVPN_BAN_REPEAT_COUNT: "${OVPN_BAN_REPEAT_COUNT:-2}"
       # Allowlist, never banned: loopback and private ranges, which include the Docker networks (172.16.0.0/12).
       # A client whose connection reaches OpenVPN through Docker's proxy shows up with the bridge gateway address (for
@@ -84,7 +86,10 @@ services:
     volumes:
       - ./easyrsa_slave:/etc/openvpn/easyrsa
       - ./ccd_slave:/etc/openvpn/ccd
+      # event file only (audit.tsv), nobody:nogroup 0700
       - ./audit_slave:/etc/openvpn/audit
+      # ban state, OpenVPN log, ban control queue, admin audit and ban event logs: root:root 0700. Written by both services, so no :ro
+      - ./state_slave:/var/lib/ovpn-admin
     logging:
       driver: json-file
       options:
@@ -95,7 +100,7 @@ services:
       context: .
       dockerfile: Dockerfile.ovpn-admin
     image: ovpn-admin:local
-    command: /app/ovpn-admin --log.level="debug" --ovpn.network="192.168.100.0/24" --ovpn.network.ipv6="fd00:192:168:100::/64" --master.host="http://172.20.0.1:8080" --role="slave" --ovpn.server="127.0.0.1:7777:tcp" --ovpn.server="127.0.0.1:7778:tcp" --easyrsa.path="/mnt/easyrsa" --easyrsa.index-path="/mnt/easyrsa/pki/index.txt" --ccd.path="/mnt/ccd"
+    command: /app/ovpn-admin --log.level="${LOG_LEVEL:-info}" --ovpn.network="192.168.100.0/24" --ovpn.network.ipv6="fd00:192:168:100::/64" --master.host="http://172.20.0.1:8080" --role="slave" --ovpn.server="127.0.0.1:7777:tcp" --ovpn.server="127.0.0.1:7778:tcp" --easyrsa.path="/mnt/easyrsa" --easyrsa.index-path="/mnt/easyrsa/pki/index.txt" --ccd.path="/mnt/ccd"
     environment:
       # Generate the sync token with: openssl rand -hex 32 (same value as OVPN_MASTER_TOKEN of docker-compose.yaml).
       # The slave panel serves every user's private key and the tls-auth key: keep it behind a TLS reverse proxy.
@@ -107,13 +112,18 @@ services:
       # Basic Auth credentials of the master, used by the slave to sync from it
       OVPN_MASTER_USER: "${OVPN_MASTER_USER:?set OVPN_MASTER_USER}"
       OVPN_MASTER_PASSWORD: "${OVPN_MASTER_PASSWORD:?set OVPN_MASTER_PASSWORD}"
-      # login history and active bans (/api/bans) come from the audit directory of the openvpn service
+      # login history comes from the audit directory, active bans (/api/bans) from the state directory (OVPN_STATE_DIR) of the openvpn service
       OVPN_AUDIT_PATH: "/mnt/audit/audit.tsv"
+      # the ban list (bans.tsv) and the manual ban queue (control/) are in the state tree the ban engine writes, not next to the event file
+      OVPN_STATE_DIR: "/var/lib/ovpn-admin"
     network_mode: service:openvpn
     volumes:
       - ./easyrsa_slave:/mnt/easyrsa
       - ./ccd_slave:/mnt/ccd
-      - ./audit_slave:/mnt/audit
+      # the panel only reads the event file: read-only here
+      - ./audit_slave:/mnt/audit:ro
+      # same tree as the openvpn service (the panel writes its admin audit trail and the ban control queue here): no :ro
+      - ./state_slave:/var/lib/ovpn-admin
     logging:
       driver: json-file
       options:

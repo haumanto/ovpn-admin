@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alecthomas/kingpin/v2"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -59,12 +60,28 @@ type bansResponse struct {
 	Bans []banJSON `json:"bans"`
 }
 
-// banListPath is the ban list file: bans.tsv in the directory of the audit log.
-func banListPath() string {
+// stateDir is the root-only state tree of the VPN container (compose: /var/lib/ovpn-admin), which holds the ban list (bans.tsv) and the
+// manual ban queue (control/). Empty, the default, keeps the earlier layout: both sit next to the audit log (--audit.path).
+var stateDir = kingpin.Flag("state.dir", "directory of the ban list (bans.tsv) and the manual ban queue (control/), written by the ban engine of the openvpn container; empty = the directory of --audit.path (earlier layout)").Default("").Envar("OVPN_STATE_DIR").String()
+
+// banStateBase is the directory of the ban list and the ban queue: --state.dir, else the directory of the audit log, empty with neither.
+func banStateBase() string {
+	if *stateDir != "" {
+		return filepath.Clean(*stateDir)
+	}
 	if *auditPath == "" {
 		return ""
 	}
-	return filepath.Join(filepath.Dir(*auditPath), banFileName)
+	return filepath.Dir(*auditPath)
+}
+
+// banListPath is the ban list file: bans.tsv in the state directory, or in the directory of the audit log without one.
+func banListPath() string {
+	base := banStateBase()
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, banFileName)
 }
 
 // parseBanSource parses the first column of a row: an address, or for an IPv6 ban of a prefix the network with the prefix length it was

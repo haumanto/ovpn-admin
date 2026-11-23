@@ -4,7 +4,7 @@
 
     ovpn-ban-control [CONTROL_DIR]      default: $OVPN_BAN_CONTROL_DIR
 
-The control directory is shared with the ovpn-admin container (a subdirectory "control" of the audit directory). It is owned by
+The control directory is shared with the ovpn-admin container (a subdirectory "control" of the root-only state directory /var/lib/ovpn-admin). It is owned by
 the user that runs this watcher (root) with mode 0700; the watcher refuses to start otherwise. A caller writes a request:
 
     <id>.req     {"id":"<id>","action":"ban"|"unban","ip":"<address>","reason":"<note>","force":true|false,"minutes":<1..525600>}

@@ -15,13 +15,15 @@ services:
       OVPN_PASSWD_AUTH: "true"
       # IPv4 firewall backend; older Docker hosts set iptables-legacy
       OVPN_IPTABLES_BIN: "${OVPN_IPTABLES_BIN:-iptables}"
-      # connection audit log written by the OpenVPN hooks, read by ovpn-admin through the shared ./audit_master mount
+      # connection audit log written by the OpenVPN hooks, read by ovpn-admin through the shared ./audit_master mount. It is the only
+      # file in that tree (owned by nobody, the user the hooks run as). Everything else, the OpenVPN log, the ban list and history, the
+      # ban control queue, the admin audit trail and the ban event log, lives in the root-only ./state_master mount (/var/lib/ovpn-admin).
       OVPN_AUDIT_LOG: "/etc/openvpn/audit/audit.tsv"
       # Ban engine (fail2ban inside this container, IPv4 and IPv6): bans a source address after OVPN_BAN_MAXRETRY failed
       # logins (AUTH_FAILED) or revoked-certificate attempts within OVPN_BAN_FINDTIME seconds, for the time OVPN_BAN_ESCALATION names.
       # Ban rules live in the OVPN_BAN chain (iptables, IPv4) and the OVPN_BAN6 chain (ip6tables, IPv6); both are only
       # reached for traffic to the OpenVPN listener port OVPN_SERVER_PORT (derived with its transport from OVPN_PROTO), never for the ovpn-admin port 8080.
-      # The active bans are listed in bans.tsv in the audit directory. Temporary bans are not kept across container restarts; permanent bans (see OVPN_BAN_ESCALATION) are.
+      # The active bans are listed in bans.tsv in the state directory (/var/lib/ovpn-admin). Temporary bans are not kept across container restarts; permanent bans (see OVPN_BAN_ESCALATION) are.
       # IPv6 firewall backend; set ip6tables-legacy together with iptables-legacy
       OVPN_IP6TABLES_BIN: "${OVPN_IP6TABLES_BIN:-ip6tables}"
       # OpenVPN listener port inside the container. The same value is the --port of openvpn, the right side of the port
@@ -44,7 +46,7 @@ services:
       # Ban length by offence number of one address (IPv6: one prefix): comma separated steps, whole number with an optional unit
       # s, m, h or d (no unit = seconds), 0 = permanent and the end of the list. Empty = the default 10m,1h,24h,0: ten minutes, one
       # hour, 24 hours, then permanent on the fourth offence. A permanent ban survives container restarts (kept in bans-history.tsv in
-      # the audit directory) and is lifted by hand only. An offence beyond the last step gets the last step again.
+      # the state directory) and is lifted by hand only. An offence beyond the last step gets the last step again.
       OVPN_BAN_ESCALATION: "${OVPN_BAN_ESCALATION:-}"
       # The earlier single-duration policy, still accepted, and only used when OVPN_BAN_ESCALATION is empty and one of them is set:
       # OVPN_BAN_BANTIME seconds (default 3600) for the first OVPN_BAN_REPEAT_COUNT-1 bans, the OVPN_BAN_REPEAT_COUNT-th ban (default 2)
@@ -101,7 +103,10 @@ services:
     volumes:
       - ./easyrsa_master:/etc/openvpn/easyrsa
       - ./ccd_master:/etc/openvpn/ccd
+      # event file only (audit.tsv), nobody:nogroup 0700
       - ./audit_master:/etc/openvpn/audit
+      # ban state, OpenVPN log, ban control queue, admin audit and ban event logs: root:root 0700. Written by both services, so no :ro
+      - ./state_master:/var/lib/ovpn-admin
     logging:
       driver: json-file
       options:
@@ -117,8 +122,6 @@ services:
       # HTTP Basic Auth of the web UI and API (/ping stays open), compose refuses to start if they are unset
       BASIC_USERNAME: "${BASIC_USERNAME:?set BASIC_USERNAME}"
       BASIC_PASSWORD: "${BASIC_PASSWORD:?set BASIC_PASSWORD}"
-      OVPN_DEBUG: "true"
-      OVPN_VERBOSE: "true"
       OVPN_NETWORK: "192.168.100.0/24"
       # must match OVPN_SERVER_NET6 of the openvpn service
       OVPN_NETWORK_IPV6: "fd00:192:168:100::/64"
@@ -134,12 +137,18 @@ services:
       # To run a slave, set it (generate with: openssl rand -hex 32); the example values TOKEN and VerySecureToken are refused at start.
       OVPN_MASTER_TOKEN: "${OVPN_MASTER_TOKEN:-}"
       OVPN_AUDIT_PATH: "/mnt/audit/audit.tsv"
-      LOG_LEVEL: "debug"
+      # the ban list (bans.tsv) and the manual ban queue (control/) are in the state tree the ban engine writes, not next to the event file
+      OVPN_STATE_DIR: "/var/lib/ovpn-admin"
+      # trace, debug, info, warn or error; debug logs every request path and is not for a normal run
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
     network_mode: service:openvpn
     volumes:
       - ./easyrsa_master:/mnt/easyrsa
       - ./ccd_master:/mnt/ccd
-      - ./audit_master:/mnt/audit
+      # the panel only reads the event file: read-only here
+      - ./audit_master:/mnt/audit:ro
+      # same tree as the openvpn service (the panel writes its admin audit trail and the ban control queue here): no :ro
+      - ./state_master:/var/lib/ovpn-admin
     logging:
       driver: json-file
       options:

@@ -61,6 +61,33 @@ func TestBanListPath(t *testing.T) {
 	}
 }
 
+// The split layout: the event file stays in the audit tree, the ban list and the ban queue are in the state tree. An empty state
+// directory (the default) keeps the earlier behaviour, tested above.
+func TestBanListPathAndControlDirFollowTheStateDirectory(t *testing.T) {
+	setFlag(t, auditPath, "/mnt/audit/audit.tsv")
+	setFlag(t, stateDir, "/var/lib/ovpn-admin/")
+	if got := banListPath(); got != "/var/lib/ovpn-admin/bans.tsv" {
+		t.Errorf("banListPath = %q", got)
+	}
+	if got := banControlDir(); got != "/var/lib/ovpn-admin/"+banControlDirName {
+		t.Errorf("banControlDir = %q", got)
+	}
+	// the state directory alone is enough
+	setFlag(t, auditPath, "")
+	if got := banListPath(); got != "/var/lib/ovpn-admin/bans.tsv" {
+		t.Errorf("banListPath without audit path = %q", got)
+	}
+	// without a state directory the audit directory is used
+	setFlag(t, stateDir, "")
+	setFlag(t, auditPath, "/mnt/audit/audit.tsv")
+	if got := banListPath(); got != "/mnt/audit/bans.tsv" {
+		t.Errorf("banListPath fallback = %q", got)
+	}
+	if got := banControlDir(); got != "/mnt/audit/"+banControlDirName {
+		t.Errorf("banControlDir fallback = %q", got)
+	}
+}
+
 func TestParseBanLine(t *testing.T) {
 	good, err := parseBanLine(banRow("146.70.195.37", banNow, banNow+3600, "3", "certificate revoked or auth failure"))
 	if err != nil {
