@@ -1,6 +1,6 @@
 # ovpn-admin v0.1.11 release notes
 
-**Status: candidate, not published.** No tag, GitHub release, image, binary or chart release exists for v0.1.11. Approval for publishing is still needed.
+**Status: published.** Tag `v0.1.11`, GitHub release with amd64 and arm64 binaries, both multi-arch images and chart `openvpn-admin-0.1.11` are published from commit `95a1804`.
 
 - Code candidate: branch `v0.1.11`, SHA `61763ac83b073bfd6470ac22271b89899e0f994c` (`CA key guard: a legacy encrypted block counts only when its encryption is declared`), tree `87521f7c`, parent `ba1b3a2`. The v0.1.11 code commits after the v0.1.10 release notes (`58ee2d7`) are `70f33c9`, `123506a`, `8bf7646`, `64c72cd`, `9108599`, `93c74cf` (version bump), `9020674`, `b1cece9`, `ba1b3a2` and `61763ac`.
 - QA: `qa-v0111/delta4/REPORT.md`, verdict SHIP on `61763ac`: 14 of 14 checks pass, and a red control on `ba1b3a2` fails 9 asserts. Earlier QA rounds (`qa-v0111/REPORT.md`, `delta/`, `delta2/`, `delta3/`) found problems on earlier commits. Those problems are fixed in the commits above.
