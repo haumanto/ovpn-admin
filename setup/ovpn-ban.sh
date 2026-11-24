@@ -128,7 +128,8 @@
 #
 # History at a start (init, then setup and check): three cases, never "no bans" by accident (hist_gate).
 #   (a) no history file and no file of the earlier releases anywhere (OVPN_BAN_LEGACY_DIR, default /etc/openvpn/audit, and the directory of
-#       the ban list): a fresh installation, a normal start. A history file that is readable and zero bytes is a history with no bans: the same.
+#       the ban list): a fresh installation, a normal start. A history file that is readable and zero bytes is a history with no bans: the same,
+#       unless a ban list holds permanent bans that it lacks (the refusals below).
 #   (b) a file of the earlier releases (ban-history.tsv, 7 fields) that is readable and entirely in that format: converted into the history,
 #       the old file kept as ban-history.tsv.migrated, and every permanent ban in it restored by setup. When OVPN_BAN_HISTORY itself names a
 #       file in the earlier format it is converted in place and the original is kept as FILE.legacy-format.
@@ -137,14 +138,23 @@
 #       of the user of this process, or cannot be converted: init fails, naming the file, and so do setup, check, ban and unban; nothing is
 #       published from it. configure.sh stops the container with OVPN_BAN_REQUIRED=true (without it the container runs without the ban
 #       engine, loudly). The history is never reported as empty because it could not be read.
-#   Two more refusals, both for a history that is cut short and would otherwise lose permanent bans without a sound:
+#   Three more refusals, each for a history that is cut short and would otherwise lose permanent bans without a sound:
 #     - a history file (current or earlier format) that is not empty and does not end in a newline: every writer ends each row with one;
 #     - a migration or in-place conversion whose result lacks a permanent entry of the ban list of the earlier release (old_lists: the ban list
 #       of this engine, and bans.tsv in OVPN_BAN_LEGACY_DIR): a cut at a row end, or an emptied file, still parses. init fails and the message
-#       names the ban list and the history. To start without those bans on purpose, move both files away.
-#   Not covered: a history in the CURRENT format cut exactly at a row end, or emptied, is a valid history of fewer bans (that includes a
-#   zero-byte file that OVPN_BAN_HISTORY itself names: an operator who lifted every ban has exactly that file). The ban list is emptied and
-#   rebuilt from the history at every start, so there is no second record to compare it with, and none is compared.
+#       names the ban list and the history. To start without those bans on purpose, move both files away;
+#     - a history that is missing, empty or in the current format and lacks a permanent entry (expires_at 0) of the ban list of this engine
+#       (list_gate): a history cut at a row end, emptied or replaced is a valid file of fewer bans, and so is the zero-byte file that
+#       OVPN_BAN_HISTORY names. The list is the second record: a ban is written to the history before the list, a lifting removes the list row
+#       before the history rows, and a container stop, a crash and a refused start leave the list as it is (only an accepted init and the jail
+#       stop, teardown, empty it), so at a start every permanent row of the list has its
+#       permanent row in the history. When the history is empty or missing, bans.tsv in OVPN_BAN_LEGACY_DIR is compared too, unless
+#       ban-history.tsv.migrated or FILE.legacy-format (the proof of a conversion) exists: that file is then an old copy that the operator may
+#       have emptied since. A state that was emptied on purpose is an empty list AND an empty history (the panel's unban removes both).
+#   Not covered: an emptied history whose list is empty too (the operator emptied both, or the list was never written), and a history cut at a
+#   row end after its list was emptied: there is no second record left to compare. Refused although the operator may mean it: an old bans.tsv
+#   of the earlier layout with permanent rows next to an emptied history, after the operator deleted the conversion marker (move that
+#   bans.tsv away, as the layout message says once its bans have been checked).
 # A container restart keeps the bans in force: init empties the chains and the list, setup puts back every permanent ban and every
 # TEMPORARY ban that has not run out (restore_temporary) with its original end, from the history (rule and row together, so /api/bans and the
 # firewall agree; a ban that ran out while the container was down is not restored; one the operator lifted is not in the history any more).
@@ -742,6 +752,23 @@ def cmd_migrate(bantime, nold, *rest):
     emit(rows)
 
 
+def cmd_listcheck(hist, *lists):
+    """The history HIST (missing, empty or in the current format) against the ban lists LISTS: every permanent entry (expires_at 0) of a ban
+    list must be a permanent row (or lie inside a permanent network) of the history, else exit 7 naming the list, the history and the
+    count. A ban list is written whole, after the history row of its ban (txn_ban_fw), and a lifting removes the row first and the history
+    after it (removal_apply), so a list can only hold a permanent entry the history lacks when the history lost rows: cut at a row end,
+    emptied, replaced. A list that is cut, not text or not a ban list is refused the same way (old_perm_entries): its permanent bans are
+    unknown."""
+    perm = [r.net for r in read_hist(hist) if r.sec == 0]
+    for o in lists:
+        lost = [n for n, _ in old_perm_entries(o) if not any(n.version == q.version and n.subnet_of(q) for q in perm)]
+        if lost:
+            fail(7, "the ban list %s holds %d permanent ban(s) (%s%s) that the ban history %s does not: the history lost rows (cut short, emptied or "
+                    "replaced). The start is refused and both files are left as they are. Restore the history from a backup; to start without these "
+                    "bans on purpose, lift them in the panel, or move both files away"
+                 % (o, len(lost), ", ".join(entry_text(n) for n in lost[:5]), ", ..." if len(lost) > 5 else "", hist))
+
+
 def cmd_hist_kind(path):
     """missing | empty | new | legacy (exit 2 unreadable, 7 not recognised)."""
     print(classify_file(path)[0])
@@ -945,7 +972,7 @@ def cmd_event(path, when, action, address, prefix, reason, off, sec, forced, use
 CMDS = {
     "classify": (cmd_classify, 3), "guard": (cmd_guard, 1), "decide": (cmd_decide, 10), "append": (cmd_append, 8), "prune": (cmd_prune, 3),
     "forget": (cmd_forget, 2), "has": (cmd_has, 2), "has_exact": (cmd_has_exact, 2), "is_perm": (cmd_is_perm, 2), "perm": (cmd_perm, 1),
-    "migrate": (cmd_migrate, None), "hist_kind": (cmd_hist_kind, 1), "trust": (cmd_trust, None), "live": (cmd_live, 3), "cover": (cmd_cover, 2),
+    "migrate": (cmd_migrate, None), "listcheck": (cmd_listcheck, None), "hist_kind": (cmd_hist_kind, 1), "trust": (cmd_trust, None), "live": (cmd_live, 3), "cover": (cmd_cover, 2),
     "state_find": (cmd_state_find, 2), "sweep": (cmd_sweep, None), "temp": (cmd_temp, 2),
     "event": (cmd_event, 10), "auditname": (cmd_auditname, 4),
 }
@@ -1846,6 +1873,64 @@ old_lists() {
   done
 }
 
+# conv_marker: has a conversion of the history of the earlier releases happened here? 0 when it left its proof: FILE.legacy-format next to the
+# history (the in-place conversion, also with the time stamp migrate_legacy adds when one exists) or ban-history.tsv.migrated beside a file
+# of the earlier releases (the migration). Only a plain file counts, never a link.
+conv_marker() {
+  local f m
+  for m in "${HISTORY}.legacy-format" "${HISTORY}".legacy-format.*; do
+    [ -f "$m" ] && [ ! -L "$m" ] && return 0
+  done
+  for f in "${LEGACY_FILES[@]}"; do
+    [ -f "${f}.migrated" ] && [ ! -L "${f}.migrated" ] && return 0
+  done
+  return 1
+}
+
+# list_gate: the second record. The history is known (hist_gate said so) but it can still be shorter than it was: cut at a row end, emptied,
+# replaced, and every row that is left is a valid row. The ban lists say what was banned, so the permanent entries of
+#   - the ban list of this engine ($STATE: written after the history row of each ban, emptied of a ban only after the history lost it; it is
+#     left as it was by a container stop or a crash (not by the jail stop, teardown) and by a refused start), always, and
+#   - bans.tsv of the earlier layout (OVPN_BAN_LEGACY_DIR), when the history is empty or missing and nothing proves that a conversion
+#     happened (conv_marker). After a conversion that file is an old copy: the operator may have lifted the bans since, and it is not
+#     compared again.
+# must all be in the history (cmd_listcheck). Otherwise the start is refused, both files named, and nothing is changed. The caller holds the
+# lock and has seen hist_gate succeed. A ban list that exists but cannot be read, or is not a ban list, refuses the start as well.
+list_gate() {
+  local st=0 hk="" f lst=0
+  local -a lists=()
+  file_state "$STATE" || st=$?
+  case "$st" in
+    0) lists+=("$STATE") ;;
+    1) ;;
+    *) echo "ovpn-ban: ERROR: the ban list $STATE exists but cannot be read (permissions, a link or an I/O error): its permanent bans cannot be compared with the ban history $HISTORY" >&2; return 1 ;;
+  esac
+  st=0
+  file_state "$HISTORY" || st=$?
+  case "$st" in
+    1) hk=missing ;;
+    0) hk="$(pylib hist_kind "$HISTORY" 2>/dev/null)" || { echo "ovpn-ban: ERROR: cannot read the ban history $HISTORY" >&2; return 1; } ;;
+    *) echo "ovpn-ban: ERROR: cannot read the ban history $HISTORY" >&2; return 1 ;;
+  esac
+  f="$LEGACY_DIR/bans.tsv"
+  if { [ "$hk" = "missing" ] || [ "$hk" = "empty" ]; } && [ "$f" != "$STATE" ] && ! conv_marker; then
+    file_state "$f" || lst=$?
+    case "$lst" in
+      0)
+        pylib trust 0 "$f" >&2 || { echo "ovpn-ban: ERROR: the ban list $f is not trusted (see above): its permanent bans cannot be compared with the ban history $HISTORY" >&2; return 1; }
+        lists+=("$f") ;;
+      1) ;;
+      *) echo "ovpn-ban: ERROR: the ban list $f exists but cannot be read (permissions, a link or an I/O error): its permanent bans cannot be compared with the ban history $HISTORY" >&2; return 1 ;;
+    esac
+  fi
+  [ "${#lists[@]}" -gt 0 ] || return 0
+  pylib listcheck "$HISTORY" "${lists[@]}" >&2 || {
+    HIST_WHY="the ban history $HISTORY lacks permanent bans of ${lists[*]}"
+    echo "ovpn-ban: ERROR: $HIST_WHY: the permanent bans are UNKNOWN, refusing to start without them" >&2
+    return 1
+  }
+}
+
 # migrate_legacy: the per-address history of the earlier releases (ban-history.tsv: 7 fields, one row per address with a counter and a
 # permanent flag) becomes offence rows (6 fields) in the history, once. A permanent address stays permanent. The old file is renamed to
 # ban-history.tsv.migrated, never deleted. The caller holds the lock. Returns 1 (and says which file) when it cannot do it, and then
@@ -1938,6 +2023,8 @@ cmd_init() {
   # Migration and gate first: the ban list of an earlier release is what a migration is checked against (old_lists), and the flush empties it.
   with_state_lock txn_housekeeping || true
   with_state_lock hist_gate || rc=1
+  # the history is known; is it the whole history? (a cut at a row end, an emptied file: compared with the ban lists)
+  [ "$rc" -eq 0 ] && { with_state_lock list_gate || rc=1; }
   if [ "$rc" -eq 0 ]; then
     with_state_lock txn_flush || die "cannot empty the ban chains and reset $STATE"
   else

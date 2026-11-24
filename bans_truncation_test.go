@@ -85,10 +85,6 @@ func TestBanGateTruncationSweep(t *testing.T) {
 	}
 	// accepted: the whole file, and a cut after the third row (the temporary row of the old list is not required); nothing else
 	okLen := func(n int) bool { return n >= third && (n == len(hist) || hist[n-1] == '\n') }
-	// One documented exception: a zero-byte file that OVPN_BAN_HISTORY itself names is an empty history of the current format as far as
-	// anybody can tell (an operator who lifted every ban has exactly that file); the engine does not convert it, so nothing compares it with
-	// the old list. A zero-byte file in the place of the history of the earlier release IS compared (all variants but the in-place one).
-	emptyInPlace := func(v bool, n int) bool { return v && n == 0 }
 	type variant struct {
 		name    string
 		inPlace bool
@@ -147,12 +143,6 @@ func TestBanGateTruncationSweep(t *testing.T) {
 					got, _ := os.ReadFile(where)
 					if code == 0 {
 						accepted++
-						if emptyInPlace(v.inPlace, n) {
-							if len(got) != 0 {
-								t.Errorf("length 0 in place: the empty file was changed: %q", got)
-							}
-							continue
-						}
 						if p := permRows(string(got)); p != 3 {
 							t.Errorf("length %d (last byte %q): init ACCEPTED the file with %d of 3 permanent bans: %q\n%s", n, lastByte(hist, n), p, got, out)
 						}
@@ -374,6 +364,278 @@ func TestBanGateOldBanListChecks(t *testing.T) {
 		if m, _ := filepath.Glob(path + ".legacy-format*"); len(m) != 0 {
 			t.Errorf("copies left behind: %v", m)
 		}
+	})
+}
+
+// The second record (t_3834d189, QA findings N1 and N3). A history that is empty, cut at a row end or replaced is a valid file of fewer
+// bans: only a ban list can say it lost some. Every start compares the permanent rows of the engine's own ban list with the history, and
+// the zero-byte history is compared with the old ban list too unless a conversion left its proof. The tests run the real script on the
+// rig; the live proofs on real containers and clients are in the card's evidence directory.
+
+// listRig is a rig that has banned three permanent addresses (two IPv4, one IPv6) through the script, so the history and the ban list are
+// what the engine writes. It returns the rig and the two files' contents.
+func listRig(t *testing.T, extra ...string) (*banRig, string, string) {
+	t.Helper()
+	r := newBanRig(t, extra...)
+	r.must("ban-manual", "8.8.8.8", "first")
+	r.must("ban-manual", "1.1.1.1", "second")
+	r.must("ban-manual", "2001:db8:1:2::9", "third")
+	hist, list := r.read("audit/bans-history.tsv"), r.read("audit/bans.tsv")
+	if permRows(hist) != 3 || strings.Count(list, "\t0\t") != 3 {
+		t.Fatalf("the rig did not make three permanent bans: history %q list %q", hist, list)
+	}
+	return r, hist, list
+}
+
+func TestBanGateListCrossCheckRefusesLostRows(t *testing.T) {
+	t.Parallel()
+	t.Run("current format: every cut at a row end and the emptied file is refused, every whole file starts", func(t *testing.T) {
+		t.Parallel()
+		r, hist, list := listRig(t)
+		histPath, listPath := filepath.Join(r.dir, "audit", "bans-history.tsv"), filepath.Join(r.dir, "audit", "bans.tsv")
+		var ends []int
+		for i, c := range hist {
+			if c == '\n' {
+				ends = append(ends, i+1)
+			}
+		}
+		for _, n := range append([]int{0}, ends...) {
+			r.write("audit/bans-history.tsv", hist[:n])
+			r.write("audit/bans.tsv", list)
+			out, code := r.run(nil, "init")
+			if n == len(hist) {
+				if code != 0 {
+					t.Errorf("the whole history refused: %s", out)
+				}
+				continue
+			}
+			lost := 3 - permRows(hist[:n])
+			if code == 0 {
+				t.Errorf("length %d of %d: a history with %d of 3 permanent bans was accepted: %s", n, len(hist), 3-lost, out)
+				continue
+			}
+			for _, want := range []string{histPath, listPath, fmt.Sprintf("holds %d permanent ban(s)", lost)} {
+				if !strings.Contains(out, want) {
+					t.Errorf("length %d: the refusal lacks %q: %s", n, want, out)
+				}
+			}
+			if r.read("audit/bans.tsv") != list || r.read("audit/bans-history.tsv") != hist[:n] {
+				t.Errorf("length %d: a refused start changed a file", n)
+			}
+			if _, c2 := r.run(nil, "init"); c2 == 0 {
+				t.Errorf("length %d: the second try was accepted (the first one emptied the list?)", n)
+			}
+		}
+	})
+	t.Run("a history that lost one row among the others is refused, the address named", func(t *testing.T) {
+		t.Parallel()
+		r, hist, list := listRig(t)
+		rows := strings.SplitAfter(hist, "\n")
+		r.write("audit/bans-history.tsv", rows[0]+rows[2]) // the second row is gone
+		out, code := r.run(nil, "init")
+		if code == 0 || !strings.Contains(out, "1.1.1.1") || strings.Contains(out, "8.8.8.8, ") {
+			t.Errorf("init: exit %d: %s", code, out)
+		}
+		_ = list
+	})
+	t.Run("a ban list that is damaged is not taken for none", func(t *testing.T) {
+		t.Parallel()
+		for name, content := range map[string]string{"cut inside a row": "8.8.8.8\t1800000000\t0\t0\tmanu", "not a ban row": "no ban row\n", "not text": "\xff\xfe\x00\n"} {
+			name, content := name, content
+			t.Run(name, func(t *testing.T) {
+				r, _, _ := listRig(t)
+				r.write("audit/bans.tsv", content)
+				out, code := r.run(nil, "init")
+				if code == 0 || !strings.Contains(out, filepath.Join(r.dir, "audit", "bans.tsv")) {
+					t.Errorf("init: exit %d: %s", code, out)
+				}
+			})
+		}
+	})
+	t.Run("N1: the zero-byte file OVPN_BAN_HISTORY names, the old list next to it holds permanent bans", func(t *testing.T) {
+		t.Parallel()
+		legacyDir := t.TempDir()
+		r := newBanRig(t, "OVPN_BAN_LEGACY_DIR="+legacyDir)
+		named := filepath.Join(r.dir, "audit", "custom-history.tsv")
+		r.env = append(r.env, "OVPN_BAN_HISTORY="+named)
+		listPath := filepath.Join(r.dir, "audit", "bans.tsv")
+		oldList := filepath.Join(legacyDir, "bans.tsv")
+		check := func(t *testing.T, name string, wantRefused bool, wantFiles ...string) {
+			t.Helper()
+			out, code := r.run(nil, "init")
+			if (code != 0) != wantRefused {
+				t.Errorf("%s: exit %d, want refused=%v: %s", name, code, wantRefused, out)
+			}
+			for _, f := range wantFiles {
+				if wantRefused && !strings.Contains(out, f) {
+					t.Errorf("%s: the refusal does not name %s: %s", name, f, out)
+				}
+			}
+			if wantRefused && !strings.Contains(out, "holds 3 permanent ban(s)") {
+				t.Errorf("%s: the refusal lacks the count: %s", name, out)
+			}
+		}
+		// case C of QA: the layout step copied the old list next to the history; nothing proves a conversion
+		r.write("audit/custom-history.tsv", "")
+		r.write("audit/bans.tsv", v0111BanList)
+		check(t, "state list with 3 permanent rows (the layout copy)", true, listPath, named)
+		// the old list only in the directory of the earlier layout (init without the layout step)
+		r.write("audit/bans.tsv", "")
+		if err := os.WriteFile(oldList, []byte(v0111BanList), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		check(t, "old list only in the earlier layout", true, oldList, named)
+		// a marker that is a link proves nothing
+		if err := os.Symlink(r.write("elsewhere/marker", ""), named+".legacy-format"); err != nil {
+			t.Fatal(err)
+		}
+		check(t, "a link named like the marker", true, oldList, named)
+		if err := os.Remove(named + ".legacy-format"); err != nil {
+			t.Fatal(err)
+		}
+		// case F of QA: the conversion happened (its proof is on disk), the operator lifted every ban, the old copy stays in the old directory
+		r.write("audit/custom-history.tsv.legacy-format", v0111History)
+		check(t, "in-place marker, old list is only a copy", false)
+		if err := os.Remove(named + ".legacy-format"); err != nil {
+			t.Fatal(err)
+		}
+		r.write("audit/ban-history.tsv.migrated", v0111History)
+		check(t, "migration marker next to the history of the state directory", false)
+		// the marker does not excuse the engine's own list: the history that lost rows after the conversion is refused all the same
+		r.write("audit/bans.tsv", v0111BanList)
+		check(t, "marker, but the engine's own list holds permanent bans", true, listPath, named)
+	})
+}
+
+// A start must never be refused for a state an operator or the engine legitimately leaves behind (every one of these is a real start of the
+// script after the real operations; the live proofs are on containers). A false refusal stops a working site.
+func TestBanGateListCrossCheckLegitimateStatesStart(t *testing.T) {
+	t.Parallel()
+	restartOK := func(t *testing.T, r *banRig, what string) {
+		t.Helper()
+		for i := 0; i < 1; i++ {
+			if out, code := r.restart(); code != 0 {
+				t.Fatalf("%s, start %d: exit %d: %s", what, i+1, code, out)
+			}
+		}
+	}
+	has := func(r *banRig, a string) bool {
+		return strings.Contains(strings.Join(append(r.rules("4"), r.rules("6")...), "|"), a)
+	}
+	t.Run("a permanent ban lifted (forced unban, what the panel does), the others stay", func(t *testing.T) {
+		t.Parallel()
+		r, _, _ := listRig(t)
+		r.must("unban", "8.8.8.8", "--force")
+		restartOK(t, r, "lifted")
+		if has(r, "8.8.8.8") || !has(r, "1.1.1.1") || permRows(r.read("audit/bans-history.tsv")) != 2 {
+			t.Errorf("lifted: rules %v %v history %q", r.rules("4"), r.rules("6"), r.read("audit/bans-history.tsv"))
+		}
+	})
+	t.Run("an unban without force leaves a permanent ban as it is", func(t *testing.T) {
+		t.Parallel()
+		r, _, _ := listRig(t)
+		r.run(nil, "unban", "8.8.8.8")
+		restartOK(t, r, "unban without force")
+		if !has(r, "8.8.8.8") {
+			t.Errorf("a permanent ban was lost: %v", r.rules("4"))
+		}
+	})
+	t.Run("the same address banned again after its lift", func(t *testing.T) {
+		t.Parallel()
+		r, _, _ := listRig(t)
+		r.must("unban", "8.8.8.8", "--force")
+		r.must("ban-manual", "8.8.8.8", "again")
+		restartOK(t, r, "banned again")
+		if !has(r, "8.8.8.8") {
+			t.Errorf("the re-ban was lost: %v", r.rules("4"))
+		}
+		r.must("unban", "8.8.8.8", "--force")
+		r.must("ban-manual", "--minutes", "30", "8.8.8.8", "again temporary this time")
+		restartOK(t, r, "banned again, temporarily")
+	})
+	t.Run("a temporary ban that expired, in the running container and while it was down", func(t *testing.T) {
+		t.Parallel()
+		r, _, _ := listRig(t)
+		r.must("ban-manual", "--minutes", "1", "9.9.9.9")
+		r.must("ban-manual", "--minutes", "1", "7.7.7.7")
+		r.setNow(rigStart + 100)
+		r.must("expire")
+		r.must("ban-manual", "--minutes", "1", "6.6.6.6") // runs out while the container is down
+		r.setNow(rigStart + 300)
+		restartOK(t, r, "expired")
+		if has(r, "9.9.9.9") || has(r, "6.6.6.6") || !has(r, "1.1.1.1") {
+			t.Errorf("expired: rules %v", r.rules("4"))
+		}
+	})
+	t.Run("a temporary ban that was made permanent by the escalation", func(t *testing.T) {
+		t.Parallel()
+		r := newBanRig(t, "OVPN_BAN_ESCALATION=60,0")
+		r.must("ban", "1.2.3.4", "3")
+		r.setNow(rigStart + 120)
+		r.must("expire")
+		r.must("ban", "1.2.3.4", "3") // second offence: permanent
+		if permRows(r.read("audit/bans-history.tsv")) != 1 {
+			t.Fatalf("no permanent offence: %q", r.read("audit/bans-history.tsv"))
+		}
+		restartOK(t, r, "escalated")
+		if !has(r, "1.2.3.4") {
+			t.Errorf("the permanent ban was lost: %v", r.rules("4"))
+		}
+	})
+	t.Run("the operator emptied the ban list and the history together", func(t *testing.T) {
+		t.Parallel()
+		r, _, _ := listRig(t)
+		r.write("audit/bans.tsv", "")
+		r.write("audit/bans-history.tsv", "")
+		restartOK(t, r, "emptied together")
+		if len(r.rules("4"))+len(r.rules("6")) != 0 {
+			t.Errorf("rules: %v %v", r.rules("4"), r.rules("6"))
+		}
+	})
+	t.Run("both files removed", func(t *testing.T) {
+		t.Parallel()
+		r, _, _ := listRig(t)
+		for _, f := range []string{"audit/bans.tsv", "audit/bans-history.tsv"} {
+			if err := os.Remove(filepath.Join(r.dir, f)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		restartOK(t, r, "both removed")
+	})
+	t.Run("a fresh installation, and a named history that does not exist yet", func(t *testing.T) {
+		t.Parallel()
+		r := newBanRig(t)
+		restartOK(t, r, "fresh")
+		n := newBanRig(t, "OVPN_BAN_HISTORY=")
+		n.env = append(n.env, "OVPN_BAN_HISTORY="+filepath.Join(n.dir, "audit", "named.tsv"))
+		restartOK(t, n, "fresh with a named history")
+		z := newBanRig(t)
+		z.write("audit/bans-history.tsv", "")
+		restartOK(t, z, "a zero-byte history and no list")
+	})
+	t.Run("a good upgrade, then restarts and a lift", func(t *testing.T) {
+		t.Parallel()
+		legacyDir := t.TempDir()
+		r := newBanRig(t, "OVPN_BAN_LEGACY_DIR="+legacyDir)
+		r.write("audit/bans.tsv", v0111BanList)
+		r.write("audit/ban-history.tsv", v0111History)
+		if err := os.WriteFile(filepath.Join(legacyDir, "bans.tsv"), []byte(v0111BanList), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		restartOK(t, r, "upgrade")
+		for _, a := range []string{"172.31.150.70", "172.31.150.71", "172.31.150.72"} {
+			r.must("unban", a, "--force")
+		}
+		r.must("unban", "fd00:172:150::70", "--force")
+		restartOK(t, r, "every ban lifted after the upgrade (the old list stays in the old directory)")
+		r.write("audit/bans-history.tsv", "")
+		restartOK(t, r, "history emptied after every ban was lifted")
+	})
+	t.Run("the cap: more permanent bans than OVPN_BAN_MAX_ENTRIES", func(t *testing.T) {
+		t.Parallel()
+		r := newBanRig(t, "OVPN_BAN_MAX_ENTRIES=2")
+		r.write("audit/bans-history.tsv", fmt.Sprintf("%d\t8.8.8.8\t32\tmanual\t0\t0\n%d\t1.1.1.1\t32\tmanual\t0\t0\n%d\t9.9.9.9\t32\tmanual\t0\t0\n", rigStart-50, rigStart-30, rigStart-20))
+		restartOK(t, r, "cap")
 	})
 }
 
