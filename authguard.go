@@ -433,11 +433,11 @@ func (g *authGuard) writeFileLocked() error {
 
 // buildAuthChain is the part of the handler chain that decides who gets to the application, outermost first:
 // the source allowlist (403 before anything else), the login lock (429 before the credentials are compared;
-// pingPath and metricsPath exempt), Basic Auth. guard is nil when no credentials are configured.
-func buildAuthChain(app http.Handler, username, password string, guard *authGuard, cfg authConfig, pingPath, metricsPath string) http.Handler {
+// only pingPath exempt, the metrics path is counted like any other), Basic Auth. guard is nil when no credentials are configured.
+func buildAuthChain(app http.Handler, username, password string, guard *authGuard, cfg authConfig, pingPath string) http.Handler {
 	authed := basicAuthMiddleware(app, username, password, pingPath)
 	if guard != nil {
-		authed = guard.middleware(authed, cfg.trustProxy, cfg.allow, pingPath, metricsPath)
+		authed = guard.middleware(authed, cfg.trustProxy, cfg.allow, pingPath)
 	}
 	return adminAllowlistMiddleware(authed, cfg.allow, cfg.trustProxy)
 }

@@ -77,7 +77,7 @@ func newGuardRig(t *testing.T, o rigOpts) *guardRig {
 		r.reached++
 		_, _ = w.Write([]byte("app"))
 	})
-	r.handler = buildAuthChain(app, guardUser, r.pass, r.guard, o.cfg, guardPing, guardMetric)
+	r.handler = buildAuthChain(app, guardUser, r.pass, r.guard, o.cfg, guardPing)
 	return r
 }
 
@@ -298,30 +298,64 @@ func TestLockStepsEscalateAndReset(t *testing.T) {
 	}
 }
 
-func TestExemptPathsAreNeverThrottled(t *testing.T) {
+// Only /ping is exempt. Wrong secrets on the metrics path are counted like on every other path, and a source
+// that is locked is refused there too, even with the right secret.
+func TestPingIsExemptMetricsIsCounted(t *testing.T) {
 	r := newGuardRig(t, rigOpts{})
 	const src = "198.51.100.14:1"
-	// wrong credentials at /metrics are refused (401) but never counted or locked
+	// a scraper with the right secret never accumulates failures
 	for i := 0; i < 50; i++ {
+		if a := r.do(src, guardMetric, guardUser, r.pass); a.code != 200 {
+			t.Fatalf("scrape %d with the right secret: %d", i, a.code)
+		}
+	}
+	if n := r.guard.failureCount(lockKey("198.51.100.14", guardUser)); n != 0 {
+		t.Fatalf("a scraper with the right secret has %d failures", n)
+	}
+	// wrong secrets on /metrics are refused (401) and counted; the sixth is locked
+	for i := 0; i < 5; i++ {
 		if a := r.do(src, guardMetric, guardUser, "not-"+r.pass); a.code != 401 {
 			t.Fatalf("metrics wrong %d: %d", i, a.code)
 		}
 	}
-	if a := r.right(src); a.code != 200 {
-		t.Fatalf("metrics failures locked the source: %d", a.code)
+	if a := r.do(src, guardMetric, guardUser, "not-"+r.pass); a.code != 429 {
+		t.Fatalf("sixth wrong secret on /metrics: %d, want 429", a.code)
 	}
-	// a source that is locked still gets /ping and /metrics with the configured credentials
-	for i := 0; i < 5; i++ {
-		r.wrong(src)
-	}
+	// the lock is the same lock on every path
 	if a := r.right(src); a.code != 429 {
-		t.Fatalf("setup: not locked: %d", a.code)
+		t.Fatalf("the application after failures on /metrics: %d, want 429", a.code)
 	}
+	if a := r.do(src, guardMetric, guardUser, r.pass); a.code != 429 {
+		t.Errorf("/metrics with the right secret from a locked source: %d, want 429", a.code)
+	}
+	// /ping stays open for health checks, locked or not
 	if a := r.do(src, guardPing, "", ""); a.code != 200 {
 		t.Errorf("/ping of a locked source: %d", a.code)
 	}
-	if a := r.do(src, guardMetric, guardUser, r.pass); a.code != 200 {
-		t.Errorf("/metrics with the right credentials of a locked source: %d", a.code)
+	// failures on the application lock /metrics as well
+	const src2 = "198.51.100.15:1"
+	for i := 0; i < 5; i++ {
+		r.wrong(src2)
+	}
+	if a := r.do(src2, guardMetric, guardUser, r.pass); a.code != 429 {
+		t.Errorf("/metrics after five failures on the application: %d, want 429", a.code)
+	}
+}
+
+// A scraper inside --admin.allow-cidr is exempt: its failures on /metrics are neither counted nor locked.
+func TestMetricsScraperInsideTheAllowlistIsExempt(t *testing.T) {
+	allow, _ := parseAllowCIDRs([]string{"198.51.100.0/24"})
+	r := newGuardRig(t, rigOpts{cfg: authConfig{allow: allow}})
+	for i := 0; i < 20; i++ {
+		if a := r.do("198.51.100.20:1", guardMetric, guardUser, "not-"+r.pass); a.code != 401 {
+			t.Fatalf("%d: %d, want 401 (never 429)", i, a.code)
+		}
+	}
+	if a := r.do("198.51.100.20:1", guardMetric, guardUser, r.pass); a.code != 200 {
+		t.Errorf("the right secret from the trusted scraper: %d", a.code)
+	}
+	if n := len(r.guard.entries); n != 0 {
+		t.Errorf("%d entries for a trusted scraper, want 0", n)
 	}
 }
 
@@ -357,7 +391,7 @@ func TestLockSurvivesARestartAndTheFileIsPrivate(t *testing.T) {
 	r2.pass = r.pass
 	r2.clock.t = r.clock.t
 	r2.handler = buildAuthChain(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { r2.reached++ }),
-		guardUser, r.pass, r2.guard, authConfig{maxFailures: 5, window: 15 * time.Minute}, guardPing, guardMetric)
+		guardUser, r.pass, r2.guard, authConfig{maxFailures: 5, window: 15 * time.Minute}, guardPing)
 	if err := r2.guard.load(); err != nil {
 		t.Fatal(err)
 	}
@@ -638,7 +672,7 @@ func TestRefusalsAreAudited(t *testing.T) {
 	cfg, _ := parseAuthConfig(5, 15*time.Minute, []string{"192.0.2.0/24"}, false)
 	r2 := newGuardRig(t, rigOpts{cfg: cfg})
 	r2.pass = r.pass
-	r2.handler = buildAuthChain(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}), guardUser, r.pass, r2.guard, cfg, guardPing, guardMetric)
+	r2.handler = buildAuthChain(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}), guardUser, r.pass, r2.guard, cfg, guardPing)
 	for i := 0; i < 3; i++ {
 		r2.do("198.51.100.99:1", "/api/x", guardUser, r.pass) // outside
 	}

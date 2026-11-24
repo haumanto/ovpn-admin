@@ -743,7 +743,7 @@ func main() {
 	log.Printf("Bind: %s", bindURL(*listenHost, *listenPort, *listenBaseUrl))
 	// /ping stays open for health checks; everything else, /metrics included, needs credentials.
 	// Order, outermost first: security headers, source allowlist (403 before anything else), login lock
-	// (429 before the credentials are compared; /ping and the metrics path exempt), Basic Auth.
+	// (429 before the credentials are compared; only /ping exempt), Basic Auth.
 	var guard *authGuard
 	if *basicUsername != "" {
 		guard = newAuthGuard(authCfg, authStateDirFromFlags())
@@ -753,7 +753,7 @@ func main() {
 		guard.flush() // proves now that the state can be written; a failure is logged, the counters then live in memory only
 	}
 	handler := securityHeadersMiddleware(
-		buildAuthChain(auditRequiredMiddleware(http.DefaultServeMux), *basicUsername, *basicPassword, guard, authCfg, *listenBaseUrl+"ping", *metricsPath),
+		buildAuthChain(auditRequiredMiddleware(http.DefaultServeMux), *basicUsername, *basicPassword, guard, authCfg, *listenBaseUrl+"ping"),
 		*listenBaseUrl+"api/")
 	if *basicUsername != "" {
 		log.Info("HTTP Basic Auth is enabled")
@@ -863,7 +863,7 @@ func basicAuthMiddleware(next http.Handler, username, password string, openPaths
 			if r.Header.Get("Authorization") != "" {
 				log.Warnf("auth failed remote=%s path=%s", r.RemoteAddr, r.URL.Path)
 				adminAudit.loginFail(r, gotUser)
-				authAttemptFrom(r).failed(r, gotUser) // the lock counts it (nil for /ping, the metrics path and without the guard)
+				authAttemptFrom(r).failed(r, gotUser) // the lock counts it (nil for /ping and without the guard)
 			}
 			w.Header().Set("WWW-Authenticate", `Basic realm="ovpn-admin", charset="UTF-8"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
