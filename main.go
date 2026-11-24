@@ -665,6 +665,7 @@ func main() {
 
 	go ovpnAdmin.updateState()
 	go ovpnAdmin.crlRefreshLoop(crlFirstCheckDelay, crlCheckInterval, crlRetryInterval, nil)
+	go ovpnAdmin.certLifecycleLoop(nil) // expiry notices (first scan after 5 minutes) and the end of renewal grace periods
 
 	ovpnAdmin.modules = append(ovpnAdmin.modules, "core")
 
@@ -707,6 +708,10 @@ func main() {
 	http.HandleFunc(*listenBaseUrl+"api/user/ccd/apply", ovpnAdmin.userApplyCcdHandler)
 	http.HandleFunc(*listenBaseUrl+"api/audit/admin", ovpnAdmin.adminAuditListHandler)
 	http.HandleFunc(*listenBaseUrl+"api/audit/verify", ovpnAdmin.adminAuditVerifyHandler)
+	http.HandleFunc(*listenBaseUrl+"api/certs/expiry", ovpnAdmin.certsExpiryHandler)
+	http.HandleFunc(*listenBaseUrl+"api/user/renew", ovpnAdmin.userRenewHandler)
+	http.HandleFunc(*listenBaseUrl+"api/server/renew", ovpnAdmin.serverRenewHandler)
+	http.HandleFunc(*listenBaseUrl+"api/server/confirm-renew", ovpnAdmin.serverConfirmRenewHandler)
 
 	http.HandleFunc(*listenBaseUrl+"api/sync/last/try", ovpnAdmin.lastSyncTimeHandler)
 	http.HandleFunc(*listenBaseUrl+"api/sync/last/successful", ovpnAdmin.lastSuccessfulSyncTimeHandler)
@@ -921,6 +926,7 @@ func (oAdmin *OvpnAdmin) registerMetrics() {
 	oAdmin.promRegistry.MustRegister(ovpnClientConnectionFrom)
 	oAdmin.promRegistry.MustRegister(ovpnClientBytesReceived)
 	oAdmin.promRegistry.MustRegister(ovpnClientBytesSent)
+	registerCertMetrics(oAdmin.promRegistry)
 }
 
 func (oAdmin *OvpnAdmin) setState() {
@@ -1124,7 +1130,9 @@ func (oAdmin *OvpnAdmin) usersList() []OpenvpnClient {
 	totalActiveConnections := 0
 	apochNow := time.Now().Unix()
 
-	for _, line := range indexTxtParser(fRead(*indexTxtPath)) {
+	// a certificate that a renewal replaced and that is valid for its grace period is not a second user
+	// (see cert_lifecycle.go)
+	for _, line := range withoutSuperseded(indexTxtParser(fRead(*indexTxtPath)), supersededSerialsQuiet()) {
 		if isServerCertificate(line) {
 			ovpnServerCertExpire.Set(float64((parseDateToUnix(indexTxtDateLayout, line.ExpirationDate) - apochNow) / 3600 / 24))
 			continue
@@ -1379,6 +1387,14 @@ func (oAdmin *OvpnAdmin) userRevokeLocked(username string) (error, string) {
 	} else if alreadyRevoked, err := userCertRevokedErr(username); err != nil {
 		problem("index.txt could not be read", err)
 	} else {
+		// a certificate that a renewal replaced and that is still valid for its grace period goes with the
+		// user: it is revoked by its file (index.txt only) and covered by the CRL rebuild below
+		finishSuperseded := func() {}
+		if _, finish, err := revokeSupersededWithUser(username); err != nil {
+			problem("the certificate that a renewal replaced could not be revoked", err)
+		} else if finish != nil {
+			finishSuperseded = finish
+		}
 		revokeFailed := false
 		if !alreadyRevoked {
 			if _, err := runCommand(*easyrsaDirPath, "yes\n", *easyrsaBinPath, "revoke", username); err != nil {
@@ -1393,6 +1409,8 @@ func (oAdmin *OvpnAdmin) userRevokeLocked(username string) (error, string) {
 				problem("the CRL could not be rebuilt", err)
 			} else if err := confirmRevokedInCrl(username); err != nil {
 				problem("the new CRL does not list the revoked certificate", err)
+			} else {
+				finishSuperseded()
 			}
 		}
 	}
@@ -1623,6 +1641,16 @@ func (oAdmin *OvpnAdmin) userRotate(username, newPassword string) (error, string
 
 	oAdmin.createUserMutex.Lock()
 	defer oAdmin.createUserMutex.Unlock()
+
+	// a certificate that a renewal replaced and that is valid for its grace period is revoked first: the
+	// rotation replaces the certificate of the user anyway, and the index line of the old one (same common
+	// name) would be taken for the line that is rotated
+	if *storageBackend != "kubernetes.secrets" {
+		if err := oAdmin.retireSupersededLocked(username); err != nil {
+			msg := fmt.Sprintf("Failed to rotate user \"%s\": %v. Nothing else was changed, the certificate of the user is as before", username, err)
+			return errors.New(msg), msg
+		}
+	}
 
 	if *storageBackend == "kubernetes.secrets" {
 		if err := oAdmin.revokeBeforeReplace(username); err != nil {
@@ -2139,6 +2167,12 @@ func (oAdmin *OvpnAdmin) userDelete(username string) (error, string) {
 	defer oAdmin.createUserMutex.Unlock()
 
 	if usernameIsPathSafe(username) && checkUserExist(username) {
+		if *storageBackend != "kubernetes.secrets" {
+			if err := oAdmin.retireSupersededLocked(username); err != nil {
+				msg := fmt.Sprintf("Failed to delete user \"%s\": %v. Nothing else was changed", username, err)
+				return errors.New(msg), msg
+			}
+		}
 		if err := oAdmin.revokeBeforeReplace(username); err != nil {
 			return err, err.Error()
 		}
