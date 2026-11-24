@@ -33,7 +33,7 @@ An example of dashboard made using ovpn-admin metrics:
 
 ## Installation
 
-Release notes for this version: [RELEASE-v0.1.11.md](RELEASE-v0.1.11.md) (v0.1.11 candidate, not yet tagged or published). Previous release: [RELEASE-v0.1.10.md](RELEASE-v0.1.10.md), then [RELEASE-v0.1.9.md](RELEASE-v0.1.9.md). Earlier releases: [RELEASE-v0.1.8.md](RELEASE-v0.1.8.md) (published with the v0.1.8 release), [RELEASE-v0.1.7.md](RELEASE-v0.1.7.md) (published with the v0.1.7 release), [RELEASE-v0.1.6.md](RELEASE-v0.1.6.md) (published with the v0.1.6 release), [RELEASE-v0.1.5.md](RELEASE-v0.1.5.md), [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md), [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md), [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0 to v0.1.4: [UPGRADING.md](UPGRADING.md). Upgrading from v0.1.4 to v0.1.5: [UPGRADING.md](UPGRADING.md#v014--v015). Upgrading from v0.1.5 to v0.1.6: [UPGRADING.md](UPGRADING.md#v015--v016). Upgrading from v0.1.6 to v0.1.7: [UPGRADING.md](UPGRADING.md#v016--v017). Upgrading from v0.1.7 to v0.1.8: [UPGRADING.md](UPGRADING.md#v017--v018). Upgrading from v0.1.8 to v0.1.9: [UPGRADING.md](UPGRADING.md#v018--v019). Upgrading from v0.1.9 to v0.1.10: [UPGRADING.md](UPGRADING.md#v019--v0110). Upgrading from v0.1.10 to v0.1.11: [UPGRADING.md](UPGRADING.md#v0110--v0111).
+Release notes for this version: [RELEASE-v0.1.12.md](RELEASE-v0.1.12.md) (v0.1.12 candidate, not yet tagged or published). Previous release: [RELEASE-v0.1.11.md](RELEASE-v0.1.11.md), then [RELEASE-v0.1.10.md](RELEASE-v0.1.10.md), then [RELEASE-v0.1.9.md](RELEASE-v0.1.9.md). Earlier releases: [RELEASE-v0.1.8.md](RELEASE-v0.1.8.md) (published with the v0.1.8 release), [RELEASE-v0.1.7.md](RELEASE-v0.1.7.md) (published with the v0.1.7 release), [RELEASE-v0.1.6.md](RELEASE-v0.1.6.md) (published with the v0.1.6 release), [RELEASE-v0.1.5.md](RELEASE-v0.1.5.md), [RELEASE-v0.1.4.md](RELEASE-v0.1.4.md), [RELEASE-v0.1.3.md](RELEASE-v0.1.3.md), [RELEASE-v0.1.2.md](RELEASE-v0.1.2.md), [RELEASE-v0.1.1.md](RELEASE-v0.1.1.md), [RELEASE-v0.1.0.md](RELEASE-v0.1.0.md). Upgrading from v0.1.0 to v0.1.4: [UPGRADING.md](UPGRADING.md). Upgrading from v0.1.4 to v0.1.5: [UPGRADING.md](UPGRADING.md#v014--v015). Upgrading from v0.1.5 to v0.1.6: [UPGRADING.md](UPGRADING.md#v015--v016). Upgrading from v0.1.6 to v0.1.7: [UPGRADING.md](UPGRADING.md#v016--v017). Upgrading from v0.1.7 to v0.1.8: [UPGRADING.md](UPGRADING.md#v017--v018). Upgrading from v0.1.8 to v0.1.9: [UPGRADING.md](UPGRADING.md#v018--v019). Upgrading from v0.1.9 to v0.1.10: [UPGRADING.md](UPGRADING.md#v019--v0110). Upgrading from v0.1.10 to v0.1.11: [UPGRADING.md](UPGRADING.md#v0110--v0111). Upgrading from v0.1.11 to v0.1.12: [UPGRADING.md](UPGRADING.md#v0111--v0112).
 
 ### 1. Docker
 
@@ -290,6 +290,7 @@ Setup (not tested against the real Telegram API in QA):
 | `OVPN_TELEGRAM_THREAD_ID` | empty | optional forum topic id |
 | `OVPN_TELEGRAM_API_BASE` | `https://api.telegram.org` | Bot API base; keep it on `https://` |
 | `OVPN_TELEGRAM_ALLOW_HTTP` | `false` | accepts an `http://` base; local mock tests only |
+| `OVPN_TELEGRAM_INCLUDE_ADDRESS` | `true` | whether a ban message carries the client address and user name; set `false` to send the reason and the duration only |
 
 Message example:
 
@@ -302,6 +303,39 @@ Server: <container hostname>
 ```
 
 A bad setting logs one `ERROR` line at start, notifications stay off, and the VPN still starts. Restarts can send again for addresses still inside the find time.
+
+### Certificate expiry notices and renewal
+
+The panel reads the certificate expiry dates from the easy-rsa index and warns
+before a certificate runs out. It covers the client certificates **and the
+server certificate**, which is the one that takes the whole VPN down when it
+expires.
+
+* **Threshold.** `OVPN_NOTIFY_CERT_DAYS` is a comma-separated list of days,
+  largest first. The default is `30,14,7,3,1`, so you get one notice at each
+  of those marks; a value that cannot be read logs a warning and falls back to
+  the default. A certificate that crosses a mark produces one notice, so a
+  certificate 40 days out is quiet and the same certificate at 13 days produces
+  the `14` notice once.
+* **Delivery.** Notices go to the same Telegram chat as ban messages and need
+  the same settings. With Telegram off, the panel only shows the expiry badge
+  in the UI.
+* **Renew a client from the panel.** The Renew action on a client issues a new
+  certificate and a new profile while the old one keeps working during a grace
+  window, so the client can download and switch without losing the tunnel. The
+  grace window is what makes this safe to do during working hours.
+* **Renew the server from the panel.** The server certificate card shows the
+  expiry date and a Renew action. Renewing the server certificate needs a
+  restart of the `openvpn` container to take effect, and the panel shows a
+  banner saying so. That restart drops connected clients.
+* **Slave setups.** Certificate notices are off on a slave by design: the
+  master owns the CA. See the limits in [RELEASE-v0.1.12.md](RELEASE-v0.1.12.md).
+
+### Disconnect
+
+The Disconnect action on a client sends the request and shows a notice. **In
+v0.1.12 it does not end the session**: the server side is not implemented yet
+and the client stays connected. It is scheduled for v0.1.13.
 
 ### Banned IPs
 
@@ -321,7 +355,7 @@ The choice is saved in your browser only. The server does not store it, so each 
 
 ## Upgrade notes
 
-Upgrading a docker compose deployment (upstream, v0.1.0, v0.1.1, v0.1.2, v0.1.3): follow [UPGRADING.md](UPGRADING.md); `scripts/upgrade.sh` backs up first and covers the audit volume. v0.1.4 steps: [UPGRADING.md](UPGRADING.md#v013--v014). v0.1.5 steps: [UPGRADING.md](UPGRADING.md#v014--v015). v0.1.6 steps: [UPGRADING.md](UPGRADING.md#v015--v016). v0.1.7 steps: [UPGRADING.md](UPGRADING.md#v016--v017). v0.1.8 steps: [UPGRADING.md](UPGRADING.md#v017--v018). v0.1.9 steps: [UPGRADING.md](UPGRADING.md#v018--v019). v0.1.10 steps: [UPGRADING.md](UPGRADING.md#v019--v0110). v0.1.11 steps: [UPGRADING.md](UPGRADING.md#v0110--v0111).
+Upgrading a docker compose deployment (upstream, v0.1.0, v0.1.1, v0.1.2, v0.1.3): follow [UPGRADING.md](UPGRADING.md); `scripts/upgrade.sh` backs up first and covers the audit volume. v0.1.4 steps: [UPGRADING.md](UPGRADING.md#v013--v014). v0.1.5 steps: [UPGRADING.md](UPGRADING.md#v014--v015). v0.1.6 steps: [UPGRADING.md](UPGRADING.md#v015--v016). v0.1.7 steps: [UPGRADING.md](UPGRADING.md#v016--v017). v0.1.8 steps: [UPGRADING.md](UPGRADING.md#v017--v018). v0.1.9 steps: [UPGRADING.md](UPGRADING.md#v018--v019). v0.1.10 steps: [UPGRADING.md](UPGRADING.md#v019--v0110). v0.1.11 steps: [UPGRADING.md](UPGRADING.md#v0110--v0111). v0.1.12 steps: [UPGRADING.md](UPGRADING.md#v0111--v0112).
 
 * **openvpn-user v1.0.4 → v1.0.9** (only relevant with password authentication, `--auth.password` / `OVPN_PASSWD_AUTH=true`). openvpn-user v1.0.9 adds the columns `secret` and `app_configured` to `users.db`. The column `secret` is added without a default value, so for every user whose password was saved by openvpn-user v1.0.4 or older it is `NULL`, and `openvpn-user auth` of v1.0.9 rejects these users (`converting NULL to string is unsupported`) — they cannot connect to the VPN any more. Users created by v1.0.9 are not affected. Additionally `openvpn-user db-migrate` does nothing on a database created by v1.0.4 until `openvpn-user db-init` has created the `migrations` table, and until the database is migrated `openvpn-user create` reports success without saving the user.
   * The Docker images handle this: `setup/configure.sh` of the openvpn image and ovpn-admin itself (when started with `--auth.password` or `--auth.db-init`) run `db-init` and `db-migrate` on start and then replace `NULL` in `secret` with an empty string (the value v1.0.9 stores for new users). All steps are idempotent.

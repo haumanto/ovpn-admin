@@ -15,6 +15,7 @@ Pick your section:
 * [v0.1.8 → v0.1.9](#v018--v019)
 * [v0.1.9 → v0.1.10](#v019--v0110)
 * [v0.1.10 → v0.1.11](#v0110--v0111)
+* [v0.1.11 → v0.1.12](#v0111--v0112)
 * [upstream → v0.1.x](#upstream--v01x)
 
 Kubernetes/Helm deployments: see `charts/openvpn-admin/README.md`. The historical notes of the first release stay in `UPGRADING-v0.1.0.md`.
@@ -332,7 +333,7 @@ Known limits of this upgrade: no in-place upgrade of a running v0.1.9 deployment
 
 ## v0.1.10 → v0.1.11
 
-Status: candidate, not published. The steps below apply once v0.1.11 is tagged and released. Details: [RELEASE-v0.1.11.md](RELEASE-v0.1.11.md).
+Status: published. v0.1.11 was tagged and released on 2026-11-22. Details: [RELEASE-v0.1.11.md](RELEASE-v0.1.11.md).
 
 1. **Note your current version** (`git describe --tags --always`, or the image tags). You need it for a rollback.
 2. **Set the ban ignore list before you upgrade.** The default no longer has `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` or `fe80::/10`. Add the networks your admins use, for example in your environment or compose file:
@@ -361,16 +362,44 @@ Status: candidate, not published. The steps below apply once v0.1.11 is tagged a
 10. **Passwords.** Existing short passwords keep working. New and changed passwords must be at least 12 characters, and at most 72 bytes.
 11. **Verify.** Run `curl -fsS http://127.0.0.1:8080/ping`, log in to the UI with the Basic Auth user, and check the CRL gauge with `curl -s -u <user>:<password> http://127.0.0.1:8080/metrics | grep ovpn_crl_expire_days`.
 12. **Helm.** The chart's `version` and `appVersion` move to v0.1.11 (`charts/openvpn-admin/Chart.yaml`). No chart template changed. The chart is not hardened to the compose level, see `charts/openvpn-admin/README.md`.
-13. **Login lock (new in this release).** Five wrong secrets for one account from one address lock that account from that address (429, 15 min, then 1 h, 4 h, 24 h). Both compose files now pass four settings through to the panel: `OVPN_ADMIN_TRUST_PROXY` (default `true`), `OVPN_ADMIN_ALLOW_CIDR` (default empty), `OVPN_AUTH_MAX_FAILURES` (default 5), `OVPN_AUTH_FAIL_WINDOW` (default 15m). Merge them into your own copy of the compose file.
+
+Known limits of this upgrade: QA used fresh stacks, so no in-place upgrade of a running v0.1.10 deployment with live data was run. A rollback was not tested. arm64 images were not tested. The slave was not tested. See `RELEASE-v0.1.11.md`, Known limitations.
+
+## v0.1.11 → v0.1.12
+
+Status: published. v0.1.12 was tagged and released on 2026-11-24. Details: [RELEASE-v0.1.12.md](RELEASE-v0.1.12.md).
+
+1. **Note your current version** (`git describe --tags --always`, or the image tags). You need it for a rollback.
+2. **Update the checkout** once the `v0.1.12` tag exists: `git fetch --tags && git checkout v0.1.12`. `docker-compose.yaml` changes in this release (the four failed-login settings below). `docker-compose-slave.yaml` changes too (the same four settings). If you keep your own copy of either file, merge the changed defaults by hand and keep your own edits.
+3. **Back up before you upgrade:**
+   ```bash
+   mkdir -p -m 700 backups
+   tar -czf backups/pre-v0.1.12-$(date -u +%Y%m%dT%H%M%SZ).tar.gz easyrsa_master ccd_master audit_master
+   sha256sum backups/pre-v0.1.12-*.tar.gz
+   ```
+4. **Rebuild both images.** Both change: `ovpn-admin` (the certificate features, the panel controls, the lock and metrics fixes) and `openvpn` (the re-hash side of the login hook):
+   ```bash
+   docker compose -p openvpn-master build --pull ovpn-admin openvpn
+   docker compose -p openvpn-master up -d --no-deps ovpn-admin openvpn
+   curl -fsS http://127.0.0.1:8080/ping
+   ```
+   Restarting the `openvpn` container drops connected VPN clients. Do this in a quiet window.
+5. **Set the certificate notice threshold if you want notices.** `OVPN_NOTIFY_CERT_DAYS` takes a comma-separated list of days, largest first (for example `30,14,7,1`), and the panel notifies Telegram when a client or the server certificate crosses one. Telegram delivery needs `OVPN_TELEGRAM_ENABLED=true` and the bot token and chat id, as before.
+6. **Panel controls are new.** Each client now has an expiry badge and a Renew action, and there is a server certificate card with a restart banner. `RELEASE-v0.1.12.md` states plainly that **Disconnect does not end a session in this version**: it sends the request and shows a notice. Do not rely on it.
+7. **Helm.** The chart's `version` and `appVersion` move to v0.1.12 (`charts/openvpn-admin/Chart.yaml`). No chart template changed. The chart is not hardened to the compose level, see `charts/openvpn-admin/README.md`.
+
+### Login lock and password re-hash (new in v0.1.12)
+
+1. **Login lock (new in this release).** Five wrong secrets for one account from one address lock that account from that address (429, 15 min, then 1 h, 4 h, 24 h). Both compose files now pass four settings through to the panel: `OVPN_ADMIN_TRUST_PROXY` (default `true`), `OVPN_ADMIN_ALLOW_CIDR` (default empty), `OVPN_AUTH_MAX_FAILURES` (default 5), `OVPN_AUTH_FAIL_WINDOW` (default 15m). Merge them into your own copy of the compose file.
     * **Put the panel behind the TLS reverse proxy and make the proxy overwrite `X-Forwarded-For`** with the address it saw (nginx: `proxy_set_header X-Forwarded-For $remote_addr;`). The panel port is published to `127.0.0.1`, so without `OVPN_ADMIN_TRUST_PROXY=true` every client is the Docker bridge gateway and the lock is one lock for everybody. Set it to `false` only when the panel is exposed without a proxy.
     * **`OVPN_ADMIN_ALLOW_CIDR`** limits who may reach the panel (CIDR list, comma separated, `/32` for one host); other sources get 403. Sources on the list are never locked, so with a list set the lock does not engage.
     * **`/metrics` is counted like every other path** (it was exempt in the earlier candidate). A scraper with the right secret never fails; a source that is locked gets 429 there too, even with the right secret. A scraper inside `OVPN_ADMIN_ALLOW_CIDR` is exempt.
     * **Lift a lock by hand:** `docker compose -p openvpn-master stop ovpn-admin`, delete the entries whose key starts with the address from `state_master/auth-throttle.json` (or delete the file to lift every lock), `docker compose -p openvpn-master start ovpn-admin`. A restart alone does not lift it. Entries of the lock of the earlier candidate (keyed on the address alone) are ignored at start.
     * **Helm:** `ovpnAdmin.trustProxy` (default `false`), `ovpnAdmin.allowCidr`, `ovpnAdmin.authMaxFailures`, `ovpnAdmin.authFailWindow`.
     * Details: README, section "Login lock and source allowlist".
-14. **Password re-hash at login.** A VPN login with a hash below bcrypt cost 12 leaves a small spool file (user name, old hash, new hash, never the password) in `users.db.rehash/` next to `users.db`, because the login hook runs as `nobody` and cannot write `users.db`. The panel creates that directory at start (mode 0700, owned by `nobody`) and applies the entries within a few seconds, with a compare-and-set on the old hash (an entry whose row changed meanwhile is dropped), then deletes them; each applied entry is one info line in the panel log (`rehash applied: user=<name> cost 4 -> 12`) and one `auth.rehash` line in the admin audit trail. `users.db` itself stays root-owned. Rebuild **both** images: the hook side is in the `openvpn` image, the applier in the `ovpn-admin` image. A spool entry that is left behind (panel stopped) is applied at the next panel start; deleting the directory loses only the pending re-hashes, the next login of the user makes a new one.
+2. **Password re-hash at login.** A VPN login with a hash below bcrypt cost 12 leaves a small spool file (user name, old hash, new hash, never the password) in `users.db.rehash/` next to `users.db`, because the login hook runs as `nobody` and cannot write `users.db`. The panel creates that directory at start (mode 0700, owned by `nobody`) and applies the entries within a few seconds, with a compare-and-set on the old hash (an entry whose row changed meanwhile is dropped), then deletes them; each applied entry is one info line in the panel log (`rehash applied: user=<name> cost 4 -> 12`) and one `auth.rehash` line in the admin audit trail. `users.db` itself stays root-owned. Rebuild **both** images: the hook side is in the `openvpn` image, the applier in the `ovpn-admin` image. A spool entry that is left behind (panel stopped) is applied at the next panel start; deleting the directory loses only the pending re-hashes, the next login of the user makes a new one.
 
-Known limits of this upgrade: QA used fresh stacks, so no in-place upgrade of a running v0.1.10 deployment with live data was run. A rollback was not tested. arm64 images were not tested. The slave was not tested. See `RELEASE-v0.1.11.md`, Known limitations.
+Known limits of this upgrade: no in-place upgrade of a running v0.1.11 deployment with live data was run. A rollback was not tested. arm64 images were not tested. The slave was not tested. The panel's Disconnect button does not end a session, and `docker-compose-slave.yaml` does not pass the `OVPN_TELEGRAM_*` settings through, so a slave always sends the client address in a ban message. Both are fixed in v0.1.13. See `RELEASE-v0.1.12.md`, Limits you need to know.
 
 ## upstream → v0.1.x
 
