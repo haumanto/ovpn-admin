@@ -116,6 +116,14 @@ services:
       OVPN_AUDIT_PATH: "/mnt/audit/audit.tsv"
       # the ban list (bans.tsv) and the manual ban queue (control/) are in the state tree the ban engine writes, not next to the event file
       OVPN_STATE_DIR: "/var/lib/ovpn-admin"
+      # Failed-login lock and source allowlist of this panel (state in OVPN_STATE_DIR/auth-throttle.json); same settings as docker-compose.yaml,
+      # see the comments there. The slave panel is reached through the same published port and a TLS reverse proxy, which MUST overwrite
+      # X-Forwarded-For; set OVPN_ADMIN_TRUST_PROXY to false only when the panel is exposed without a proxy (every client is then the
+      # Docker bridge gateway and the lock becomes one lock for everybody). A source inside OVPN_ADMIN_ALLOW_CIDR is never locked.
+      OVPN_AUTH_MAX_FAILURES: "${OVPN_AUTH_MAX_FAILURES:-5}"
+      OVPN_AUTH_FAIL_WINDOW: "${OVPN_AUTH_FAIL_WINDOW:-15m}"
+      OVPN_ADMIN_TRUST_PROXY: "${OVPN_ADMIN_TRUST_PROXY:-true}"
+      OVPN_ADMIN_ALLOW_CIDR: "${OVPN_ADMIN_ALLOW_CIDR:-}"
     network_mode: service:openvpn
     volumes:
       - ./easyrsa_slave:/mnt/easyrsa

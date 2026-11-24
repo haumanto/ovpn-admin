@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,22 +24,25 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// Auth hardening of the panel. The panel has one Basic Auth account, so the guards below do not know
-// accounts: nothing is keyed by the user name (a lockout by name would be a switch any attacker could flip
-// to lock the owner out).
+// Auth hardening of the panel.
 //
 //   - validateNoAuthConfig: the panel does not start without credentials unless --insecure-no-auth says so.
-//   - authGuard: failed logins are counted per source address; a source that reaches --auth.max-failures within
-//     --auth.fail-window is locked (429 + Retry-After) for 15 min, 1 h, 4 h, 24 h for repeat offences within
-//     24 h. The lock is checked before the credentials are compared. A correct login clears the source. The
-//     state survives a restart (OVPN_STATE_DIR/auth-throttle.json, 0600, replaced atomically). /ping and the
-//     metrics path are exempt. More than authFloodSources distinct sources failing within the window is
-//     reported once (CRITICAL log line + one Telegram line); it never locks the account.
+//   - authGuard: failed logins are counted per source address AND user name (the lock key is
+//     "address|hash of the user name"); a pair that reaches --auth.max-failures within --auth.fail-window is
+//     locked (429 + Retry-After) for 15 min, 1 h, 4 h, 24 h for repeat offences within 24 h. Failures against
+//     one account never lock another account from the same address. The lock is checked before the
+//     credentials are compared. A correct login clears that pair. The state survives a restart
+//     (OVPN_STATE_DIR/auth-throttle.json, 0600, replaced atomically). /ping is exempt; the metrics path is
+//     counted like every other path. A source inside --admin.allow-cidr is trusted: never locked, never
+//     counted. More than authFloodSources distinct sources failing within the window is reported once
+//     (CRITICAL log line + one Telegram line); it never locks the account.
 //   - adminAllowlistMiddleware: --admin.allow-cidr, checked before authentication.
 //
 // The source address is the direct peer address; with --admin.trust-proxy it is the last X-Forwarded-For
-// value instead (behind a reverse proxy the peer is the proxy, and one attacker would otherwise lock out
-// everybody who comes in through it). Both the lock and the allowlist use the same address.
+// value instead (behind a reverse proxy, or a published Docker port, the peer is the proxy or the bridge
+// gateway, and one attacker would otherwise lock out everybody who comes in through it). Both the lock and
+// the allowlist use the same address. The user name is stored only as a short hash: what was typed in the
+// user name field (it may be a password) never reaches the state file.
 
 const (
 	authThrottleFileName   = "auth-throttle.json"
@@ -327,11 +332,32 @@ func (l *limitedFile) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// lockKey is the key of one (source, account) pair: "<address>|<first 16 hex of sha256(user name)>".
+func lockKey(src, user string) string {
+	sum := sha256.Sum256([]byte(user))
+	return src + "|" + hex.EncodeToString(sum[:8])
+}
+
+// keySource is the address part of a lock key.
+func keySource(key string) string {
+	src, _, _ := strings.Cut(key, "|")
+	return src
+}
+
+// validSourceKey accepts the keys lockKey makes. An entry of the earlier format (the bare address) is not
+// valid: it belonged to the lock that covered everybody behind one address, and is dropped at load.
 func validSourceKey(s string) bool {
-	if s == "unknown" {
+	src, h, ok := strings.Cut(s, "|")
+	if !ok || len(h) != 16 {
+		return false
+	}
+	if _, err := hex.DecodeString(h); err != nil {
+		return false
+	}
+	if src == "unknown" {
 		return true
 	}
-	_, err := netip.ParseAddr(s)
+	_, err := netip.ParseAddr(src)
 	return err == nil
 }
 
@@ -411,7 +437,7 @@ func (g *authGuard) writeFileLocked() error {
 func buildAuthChain(app http.Handler, username, password string, guard *authGuard, cfg authConfig, pingPath, metricsPath string) http.Handler {
 	authed := basicAuthMiddleware(app, username, password, pingPath)
 	if guard != nil {
-		authed = guard.middleware(authed, cfg.trustProxy, pingPath, metricsPath)
+		authed = guard.middleware(authed, cfg.trustProxy, cfg.allow, pingPath, metricsPath)
 	}
 	return adminAllowlistMiddleware(authed, cfg.allow, cfg.trustProxy)
 }
@@ -500,10 +526,14 @@ func (g *authGuard) fail(src string) lockResult {
 // floodCheckLocked returns the addresses once when more than authFloodSources distinct sources have failed
 // within the window, and nil otherwise; it re-arms when the number is back under the limit.
 func (g *authGuard) floodCheckLocked(nowU, windowS int64) []string {
+	seen := map[string]bool{}
 	var addrs []string
-	for src, e := range g.entries {
+	for key, e := range g.entries {
 		if e.LastFail != 0 && nowU-e.LastFail < windowS {
-			addrs = append(addrs, src)
+			if src := keySource(key); !seen[src] {
+				seen[src] = true
+				addrs = append(addrs, src)
+			}
 		}
 	}
 	if len(addrs) <= authFloodSources {
@@ -561,7 +591,7 @@ func (g *authGuard) failureCount(src string) int {
 	return 0
 }
 
-// sourceKey is the key of a request: the address of clientAddr, or the peer text when the address is not one.
+// sourceKey is the address of a request: the address of clientAddr, or the peer text when the address is not one.
 func (g *authGuard) sourceKey(r *http.Request, trustProxy bool) string {
 	if a, ok := clientAddr(r, trustProxy); ok {
 		return a.String()
@@ -575,9 +605,11 @@ func (g *authGuard) sourceKey(r *http.Request, trustProxy bool) string {
 type authAttemptKey struct{}
 
 // authAttempt travels in the context of a request that is subject to the lock; basicAuthMiddleware reports
-// the outcome of the credential comparison to it.
+// the outcome of the credential comparison to it. key is the (source, account) pair, src the address alone
+// (for the log).
 type authAttempt struct {
 	g   *authGuard
+	key string
 	src string
 }
 
@@ -591,7 +623,7 @@ func (at *authAttempt) failed(r *http.Request, user string) {
 	if at == nil {
 		return
 	}
-	res := at.g.fail(at.src)
+	res := at.g.fail(at.key)
 	if res.locked {
 		log.Warnf("auth locked remote=%s for %s after %d failed logins (lock number %d within 24h)", at.src, res.dur, at.g.maxFailures, res.strikes)
 		if adminAudit != nil {
@@ -603,35 +635,41 @@ func (at *authAttempt) failed(r *http.Request, user string) {
 
 func (at *authAttempt) succeeded() {
 	if at != nil {
-		at.g.succeeded(at.src)
+		at.g.succeeded(at.key)
 	}
 }
 
-// middleware answers 429 to a locked source before anything else looks at the request, and hands the
-// outcome of the credential comparison to the guard. Requests for the exempt paths (/ping and the metrics
-// path: monitoring must never lock out) pass untouched and are not counted.
-func (g *authGuard) middleware(next http.Handler, trustProxy bool, exempt ...string) http.Handler {
+// middleware answers 429 to a locked (source, account) pair before anything else looks at the request, and
+// hands the outcome of the credential comparison to the guard. Requests for the exempt paths (/ping) pass
+// untouched and are not counted; so do requests from a source inside allow (trusted: never locked, never
+// counted).
+func (g *authGuard) middleware(next http.Handler, trustProxy bool, allow []netip.Prefix, exempt ...string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if slices.Contains(exempt, r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
+		if addr, ok := clientAddr(r, trustProxy); ok && slices.ContainsFunc(allow, func(p netip.Prefix) bool { return p.Contains(addr) }) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		src := g.sourceKey(r, trustProxy)
-		if locked, wait := g.check(src); locked {
+		user, _, _ := r.BasicAuth()
+		key := lockKey(src, user)
+		if locked, wait := g.check(key); locked {
 			secs := int((wait + time.Second - 1) / time.Second)
 			if secs < 1 {
 				secs = 1
 			}
-			user, _, _ := r.BasicAuth()
 			recordAuthRefusal(&g.lockedSeen, auditActLoginLocked, user, src,
 				fmt.Sprintf("request refused, source is locked for another %ds", secs))
 			w.Header().Set("Retry-After", strconv.Itoa(secs))
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(http.StatusTooManyRequests)
-			fmt.Fprintf(w, "Too many failed logins from this address. Try again in %s.\n", waitText(secs))
+			fmt.Fprintf(w, "Too many failed logins for this account from this address. Try again in %s.\n", waitText(secs))
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authAttemptKey{}, &authAttempt{g: g, src: src})))
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authAttemptKey{}, &authAttempt{g: g, key: key, src: src})))
 	})
 }
 

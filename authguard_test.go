@@ -197,32 +197,21 @@ func TestFiveFailuresThenLocked(t *testing.T) {
 	}
 }
 
-func TestWrongUserWithRightPasswordCountsToo(t *testing.T) {
+// Failures against one account lock that account from that address and nothing else: a stranger who guesses
+// at one account name cannot lock out the owner of another, even from the same address (a published port
+// shows every client as the Docker gateway).
+func TestWrongUserLocksOnlyThatPairNotAnotherUser(t *testing.T) {
 	r := newGuardRig(t, rigOpts{})
 	for i := 0; i < 5; i++ {
 		if a := r.do("198.51.100.8:1", "/api/x", "somebody-else", r.pass); a.code != 401 {
 			t.Fatalf("%d: %d", i, a.code)
 		}
 	}
-	if a := r.right("198.51.100.8:1"); a.code != 429 {
-		t.Fatalf("locked: %d", a.code)
+	if a := r.do("198.51.100.8:1", "/api/x", "somebody-else", r.pass); a.code != 429 {
+		t.Fatalf("the guessed account from that address: %d, want 429", a.code)
 	}
-}
-
-// The key is the source, never the user name: an attacker cannot lock the owner out by guessing at the account.
-func TestLockIsPerSourceNotPerUser(t *testing.T) {
-	r := newGuardRig(t, rigOpts{})
-	for i := 0; i < 6; i++ {
-		r.wrong("198.51.100.9:5")
-	}
-	if a := r.wrong("198.51.100.9:6"); a.code != 429 {
-		t.Fatalf("same address, other port: %d, want 429", a.code)
-	}
-	if a := r.right("203.0.113.1:5"); a.code != 200 {
-		t.Fatalf("the owner from another address: %d, want 200", a.code)
-	}
-	if a := r.wrong("203.0.113.2:5"); a.code != 401 {
-		t.Fatalf("another attacker: %d, want 401", a.code)
+	if a := r.right("198.51.100.8:1"); a.code != 200 {
+		t.Fatalf("the owner from the same address: %d, want 200", a.code)
 	}
 }
 
@@ -232,13 +221,13 @@ func TestSuccessfulLoginClearsTheCount(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		r.wrong(src)
 	}
-	if n := r.guard.failureCount("198.51.100.10"); n != 4 {
+	if n := r.guard.failureCount(lockKey("198.51.100.10", guardUser)); n != 4 {
 		t.Fatalf("count = %d, want 4", n)
 	}
 	if a := r.right(src); a.code != 200 {
 		t.Fatalf("right password: %d", a.code)
 	}
-	if n := r.guard.failureCount("198.51.100.10"); n != 0 {
+	if n := r.guard.failureCount(lockKey("198.51.100.10", guardUser)); n != 0 {
 		t.Fatalf("count after a correct login = %d, want 0", n)
 	}
 	for i := 0; i < 4; i++ { // four more would have been the ninth failure without the clear
@@ -375,7 +364,7 @@ func TestLockSurvivesARestartAndTheFileIsPrivate(t *testing.T) {
 	if a := r2.right(src); a.code != 429 {
 		t.Fatalf("after the restart: %d, want 429", a.code)
 	}
-	if n := r2.guard.failureCount("198.51.100.16"); n != 3 {
+	if n := r2.guard.failureCount(lockKey("198.51.100.16", guardUser)); n != 3 {
 		t.Errorf("failure count after the restart = %d, want 3", n)
 	}
 	r2.clock.advance(16 * time.Minute)
@@ -533,7 +522,7 @@ func TestAllowlistDeniesBeforeAuthAndTheHandler(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		r.do("198.51.100.1:1", "/api/x", guardUser, "wrong")
 	}
-	if n := r.guard.failureCount("198.51.100.1"); n != 0 {
+	if n := r.guard.failureCount(lockKey("198.51.100.1", guardUser)); n != 0 {
 		t.Errorf("a refused source was counted: %d", n)
 	}
 }
@@ -637,8 +626,8 @@ func TestClientAddr(t *testing.T) {
 // The refusals and locks are written to the admin audit trail; no password or token is.
 func TestRefusalsAreAudited(t *testing.T) {
 	trail := useAdminAudit(t, "")
-	cfg, _ := parseAuthConfig(5, 15*time.Minute, []string{"192.0.2.0/24"}, false)
-	r := newGuardRig(t, rigOpts{cfg: cfg})
+	// the lock and the allowlist are separate cases now: a source inside the allowlist is never locked
+	r := newGuardRig(t, rigOpts{})
 	wrongPass := "audit-wrong-" + randomSecret(t, "")
 	for i := 0; i < 5; i++ {
 		r.do("192.0.2.30:1", "/api/x", guardUser, wrongPass)
@@ -646,8 +635,12 @@ func TestRefusalsAreAudited(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		r.right("192.0.2.30:1") // locked: 429
 	}
+	cfg, _ := parseAuthConfig(5, 15*time.Minute, []string{"192.0.2.0/24"}, false)
+	r2 := newGuardRig(t, rigOpts{cfg: cfg})
+	r2.pass = r.pass
+	r2.handler = buildAuthChain(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}), guardUser, r.pass, r2.guard, cfg, guardPing, guardMetric)
 	for i := 0; i < 3; i++ {
-		r.do("198.51.100.99:1", "/api/x", guardUser, r.pass) // outside
+		r2.do("198.51.100.99:1", "/api/x", guardUser, r.pass) // outside
 	}
 	trail.Close()
 	var all string
@@ -699,7 +692,7 @@ func TestManySourcesStayBounded(t *testing.T) {
 	r.guard.alert = nil
 	r.guard.path = "" // memory only: 4000 fsynced writes would test the disk
 	for i := 0; i < authMaxSources+50; i++ {
-		r.guard.fail("10." + itoa(i/65536) + "." + itoa(i/256%256) + "." + itoa(i%256))
+		r.guard.fail(lockKey("10."+itoa(i/65536)+"."+itoa(i/256%256)+"."+itoa(i%256), guardUser))
 	}
 	if n := len(r.guard.entries); n > authMaxSources {
 		t.Errorf("%d entries, limit %d", n, authMaxSources)

@@ -2,6 +2,14 @@ ovpnAdmin:
   repo: ghcr.io/haumanto/ovpn-admin/ovpn-admin
   # -- Image tag, defaults to the `appVersion` of the chart. Never use `master`.
   tag: ""
+  # -- Take the source address of the login lock and the allowlist from the last `X-Forwarded-For` value (`OVPN_ADMIN_TRUST_PROXY`). Set `true` when the ingress overwrites that header with the address it saw. Behind an ingress with `false` every client is the ingress pod and the lock is one lock for everybody; with no proxy in front, leave `false` (a client could name its own address).
+  trustProxy: false
+  # -- Source networks that may reach the panel, comma separated CIDRs (`OVPN_ADMIN_ALLOW_CIDR`); other sources get 403. Sources on the list are never locked. Empty = no restriction.
+  allowCidr: ""
+  # -- Wrong secrets for one account from one address within `authFailWindow` that lock it (`OVPN_AUTH_MAX_FAILURES`).
+  authMaxFailures: 5
+  # -- Window of the failure count (`OVPN_AUTH_FAIL_WINDOW`), e.g. `15m`.
+  authFailWindow: "15m"
 
 openvpn:
   repo: ghcr.io/haumanto/ovpn-admin/openvpn

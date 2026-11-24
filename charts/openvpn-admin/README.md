@@ -26,6 +26,10 @@ Kubernetes: `>=1.14.0-0`
 |-----|------|---------|-------------|
 | ovpnAdmin.repo | string | `"ghcr.io/haumanto/ovpn-admin/ovpn-admin"` |  |
 | ovpnAdmin.tag | string | `""` | Image tag, defaults to the `appVersion` of the chart. Never use `master`. |
+| ovpnAdmin.trustProxy | bool | `false` | Take the source address of the login lock and the allowlist from the last `X-Forwarded-For` value (`OVPN_ADMIN_TRUST_PROXY`). Set `true` when the ingress overwrites that header with the address it saw. Behind an ingress with `false` every client is the ingress pod and the lock is one lock for everybody; with no proxy in front, leave `false` (a client could name its own address). |
+| ovpnAdmin.allowCidr | string | `""` | Source networks that may reach the panel, comma separated CIDRs (`OVPN_ADMIN_ALLOW_CIDR`); other sources get 403. Sources on the list are never locked. Empty = no restriction. |
+| ovpnAdmin.authMaxFailures | int | `5` | Wrong secrets for one account from one address within `authFailWindow` that lock it (`OVPN_AUTH_MAX_FAILURES`). |
+| ovpnAdmin.authFailWindow | string | `"15m"` | Window of the failure count (`OVPN_AUTH_FAIL_WINDOW`), e.g. `15m`. |
 | openvpn.repo | string | `"ghcr.io/haumanto/ovpn-admin/openvpn"` |  |
 | openvpn.tag | string | `""` | Image tag, defaults to the `appVersion` of the chart. Never use `master`. |
 | openvpn.subnet | string | `"172.16.200.0/255.255.255.0"` | IPv4 pool for VPN clients in the `address/netmask` format (OpenVPN `server`). |

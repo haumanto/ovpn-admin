@@ -74,6 +74,15 @@ spec:
         # connection audit log written by the OpenVPN hooks, shared through the "audit" volume
         - name: OVPN_AUDIT_PATH
           value: /mnt/audit/audit.tsv
+        # failed-login lock and source allowlist of the panel, see the README of the repository ("Login lock and source allowlist")
+        - name: OVPN_ADMIN_TRUST_PROXY
+          value: {{ .Values.ovpnAdmin.trustProxy | default false | quote }}
+        - name: OVPN_ADMIN_ALLOW_CIDR
+          value: {{ .Values.ovpnAdmin.allowCidr | default "" | quote }}
+        - name: OVPN_AUTH_MAX_FAILURES
+          value: {{ .Values.ovpnAdmin.authMaxFailures | default 5 | quote }}
+        - name: OVPN_AUTH_FAIL_WINDOW
+          value: {{ .Values.ovpnAdmin.authFailWindow | default "15m" | quote }}
         ports:
         - name: ovpn-admin
           protocol: TCP

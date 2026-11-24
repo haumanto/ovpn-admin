@@ -142,6 +142,20 @@ services:
       OVPN_STATE_DIR: "/var/lib/ovpn-admin"
       # trace, debug, info, warn or error; debug logs every request path and is not for a normal run
       LOG_LEVEL: "${LOG_LEVEL:-info}"
+      # Failed-login lock and source allowlist of the panel (the lock state is kept in OVPN_STATE_DIR/auth-throttle.json).
+      # The lock is keyed on source address plus user name: OVPN_AUTH_MAX_FAILURES wrong secrets for one account from one address
+      # within OVPN_AUTH_FAIL_WINDOW lock that account from that address (429 with Retry-After; 15 min, 1 h, 4 h, 24 h for repeat offences).
+      OVPN_AUTH_MAX_FAILURES: "${OVPN_AUTH_MAX_FAILURES:-5}"
+      OVPN_AUTH_FAIL_WINDOW: "${OVPN_AUTH_FAIL_WINDOW:-15m}"
+      # Source address for the lock and the allowlist. The panel port is published to 127.0.0.1 only (see ports of the openvpn
+      # service) and must sit behind the TLS reverse proxy, which MUST overwrite X-Forwarded-For with the address it saw (the panel
+      # takes the last value). Without this switch every client shows up as the Docker bridge gateway and the lock becomes one lock
+      # for everybody. Set it to false only when the panel is exposed without a proxy.
+      OVPN_ADMIN_TRUST_PROXY: "${OVPN_ADMIN_TRUST_PROXY:-true}"
+      # Comma separated source networks (CIDR, a single host needs /32 or /128) that may reach the panel; other sources get 403 before
+      # authentication. A source on the list is trusted: it is never locked and never counted, so with a list set the lock has nothing
+      # left to do (only listed sources get that far). Empty = no restriction, and the lock applies to every source.
+      OVPN_ADMIN_ALLOW_CIDR: "${OVPN_ADMIN_ALLOW_CIDR:-}"
       # Telegram settings of the panel (certificate expiry notices, including the server certificate). Same variables and defaults as
       # the openvpn service above, which uses them for ban alerts: one set of values in the environment or the env file feeds both.
       # The panel is a separate container, so the notices stay off until these reach this service. See the openvpn service for the
