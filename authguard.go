@@ -635,14 +635,24 @@ func (g *authGuard) middleware(next http.Handler, trustProxy bool, exempt ...str
 	})
 }
 
+// waitText says how long a lock lasts, rounded up to whole minutes and carried into the hours, so that the
+// sentence never reads "3 hours 60 minutes" (14395 s is 4 hours 0 minutes).
 func waitText(secs int) string {
-	switch {
-	case secs >= 3600:
-		return fmt.Sprintf("%d hours %d minutes", secs/3600, (secs%3600+59)/60)
-	case secs >= 60:
-		return fmt.Sprintf("%d minutes", (secs+59)/60)
+	if secs < 60 {
+		return plural(secs, "second")
 	}
-	return fmt.Sprintf("%d seconds", secs)
+	mins := (secs + 59) / 60
+	if mins < 60 {
+		return plural(mins, "minute")
+	}
+	return plural(mins/60, "hour") + " " + plural(mins%60, "minute")
+}
+
+func plural(n int, unit string) string {
+	if n == 1 {
+		return fmt.Sprintf("1 %s", unit)
+	}
+	return fmt.Sprintf("%d %ss", n, unit)
 }
 
 // ---- flood alert ----

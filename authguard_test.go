@@ -707,3 +707,27 @@ func TestManySourcesStayBounded(t *testing.T) {
 }
 
 var _ = sync.Mutex{}
+
+func TestWaitTextCarriesMinutesIntoHours(t *testing.T) {
+	for _, c := range []struct {
+		secs int
+		want string
+	}{
+		{1, "1 second"},
+		{59, "59 seconds"},
+		{60, "1 minute"},
+		{61, "2 minutes"},
+		{900, "15 minutes"},
+		{3599, "1 hour 0 minutes"},
+		{3600, "1 hour 0 minutes"},
+		{3601, "1 hour 1 minute"},
+		{14395, "4 hours 0 minutes"},
+		{14400, "4 hours 0 minutes"},
+		{86398, "24 hours 0 minutes"},
+		{86400, "24 hours 0 minutes"},
+	} {
+		if got := waitText(c.secs); got != c.want {
+			t.Errorf("waitText(%d) = %q, want %q", c.secs, got, c.want)
+		}
+	}
+}
