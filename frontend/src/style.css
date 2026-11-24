@@ -606,3 +606,50 @@ table.ov-hist { width: 100%; border-collapse: collapse; }
   table.vgt-table.ov-users thead th { padding-right: 28px; }
   table.vgt-table.ov-users thead th.c-actions { padding-right: 10px; }
 }
+
+/* ================= certificate lifecycle (v0.1.12) ================= */
+/* days-left badge: red <= 7 days, amber <= 30, plain otherwise. The text always says it: colour is never the only cue. */
+.ov-days { height: auto; min-height: 22px; padding: 2px 8px; font-size: var(--fs-small); }
+.ov-days-red { background: var(--c-danger-subtle); color: var(--c-danger-text); border-color: var(--c-danger-text); }
+.ov-days-amber { background: var(--c-warn-bg); color: var(--c-warn-text); border-color: var(--c-warn-border); }
+.ov-days-plain { background: transparent; color: var(--c-text-muted); border-color: transparent; padding-left: 0; font-weight: 400; }
+.ov-cell2 .ov-days { margin-top: 2px; }
+.ov-icon-sm { width: 16px; height: 16px; vertical-align: -3px; }
+
+/* server certificate card */
+.ov-cert-card {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4);
+  padding: var(--sp-3) var(--sp-4); margin-bottom: var(--sp-3);
+  background: var(--c-surface); border: 1px solid var(--c-border); border-radius: var(--radius-lg);
+}
+.ov-cert-main { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-1) var(--sp-3); flex: 1 1 auto; min-width: 0; }
+.ov-cert-title { margin: 0; font-size: var(--fs-base); line-height: var(--lh-base); font-weight: 600; }
+.ov-cert-err { margin: 0; flex: 1 1 100%; }
+.ov-cert-card .ov-btn { margin-left: auto; }
+
+/* banners: persistent restart notice, throttled panel */
+.ov-banner-body { flex: 1 1 auto; min-width: 0; }
+.ov-banner-err { margin-top: var(--sp-1); font-weight: 600; }
+.ov-banner-warn .ov-icon { margin-top: 1px; }
+.ov-panel-notice { margin-bottom: var(--sp-3); }
+.ov-restart .ov-btn { background: var(--c-surface); }
+.ov-dialog-body .ov-impact { margin: var(--sp-3) 0 0; }
+.ov-dialog-body .ov-impact + .ov-alert { margin-top: var(--sp-3); }
+
+/* native select in a dialog: same box as .ov-input */
+select.ov-select { appearance: auto; padding-right: var(--sp-2); cursor: pointer; }
+select.ov-select:disabled { cursor: default; background: var(--c-surface-alt); color: var(--c-text-muted); }
+select.ov-select:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+
+@media (max-width: 480px) {
+  .ov-cert-card .ov-btn { margin-left: 0; flex: 1 1 100%; }
+  .ov-banner.ov-restart { flex-wrap: wrap; }
+  .ov-banner.ov-restart .ov-btn { margin-left: 0; flex: 1 1 100%; }
+}
+
+/* desktop: Renew and Disconnect join the inline actions; the buttons wrap onto a second line instead of being cut off */
+@media (min-width: 1025px) {
+  .ov-users th.c-actions, .ov-users td.c-actions { width: auto; white-space: normal; }
+  .ov-users td.c-actions .ov-row-actions { flex-wrap: wrap; max-width: 700px; margin-left: auto; }
+}
+.ov-dialog-body .ov-impact + p { margin-top: var(--sp-3); }

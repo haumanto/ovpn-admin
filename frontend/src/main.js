@@ -33,11 +33,67 @@ var axios_cfg = function(url, data='', type='form') {
   }
 };
 
+// ---- throttled panel (429) and refused address (403) ----
+
+var PANEL_FORBIDDEN_TEXT = 'This address is not allowed to use the panel.';
+
+// Retry-After of a 429, in whole seconds; 0 when the header is missing or unusable.
+var retryAfterSeconds = function(error) {
+  var headers = error && error.response && error.response.headers;
+  var value = headers ? headers['retry-after'] : null;
+  var n = parseInt(value, 10);
+  return isFinite(n) && n > 0 ? n : 0;
+};
+
+var throttleText = function(secs) {
+  if (secs > 0) {
+    return 'Too many failed attempts. Try again in ' + secs + (secs === 1 ? ' second' : ' seconds') + '.';
+  }
+  return 'Too many failed attempts. Try again later.';
+};
+
+// The address allow-list answers 403 with a bare "Forbidden" (or a proxy page). The other 403 answers
+// carry their own message and are shown as they are: {"status":"error","message":...} of the admin-only
+// endpoints, "cross-site request refused".
+var isPanelForbidden = function(response) {
+  if (!response || response.status !== 403) {
+    return false;
+  }
+  var data = response.data;
+  if (data && typeof data === 'object') {
+    return false;
+  }
+  return String(data || '').toLowerCase().indexOf('cross-site') === -1;
+};
+
+// the app registers itself here once it is created (the interceptor is older than the app)
+var panelNotice = { handler: null };
+
+axios.interceptors.response.use(function(response) {
+  return response;
+}, function(error) {
+  var res = error && error.response;
+  if (res && panelNotice.handler) {
+    if (res.status === 429) {
+      panelNotice.handler({ kind: 'throttled', seconds: retryAfterSeconds(error) });
+    } else if (isPanelForbidden(res)) {
+      panelNotice.handler({ kind: 'forbidden', seconds: 0 });
+    }
+  }
+  return Promise.reject(error);
+});
+
 // Human readable message of a failed axios request: the backend answers with
 // plain text (http.Error) or with {"status": "...", "message": "..."}.
 var errorMessage = function(error) {
   if (!error.response) {
     return error.message || String(error);
+  }
+  if (error.response.status === 429) {
+    return throttleText(retryAfterSeconds(error));
+  }
+  if (isPanelForbidden(error.response)) {
+    return PANEL_FORBIDDEN_TEXT;
   }
   var data = error.response.data;
   if (data && typeof data === 'object') {
@@ -257,6 +313,68 @@ var expiryInfo = function(row, nowMs) {
   return { date: date, text: 'in ' + daysSpan(diff), warn: false };
 };
 
+// ---- certificate lifecycle (GET api/certs/expiry, POST api/user/renew, api/server/renew) ----
+
+var DAYS_RED = 7;
+var DAYS_AMBER = 30;
+
+// grace choices of a client renewal; 72 h is the default
+var GRACE_OPTIONS = [
+  { hours: '0', label: '0 hours: cut over now' },
+  { hours: '24', label: '24 hours (1 day)' },
+  { hours: '72', label: '72 hours (3 days)' },
+  { hours: '168', label: '168 hours (7 days)' },
+  { hours: '336', label: '336 hours (14 days)' }
+];
+var GRACE_DEFAULT = '72';
+
+// the one text the badge and the server card share; level: red <= 7 days, amber <= 30, otherwise plain
+var daysLeftInfo = function(cert) {
+  if (!cert || typeof cert.daysLeft !== 'number' || !isFinite(cert.daysLeft)) {
+    return null;
+  }
+  var days = Math.floor(cert.daysLeft);
+  var text;
+  if (days < 0) {
+    text = 'Expired ' + daysSpan(-days) + ' ago';
+  } else if (days === 0) {
+    text = 'Expires today';
+  } else {
+    text = plural(days, 'day') + ' left';
+  }
+  return {
+    days: days,
+    level: days <= DAYS_RED ? 'red' : (days <= DAYS_AMBER ? 'amber' : 'plain'),
+    text: text,
+    notAfter: typeof cert.notAfter === 'string' ? cert.notAfter : '',
+    renewable: cert.renewable !== false,
+    superseded: cert.superseded === true
+  };
+};
+
+// the message of a JSON answer ({status, message}) or of a plain text answer
+var serverMessage = function(data) {
+  if (data && typeof data === 'object') {
+    return typeof data.message === 'string' ? data.message : '';
+  }
+  return typeof data === 'string' ? data.trim() : '';
+};
+
+// Number of sessions a disconnect answer reports ({"sessions": n}); null when the answer has no count.
+var disconnectedCount = function(data) {
+  if (!data || typeof data !== 'object') {
+    return null;
+  }
+  var keys = ['sessions', 'disconnected', 'killed'];
+  for (var i = 0; i < keys.length; i++) {
+    var n = data[keys[i]];
+    if (typeof n === 'number' && isFinite(n) && n >= 0) {
+      return Math.floor(n);
+    }
+  }
+  return null;
+};
+
 // ---- banned IPs (GET api/bans) ----
 
 // Unix seconds (number or numeric string, as in bans.tsv) or an RFC 3339
@@ -387,6 +505,28 @@ var validateBanNote = function(value) {
   return '';
 };
 
+// Duration of a manual ban: the `minutes` field of POST api/ban/manual, empty = permanent.
+var BAN_DURATIONS = [
+  { minutes: '', label: 'Permanent' },
+  { minutes: '10', label: '10 minutes' },
+  { minutes: '60', label: '1 hour' },
+  { minutes: '1440', label: '24 hours' }
+];
+
+// Loopback and private addresses need force=true on the server. The browser cannot know the admin's own
+// public address: the server refuses what it knows about with a 400, and the dialog then offers the same
+// confirmation with the server's reason.
+var banNeedsForce = function(ip) {
+  var v = String(ip || '').trim().toLowerCase();
+  var v4 = /^(?:::ffff:)?(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(v);
+  if (v4) {
+    var a = Number(v4[1]);
+    var b = Number(v4[2]);
+    return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+  }
+  return v === '::1' || /^f[cd][0-9a-f]{2}:/.test(v);
+};
+
 var BANS_POLL_MS = 30000;
 var BANS_POLL_BACKOFF_MS = 120000;
 var BANS_BACKOFF_AFTER = 3;
@@ -445,7 +585,7 @@ var EVENT_LABELS = {
 var STATUS_RANK = { Online: 0, Active: 1, Expired: 2, Revoked: 3 };
 
 // Adds the derived fields the table cells and sort functions read.
-var decorateRow = function(row, nowMs) {
+var decorateRow = function(row, nowMs, cert) {
   var online = row.AccountStatus === 'Active' && row.ConnectionStatus === 'Connected';
   var label = online ? 'Online' : (row.AccountStatus || '');
   var badgeClass = 'ov-badge-active';
@@ -478,7 +618,11 @@ var decorateRow = function(row, nowMs) {
     _rank: label in STATUS_RANK ? STATUS_RANK[label] : 1,
     _loginTs: isNaN(ts) ? 0 : ts,
     _login: login,
-    _expiry: expiryInfo(row, nowMs)
+    _expiry: expiryInfo(row, nowMs),
+    // merged from GET api/certs/expiry by common name; null when the endpoint gave nothing for this row
+    // (the existing expiry column then stands alone). A revoked certificate is not a call to action.
+    _days: row.AccountStatus === 'Revoked' ? null : daysLeftInfo(cert),
+    _renewable: cert ? cert.renewable !== false : true
   });
 };
 
@@ -867,11 +1011,15 @@ const app = createApp({
         },
       ],
       rows: [],
+      graceOptions: GRACE_OPTIONS,
+      banDurations: BAN_DURATIONS,
       // order inside a group is the order on screen (History is always first
       // and is rendered separately). group 'danger' sits at the far right.
       actions: [
         { name: 'u-unrevoke', label: 'Unrevoke', icon: 'i-undo', group: 'routine', showWhenStatus: ['Revoked'], showForServerRole: ['master'], showForModule: ['core'] },
         { name: 'u-download-config', label: 'Download config', icon: 'i-download', group: 'routine', showWhenStatus: ['Active'], showForServerRole: ['master', 'slave'], showForModule: ['core'] },
+        { name: 'u-renew', label: 'Renew', icon: 'i-calendar', group: 'routine', showWhenStatus: ['Active'], showForServerRole: ['master'], showForModule: ['core'], needsRenewable: true },
+        { name: 'u-disconnect-user', label: 'Disconnect', icon: 'i-plug', group: 'routine', showWhenStatus: ['Active'], showForServerRole: ['master'], showForModule: ['core'], onlineOnly: true },
         { name: 'u-edit-ccd', label: 'Edit routes', icon: 'i-route', group: 'routine', showWhenStatus: ['Active'], showForServerRole: ['master'], showForModule: ['ccd'] },
         { name: 'u-edit-ccd', label: 'Show routes', icon: 'i-route', group: 'routine', showWhenStatus: ['Active'], showForServerRole: ['slave'], showForModule: ['ccd'] },
         { name: 'u-change-password', label: 'Set password', icon: 'i-key', group: 'routine', showWhenStatus: ['Active'], showForServerRole: ['master'], showForModule: ['passwdAuth'] },
@@ -898,7 +1046,21 @@ const app = createApp({
       staleError: '',
       now: Date.now(),
       rowBusy: {},
-      // the one open dialog: {kind: 'add'|'password'|'revoke'|'delete'|'rotate'|'config'|'routes'|'history', ...}
+      // users whose Disconnect request is in flight (the row shows a spinner)
+      disconnecting: {},
+      // certificate expiry (GET api/certs/expiry): client rows by common name, the server certificate row,
+      // the restart that a server renewal waits for, and why the last load failed
+      certsByName: {},
+      serverCert: null,
+      restartPending: false,
+      certsError: '',
+      certsLoaded: false,
+      serverBusy: false,
+      serverError: '',
+      // a 429 or 403 answer of any request: {kind: 'throttled'|'forbidden', until, text, announce}
+      notice: null,
+      noticeNow: Date.now(),
+      // the one open dialog: {kind: 'add'|'password'|'revoke'|'delete'|'rotate'|'renew'|'server-renew'|'config'|'routes'|'history', ...}
       dialog: null,
       notificationSpeed: (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) ? 0 : 900,
       // layout: cards up to 768 px, tables from 769 px
@@ -931,9 +1093,11 @@ const app = createApp({
     }
   },
   mounted: function () {
-    this.loadUsers();
-    this.getServerSetting();
     var _this = this;
+    panelNotice.handler = function(n) { _this.setNotice(n); };
+    this.loadUsers();
+    this.loadExpiry();
+    this.getServerSetting();
     new MutationObserver(function() { _this.syncAriaSort(); })
       .observe(document.getElementById('app'), { subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'aria-sort'] });
 
@@ -1017,6 +1181,8 @@ const app = createApp({
     this.loadBans(true);
   },
   unmounted: function () {
+    panelNotice.handler = null;
+    this.stopNoticeTimer();
     this.stopBansTimer();
     clearInterval(this.nowTimer);
     window.removeEventListener('hashchange', this.onHashChange);
@@ -1073,9 +1239,10 @@ const app = createApp({
     },
     tableRows: function() {
       var nowMs = this.now;
+      var certs = this.certsByName;
       var query = this.search.trim().toLowerCase();
       return this.hideFiltered(this.rows).map(function(row) {
-        return decorateRow(row, nowMs);
+        return decorateRow(row, nowMs, certs[row.Identity]);
       }).filter(function(row) {
         if (query === '') {
           return true;
@@ -1169,7 +1336,31 @@ const app = createApp({
       var username = this.menu ? this.menu.username : null;
       var nowMs = this.now;
       var row = this.rows.find(function(r) { return r.Identity == username; });
-      return row ? decorateRow(row, nowMs) : null;
+      return row ? decorateRow(row, nowMs, this.certsByName[username]) : null;
+    },
+    serverDays: function() {
+      return daysLeftInfo(this.serverCert);
+    },
+    // the server certificate row of the card: date, days left, whether Renew is offered
+    serverNotAfterDate: function() {
+      var d = this.serverDays;
+      return d && d.notAfter ? d.notAfter.substring(0, 10) : '';
+    },
+    showServerCard: function() {
+      return !!this.serverCert || (this.certsLoaded === false && this.certsError !== '');
+    },
+    noticeText: function() {
+      var n = this.notice;
+      if (!n) {
+        return '';
+      }
+      if (n.kind === 'forbidden') {
+        return PANEL_FORBIDDEN_TEXT;
+      }
+      if (!n.until) {
+        return throttleText(0);
+      }
+      return throttleText(Math.max(1, Math.ceil((n.until - this.noticeNow) / 1000)));
     },
     menuItems: function() {
       var row = this.menuRow;
@@ -1225,6 +1416,7 @@ const app = createApp({
         this.loadBans(false);
       } else {
         this.loadUsers();
+        this.loadExpiry();
       }
     },
     primaryAction: function(row) {
@@ -1436,7 +1628,9 @@ const app = createApp({
         return action.group == group &&
           action.showWhenStatus.includes(row.AccountStatus) &&
           action.showForServerRole.includes(_this.serverRole) &&
-          action.showForModule.some(function(p) { return _this.modulesEnabled.includes(p) });
+          action.showForModule.some(function(p) { return _this.modulesEnabled.includes(p) }) &&
+          (!action.onlineOnly || row.ConnectionStatus === 'Connected') &&
+          (!action.needsRenewable || row._renewable !== false);
       });
     },
     actionAriaLabel: function(action, username) {
@@ -1447,6 +1641,7 @@ const app = createApp({
         'u-revoke': this.openRevoke,
         'u-unrevoke': this.unrevokeUserAction,
         'u-rotate': this.openRotate,
+        'u-renew': this.openRenew,
         'u-delete': this.openDelete,
         'u-show-config': this.showConfigAction,
         'u-download-config': this.downloadConfigAction,
@@ -1540,6 +1735,60 @@ const app = createApp({
     openDelete: function() {
       this.dialog = { kind: 'delete', username: this.username, busy: false, error: '' };
     },
+    // ---- renew a client certificate (POST api/user/renew) ----
+    openRenew: function() {
+      this.dialog = { kind: 'renew', username: this.username, grace: GRACE_DEFAULT, busy: false, error: '', done: false, message: '', downloading: false, downloadError: '' };
+    },
+    // 'The old certificate keeps working until 2026-11-27 14:30.' for the grace chosen now
+    graceHelp: function(grace) {
+      var hours = Number(grace);
+      if (!hours) {
+        return 'The old certificate stops working as soon as you confirm. Only choose this when the user can install the new config right away.';
+      }
+      return 'The old certificate keeps working until about ' + formatLocal(new Date(Date.now() + hours * 3600000), false) +
+        ' (' + offsetLabel() + '), then it is revoked automatically.';
+    },
+    renewUser: function() {
+      var _this = this;
+      var d = _this.dialog;
+      if (!d || d.busy || d.done) {
+        return;
+      }
+      d.busy = true;
+      d.error = '';
+      var form = _this.userForm(d.username);
+      form.append('grace_hours', String(d.grace));
+      axios.request(axios_cfg('api/user/renew', form, 'form'))
+      .then(function(response) {
+        d.busy = false;
+        d.done = true;
+        // the server's own words, as they are
+        d.message = serverMessage(response.data) || 'Certificate renewed.';
+        _this.loadUsers();
+        _this.loadExpiry();
+      })
+      .catch(function(error) {
+        d.busy = false;
+        d.error = errorMessage(error);
+      });
+    },
+    // hands the new config to the admin as <username>.ovpn; nothing is sent to the user
+    downloadRenewedConfig: function() {
+      var _this = this;
+      var d = _this.dialog;
+      if (!d || d.downloading) {
+        return;
+      }
+      d.downloading = true;
+      d.downloadError = '';
+      _this.saveConfigFile(d.username)
+      .catch(function(error) {
+        d.downloadError = 'Could not download the config for ' + d.username + ': ' + trimPeriod(errorMessage(error)) + '.';
+      })
+      .then(function() {
+        d.downloading = false;
+      });
+    },
     openRevoke: function() {
       var _this = this;
       var username = _this.username;
@@ -1562,18 +1811,29 @@ const app = createApp({
 
     // ---- manual ban and unban (Banned IPs view, master only) ----
     openBanAdd: function() {
-      this.dialog = { kind: 'ban-add', ip: '', note: '', submitted: false, busy: false, error: '' };
+      this.dialog = { kind: 'ban-add', ip: '', note: '', minutes: '', forceFor: '', submitted: false, busy: false, error: '' };
     },
     openUnban: function(ban) {
       this.dialog = { kind: 'unban', ip: ban.ip, permanent: !!ban.permanent, busy: false, error: '' };
     },
-    banForm: function(ip, note) {
+    banForm: function(ip, note, minutes, force) {
       var data = new URLSearchParams();
       data.append('ip', ip);
       if (note) {
         data.append('reason', note);
       }
+      if (minutes) {
+        data.append('minutes', String(minutes));
+      }
+      if (force) {
+        data.append('force', 'true');
+      }
       return data;
+    },
+    // the force confirmation is shown for the address it was asked about, not for an edited one
+    banForceAsked: function() {
+      var d = this.dialog;
+      return !!(d && d.kind == 'ban-add' && d.forceFor && d.forceFor === String(d.ip || '').trim());
     },
     // reloads the list after a change, also when a poll is already running (its answer may predate the change)
     reloadBans: function() {
@@ -1584,8 +1844,9 @@ const app = createApp({
       }
       return _this.loadBans(false);
     },
-    // one request: busy state, no double submit, inline error, toast and list reload on success
-    runBanRequest: function(url, form, verb, onSuccess) {
+    // one request: busy state, no double submit, inline error, toast and list reload on success.
+    // onReloaded (optional) runs when the list has been reloaded, with the dialog that made the request.
+    runBanRequest: function(url, form, verb, onSuccess, onReloaded) {
       var _this = this;
       var d = _this.dialog;
       if (!d || d.busy) {
@@ -1603,6 +1864,9 @@ const app = createApp({
         return _this.reloadBans().then(function() {
           _this.bansQuiet = false;
           _this.bansAnnounce = message + '. ' + plural(_this.bans.length, 'active ban') + '.';
+          if (onReloaded) {
+            onReloaded(d);
+          }
           // an unbanned row is gone now: focus must not fall back to the page
           _this.focusAfterBans();
         });
@@ -1611,9 +1875,36 @@ const app = createApp({
         // a failed reload after a successful change is shown by the list itself; this branch is for the request
         if (_this.dialog === d) {
           d.busy = false;
-          d.error = 'Could not ' + verb + ' ' + d.ip + ': ' + trimPeriod(errorMessage(error)) + '.';
+          if (verb == 'ban') {
+            // the server's reason, as it is
+            var reason = errorMessage(error);
+            d.error = 'Could not ban ' + d.ip + ': ' + reason;
+            // a refusal that names force: offer the same confirmation, once
+            if (error.response && error.response.status === 400 && /force/i.test(reason) && d.sentForce !== true) {
+              d.forceFor = String(d.ip || '').trim();
+            }
+          } else {
+            d.error = 'Could not ' + verb + ' ' + d.ip + ': ' + trimPeriod(errorMessage(error)) + '.';
+          }
         }
       });
+    },
+    // 'permanent, until you unban it' or 'until 2026-11-24 15:20' of the ban the server now lists for ip
+    banResultText: function(ip, minutes) {
+      var ban = this.bans.find(function(b) { return b.ip === ip; });
+      var when;
+      var offences = '';
+      if (ban) {
+        offences = ' ' + plural(ban.failures, 'offence') + ' on record.';
+        when = ban.permanent ? 'The ban is permanent until you unban it.' :
+          (ban.expiresMs ? 'The ban lasts until ' + formatLocal(new Date(ban.expiresMs), false) + ' (' + relativeFuture(ban.expiresMs, Date.now()) + ').' : 'The ban is in place.');
+      } else if (minutes) {
+        var shown = BAN_DURATIONS.find(function(o) { return o.minutes === String(minutes); });
+        when = 'The ban lasts ' + (shown ? shown.label : minutes + ' minutes') + '.';
+      } else {
+        when = 'The ban is permanent until you unban it.';
+      }
+      return when + offences;
     },
     submitBanAdd: function() {
       var _this = this;
@@ -1624,9 +1915,19 @@ const app = createApp({
       }
       var ip = d.ip.trim();
       d.ip = ip;
-      _this.runBanRequest('api/ban/manual', _this.banForm(ip, d.note.trim()), 'ban', function() {
-        _this.toast('success', ip + ' banned', 'The ban is permanent until you unban it.');
-        return ip + ' banned permanently';
+      // a loopback or private address may be the admin's own: ask first, then send force=true
+      if (banNeedsForce(ip) && d.forceFor !== ip) {
+        d.forceFor = ip;
+        d.error = '';
+        return;
+      }
+      var force = d.forceFor === ip;
+      d.sentForce = force;
+      var minutes = d.minutes;
+      _this.runBanRequest('api/ban/manual', _this.banForm(ip, d.note.trim(), minutes, force), 'ban', function() {
+        return ip + ' banned';
+      }, function() {
+        _this.toast('success', ip + ' banned', _this.banResultText(ip, minutes));
       });
     },
     submitUnban: function() {
@@ -1769,16 +2070,23 @@ const app = createApp({
     downloadConfigAction: function() {
       var _this = this;
       var username = _this.username;
-      axios.request(axios_cfg('api/user/config/show', _this.userForm(username), 'form'))
-      .then(function(response) {
-        const blob = new Blob([response.data], { type: 'text/plain' })
-        const link = document.createElement('a')
-        link.href = URL.createObjectURL(blob)
-        link.download = username + ".ovpn"
-        link.click()
-        URL.revokeObjectURL(link.href)
-      }).catch(function(error) {
+      _this.saveConfigFile(username).catch(function(error) {
         _this.toast('error', 'Could not download config for ' + username, errorMessage(error));
+      });
+    },
+    // fetches the config of username (api/user/config/show) and saves it as <username>.ovpn
+    saveConfigFile: function(username) {
+      return axios.request(axios_cfg('api/user/config/show', this.userForm(username), 'form'))
+      .then(function(response) {
+        var blob = new Blob([response.data], { type: 'text/plain' });
+        var url = URL.createObjectURL(blob);
+        var link = document.createElement('a');
+        link.href = url;
+        link.download = username + '.ovpn';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
       });
     },
     editCcdAction: function() {
@@ -1799,10 +2107,37 @@ const app = createApp({
         }
       });
     },
+    // POST api/user/disconnect: the row shows a spinner and its buttons are disabled until the answer is in
     disconnectUserAction: function() {
-      axios.request(axios_cfg('api/user/disconnect', this.userForm(this.username), 'form'))
+      var _this = this;
+      var username = _this.username;
+      if (_this.rowBusy[username]) {
+        return;
+      }
+      _this.rowBusy = Object.assign({}, _this.rowBusy, { [username]: true });
+      _this.disconnecting = Object.assign({}, _this.disconnecting, { [username]: true });
+      axios.request(axios_cfg('api/user/disconnect', _this.userForm(username), 'form'))
       .then(function(response) {
-        console.log(response.data);
+        var n = disconnectedCount(response.data);
+        if (n === null) {
+          // an answer without a count (plain text): do not claim what the server did not report
+          _this.toast('success', 'Disconnect requested for ' + username, 'The server did not report how many sessions it closed.');
+        } else {
+          _this.toast('success', 'disconnected ' + username + ' (' + plural(n, 'session') + ')');
+        }
+        return _this.loadUsers();
+      })
+      .catch(function(error) {
+        _this.toast('error', 'Could not disconnect ' + username, errorMessage(error));
+      })
+      .then(function() {
+        var busy = Object.assign({}, _this.rowBusy);
+        delete busy[username];
+        _this.rowBusy = busy;
+        var working = Object.assign({}, _this.disconnecting);
+        delete working[username];
+        _this.disconnecting = working;
+        _this.focusAfterReload(username);
       });
     },
 
@@ -1951,6 +2286,131 @@ const app = createApp({
           _this.loading = false;
           _this.refreshing = false;
         });
+    },
+
+    // ---- certificate expiry and the server certificate ----
+    // GET api/certs/expiry: {certs: [{name, kind, notAfter, daysLeft, renewable, superseded}], restartPending}.
+    // A failure never touches the user table: the rows keep their own expiry column.
+    loadExpiry: function() {
+      var _this = this;
+      if (_this.expiryPromise) {
+        return _this.expiryPromise;
+      }
+      _this.expiryPromise = axios.request(axios_cfg('api/certs/expiry'))
+      .then(function(response) {
+        var data = response.data;
+        var list = data && Array.isArray(data.certs) ? data.certs : (Array.isArray(data) ? data : null);
+        if (list === null) {
+          throw new Error('unexpected response');
+        }
+        var byName = {};
+        var server = null;
+        list.forEach(function(cert) {
+          if (!cert || typeof cert.name !== 'string') {
+            return;
+          }
+          if (cert.kind === 'server') {
+            server = cert;
+          } else if (cert.kind === 'client') {
+            byName[cert.name] = cert;
+          }
+        });
+        _this.certsByName = byName;
+        _this.serverCert = server;
+        _this.restartPending = !!(data && !Array.isArray(data) && data.restartPending === true);
+        _this.certsLoaded = true;
+        _this.certsError = '';
+      })
+      .catch(function(error) {
+        // what is on screen from an earlier answer stays (the restart banner must not vanish on a hiccup)
+        _this.certsError = trimPeriod(errorMessage(error));
+      })
+      .then(function() {
+        _this.expiryPromise = null;
+      });
+      return _this.expiryPromise;
+    },
+    openServerRenew: function() {
+      this.dialog = { kind: 'server-renew', busy: false, error: '' };
+    },
+    // POST api/server/renew (no fields): restartRequired: true raises the banner
+    renewServer: function() {
+      var _this = this;
+      var d = _this.dialog;
+      if (!d || d.busy) {
+        return;
+      }
+      d.busy = true;
+      d.error = '';
+      axios.request({ method: 'post', url: 'api/server/renew', data: new URLSearchParams(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })
+      .then(function(response) {
+        _this.dialog = null;
+        var data = response.data;
+        if (data && typeof data === 'object' && data.restartRequired === true) {
+          _this.restartPending = true;
+        }
+        _this.serverError = '';
+        _this.toast('success', 'Server certificate renewed', serverMessage(data));
+        // the endpoint is the source of truth for restartPending, also after a reload
+        return _this.loadExpiry();
+      })
+      .catch(function(error) {
+        d.busy = false;
+        d.error = errorMessage(error);
+      });
+    },
+    // POST api/server/confirm-renew (no fields): the admin restarted openvpn
+    confirmServerRenew: function() {
+      var _this = this;
+      if (_this.serverBusy) {
+        return;
+      }
+      _this.serverBusy = true;
+      _this.serverError = '';
+      axios.request({ method: 'post', url: 'api/server/confirm-renew', data: new URLSearchParams(), headers: { 'Content-Type': 'application/x-www-form-urlencoded' } })
+      .then(function(response) {
+        _this.restartPending = false;
+        _this.toast('success', 'Server certificate renewal confirmed', serverMessage(response.data));
+        return _this.loadExpiry();
+      })
+      .catch(function(error) {
+        _this.serverError = errorMessage(error);
+      })
+      .then(function() {
+        _this.serverBusy = false;
+      });
+    },
+
+    // ---- throttled panel (429) and refused address (403) ----
+    setNotice: function(n) {
+      var _this = this;
+      _this.stopNoticeTimer();
+      _this.noticeNow = Date.now();
+      if (n.kind === 'throttled' && n.seconds > 0) {
+        var until = Date.now() + n.seconds * 1000;
+        // read out once; the ticking countdown on screen is hidden from screen readers
+        _this.notice = { kind: 'throttled', until: until, announce: throttleText(n.seconds) };
+        _this.noticeTimer = setInterval(function() {
+          _this.noticeNow = Date.now();
+          if (_this.noticeNow >= until) {
+            _this.dismissNotice();
+          }
+        }, 1000);
+      } else if (n.kind === 'throttled') {
+        _this.notice = { kind: 'throttled', until: 0, announce: throttleText(0) };
+      } else {
+        _this.notice = { kind: 'forbidden', until: 0, announce: PANEL_FORBIDDEN_TEXT };
+      }
+    },
+    dismissNotice: function() {
+      this.stopNoticeTimer();
+      this.notice = null;
+    },
+    stopNoticeTimer: function() {
+      if (this.noticeTimer) {
+        clearInterval(this.noticeTimer);
+        this.noticeTimer = null;
+      }
     },
 
     getServerSetting: function() {

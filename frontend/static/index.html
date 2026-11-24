@@ -36,6 +36,8 @@
   <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></symbol>
   <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></symbol>
   <symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M18 14.5a6.5 6.5 0 0 1 3.5 5.5"/></symbol>
+  <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15" rx="2"/><path d="M3.5 10h17M8 3v4M16 3v4M9 15l2 2 4-4"/></symbol>
+  <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 3v5M15 3v5M6 8h12v3a6 6 0 0 1-12 0V8zM12 17v4"/></symbol>
 </svg>
 <div id="app" v-cloak>
   <a class="ov-skip" href="#main" @click.prevent="focusMain()">Skip to content</a>
@@ -62,9 +64,37 @@
   <main class="ov-main" id="main" tabindex="-1">
     <div class="ov-banner ov-banner-warn" role="status" v-if="offline"><span><strong>You are offline.</strong> <template v-if="view == 'bans' ? bansUpdatedClock : updatedTime">Showing data from {{ view == 'bans' ? bansUpdatedClock : updatedTime }}. </template>Actions are disabled until the connection returns.</span></div>
 
+    <!-- 429 (throttled) and 403 (address not allowed) of any request. The countdown on screen is hidden from screen readers, the first text is read out once. -->
+    <div class="ov-banner ov-banner-error ov-panel-notice" id="panel-notice" role="alert" v-if="notice">
+      <span class="visually-hidden">{{ notice.announce }}</span>
+      <span aria-hidden="true">{{ noticeText }}</span>
+      <button type="button" class="ov-btn" @click="dismissNotice()">Dismiss</button>
+    </div>
+
+    <!-- A renewed server certificate is only served after the restart: stays until it is confirmed, also after a reload. -->
+    <div class="ov-banner ov-banner-warn ov-restart" id="restart-banner" role="status" v-if="restartPending">
+      <svg class="ov-icon" aria-hidden="true"><use href="#i-info"/></svg>
+      <div class="ov-banner-body">
+        <span>The running OpenVPN still serves the previous certificate. Restart the openvpn container in a maintenance window, then confirm.</span>
+        <div class="ov-banner-err" role="alert" v-if="serverError">Could not confirm: {{ serverError }}</div>
+      </div>
+      <button type="button" id="server-confirm-btn" class="ov-btn" v-if="serverRole == 'master'" :disabled="serverBusy || offline" :aria-busy="serverBusy ? 'true' : null" @click="confirmServerRenew()">{{ serverBusy ? 'Confirming…' : 'Confirm' }}</button>
+    </div>
+
     <!-- USERS -->
     <section v-show="view == 'users'" aria-labelledby="users-h">
       <h1 id="users-h" class="visually-hidden">Users</h1>
+      <!-- server certificate: days left from GET api/certs/expiry -->
+      <section class="ov-cert-card" id="server-cert-card" aria-labelledby="server-cert-h" v-if="showServerCard">
+        <div class="ov-cert-main">
+          <h2 id="server-cert-h" class="ov-cert-title">Server certificate</h2>
+          <span class="ov-badge ov-days" :class="'ov-days-' + serverDays.level" v-if="serverDays">{{ serverDays.text }}</span>
+          <span class="ov-muted ov-small ov-num" v-if="serverNotAfterDate">expires {{ serverNotAfterDate }}</span>
+          <span class="ov-muted ov-small" v-if="restartPending">Renewed. Waiting for the OpenVPN restart.</span>
+        </div>
+        <p class="ov-small ov-muted ov-cert-err" role="status" v-if="certsError">Certificate expiry could not be loaded: {{ certsError }}.</p>
+        <button type="button" id="server-renew-btn" class="ov-btn" v-if="serverCert && serverRole == 'master'" :disabled="!serverDays || !serverDays.renewable || offline" @click.left.stop="openServerRenew()"><svg class="ov-icon" aria-hidden="true"><use href="#i-calendar"/></svg>Renew</button>
+      </section>
       <div class="ov-toolbar">
         <div class="ov-search">
           <label class="visually-hidden" for="user-search">Search users</label>
@@ -94,9 +124,11 @@
                 <span class="ov-muted" v-else>No record</span>
               </dd>
               <dt>Expires</dt>
-              <dd :title="row.ExpirationDate"><span class="ov-num">{{ row._expiry.date }}</span><span :class="row._expiry.warn ? 'ov-warn-text' : 'ov-muted'" v-if="row._expiry.text"> · {{ row._expiry.text }}</span></dd>
+              <dd :title="row.ExpirationDate"><span class="ov-num">{{ row._expiry.date }}</span>
+                <template v-if="row._days"> <span class="ov-badge ov-days" :class="'ov-days-' + row._days.level">{{ row._days.text }}</span><span class="ov-muted" v-if="row._days.superseded" title="A new certificate was issued. The old one is still valid during its grace."> · renewed</span></template>
+                <span :class="row._expiry.warn ? 'ov-warn-text' : 'ov-muted'" v-else-if="row._expiry.text"> · {{ row._expiry.text }}</span></dd>
               <dt>Sessions</dt>
-              <dd class="ov-num"><template v-if="row._sessions > 0">{{ row._sessions }}</template><span class="ov-muted" v-else>No sessions</span></dd>
+              <dd class="ov-num"><span role="status" v-if="disconnecting[row.Identity]"><svg class="ov-icon ov-icon-sm ov-spin" aria-hidden="true"><use href="#i-refresh"/></svg> Disconnecting…</span><template v-else-if="row._sessions > 0">{{ row._sessions }}</template><span class="ov-muted" v-else>No sessions</span></dd>
             </dl>
             <div class="ov-card-actions">
               <button type="button" class="ov-btn ov-btn-main" v-if="primaryAction(row)"
@@ -131,7 +163,8 @@
             <div class="ov-name" v-if="props.column.field == 'Identity'" :title="props.row.Identity"><span class="ov-clamp">{{ props.row.Identity }}</span></div>
             <template v-else-if="props.column.field == '_rank'">
               <span class="ov-badge" :class="props.row._badgeClass">{{ props.row._statusLabel }}</span>
-              <span class="ov-cell2" v-if="props.row._statusNote">{{ props.row._statusNote }}</span>
+              <span class="ov-cell2" role="status" v-if="disconnecting[props.row.Identity]"><svg class="ov-icon ov-icon-sm ov-spin" aria-hidden="true"><use href="#i-refresh"/></svg> Disconnecting…</span>
+              <span class="ov-cell2" v-else-if="props.row._statusNote">{{ props.row._statusNote }}</span>
             </template>
             <div v-else-if="props.column.field == '_loginTs'" :title="props.row._login ? props.row._login.utc + ' UTC' : 'No connection found in the audit log. Logins before v0.1.1 are not recorded.'">
               <template v-if="props.row._login">
@@ -144,8 +177,9 @@
               </template>
             </div>
             <div v-else-if="props.column.field == 'ExpirationDate'" :title="props.row.ExpirationDate">
-              <span class="ov-num">{{ props.row._expiry.date }}</span>
-              <span class="ov-cell2" :class="{'ov-warn-text': props.row._expiry.warn}" v-if="props.row._expiry.text">{{ props.row._expiry.text }}</span>
+              <span class="ov-num">{{ props.row._expiry.date }}</span><span class="ov-muted ov-small" v-if="props.row._days && props.row._days.superseded" title="A new certificate was issued. The old one is still valid during its grace."> · renewed</span>
+              <span class="ov-cell2" v-if="props.row._days"><span class="ov-badge ov-days" :class="'ov-days-' + props.row._days.level">{{ props.row._days.text }}</span></span>
+              <span class="ov-cell2" :class="{'ov-warn-text': props.row._expiry.warn}" v-else-if="props.row._expiry.text">{{ props.row._expiry.text }}</span>
             </div>
             <div class="ov-row-actions" v-else-if="props.column.field == 'actions'">
               <button
@@ -179,8 +213,9 @@
                 v-for="action in rowActions(props.row, 'routine')"
                 :key="action.name + action.label"
                 :aria-label="actionAriaLabel(action, props.row.Identity)"
+                :aria-busy="action.name == 'u-disconnect-user' && disconnecting[props.row.Identity] ? 'true' : null"
                 :disabled="rowLocked(props.row)"
-                @click.left.stop="rowActionFn(action.name, props.row.Identity)">{{ action.label }}</button>
+                @click.left.stop="rowActionFn(action.name, props.row.Identity)"><svg class="ov-icon ov-icon-sm ov-spin" aria-hidden="true" v-if="action.name == 'u-disconnect-user' && disconnecting[props.row.Identity]"><use href="#i-refresh"/></svg>{{ action.label }}</button>
               <span class="ov-danger-slot ov-desk-only" v-if="rowActions(props.row, 'danger').length > 0">
                 <button
                   type="button"
@@ -316,8 +351,15 @@
         <input id="f-ban-ip" class="ov-input ov-mono" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false"
           placeholder="203.0.113.9" v-model="dialog.ip" :aria-invalid="fieldError('ban-ip') ? 'true' : null"
           aria-describedby="f-ban-ip-help f-ban-ip-err">
-        <div class="ov-help" id="f-ban-ip-help">IPv4 or IPv6. The ban is permanent until you unban the address.</div>
+        <div class="ov-help" id="f-ban-ip-help">IPv4 or IPv6.</div>
         <div class="ov-error" id="f-ban-ip-err" v-if="fieldError('ban-ip')">{{ fieldError('ban-ip') }}</div>
+      </div>
+      <div class="ov-field">
+        <label class="ov-label" for="f-ban-minutes">Duration</label>
+        <select id="f-ban-minutes" class="ov-input ov-select" v-model="dialog.minutes" :disabled="dialog.busy" aria-describedby="f-ban-minutes-help">
+          <option v-for="option in banDurations" :key="option.minutes" :value="option.minutes">{{ option.label }}</option>
+        </select>
+        <div class="ov-help" id="f-ban-minutes-help">{{ dialog.minutes ? 'A timed ban ends on its own.' : 'A permanent ban stays until you unban the address.' }}</div>
       </div>
       <div class="ov-field">
         <label class="ov-label" for="f-ban-note">Note <span class="ov-muted">(optional)</span></label>
@@ -327,10 +369,11 @@
         <div class="ov-error" id="f-ban-note-err" v-if="fieldError('ban-note')">{{ fieldError('ban-note') }}</div>
       </div>
     </form>
+    <p class="ov-impact" role="status" id="ban-force-warning" v-if="banForceAsked()"><strong>{{ dialog.ip }} may be your own address or part of your network.</strong> Banning it can lock you out of the panel and the VPN. Ban it anyway?</p>
     <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
     <template #footer>
       <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
-      <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" :disabled="dialog.busy || offline" :aria-busy="dialog.busy ? 'true' : null">{{ dialog.busy ? 'Banning…' : 'Ban IP' }}</button>
+      <button type="submit" form="dialog-form" class="ov-btn" :class="banForceAsked() ? 'ov-btn-danger' : 'ov-btn-primary'" :disabled="dialog.busy || offline" :aria-busy="dialog.busy ? 'true' : null">{{ dialog.busy ? 'Banning…' : (banForceAsked() ? 'Ban anyway' : 'Ban IP') }}</button>
     </template>
   </app-dialog>
 
@@ -408,6 +451,51 @@
     <template #footer>
       <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
       <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" :disabled="dialog.busy || offline">{{ dialog.busy ? 'Rotating…' : 'Rotate certificate' }}</button>
+    </template>
+  </app-dialog>
+
+  <!-- Renew a client certificate -->
+  <app-dialog v-if="dialog && dialog.kind == 'renew'" :title="dialog.done ? 'Certificate renewed for ' + dialog.username : 'Renew certificate for ' + dialog.username + '?'"
+    :busy="dialog.busy || dialog.downloading" initial-focus="cancel" describe-body @close="closeDialog()">
+    <template v-if="!dialog.done">
+      <p>A new certificate is issued for {{ dialog.username }}. The old certificate keeps working until the grace period ends. {{ dialog.username }} must install the new config before then, or can no longer connect.</p>
+      <form id="dialog-form" novalidate @submit.prevent="renewUser()">
+        <div class="ov-field">
+          <label class="ov-label" for="f-grace">Grace period</label>
+          <select id="f-grace" class="ov-input ov-select" v-model="dialog.grace" :disabled="dialog.busy" aria-describedby="f-grace-help">
+            <option v-for="option in graceOptions" :key="option.hours" :value="option.hours">{{ option.label }}</option>
+          </select>
+          <div class="ov-help" id="f-grace-help">{{ graceHelp(dialog.grace) }}</div>
+        </div>
+      </form>
+      <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
+    </template>
+    <template v-else>
+      <p class="ov-impact" role="status" id="renew-message">{{ dialog.message }}</p>
+      <p>Download the new config and hand it to {{ dialog.username }}. Nothing is emailed.</p>
+      <div class="ov-alert" role="alert" v-if="dialog.downloadError">{{ dialog.downloadError }}</div>
+    </template>
+    <template #footer>
+      <template v-if="!dialog.done">
+        <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
+        <button type="submit" form="dialog-form" class="ov-btn ov-btn-primary" id="renew-confirm-btn" :disabled="dialog.busy || offline" :aria-busy="dialog.busy ? 'true' : null">{{ dialog.busy ? 'Renewing…' : 'Renew certificate' }}</button>
+      </template>
+      <template v-else>
+        <button type="button" class="ov-btn ov-btn-primary" id="renew-download-btn" :disabled="dialog.downloading" :aria-busy="dialog.downloading ? 'true' : null" @click="downloadRenewedConfig()"><svg class="ov-icon" aria-hidden="true"><use href="#i-download"/></svg>{{ dialog.downloading ? 'Downloading…' : 'Download config' }}</button>
+        <button type="button" class="ov-btn" data-dialog-cancel data-dialog-close :disabled="dialog.downloading" @click="closeDialog()">Close</button>
+      </template>
+    </template>
+  </app-dialog>
+
+  <!-- Renew the server certificate -->
+  <app-dialog v-if="dialog && dialog.kind == 'server-renew'" title="Renew the server certificate?" :busy="dialog.busy"
+    initial-focus="cancel" describe-body @close="closeDialog()">
+    <p>A new server certificate is issued. The running OpenVPN keeps serving the previous certificate until the openvpn container is restarted.</p>
+    <p class="ov-muted">After the restart, press Confirm in the banner that appears. The previous certificate is revoked then.</p>
+    <div class="ov-alert" role="alert" v-if="dialog.error">{{ dialog.error }}</div>
+    <template #footer>
+      <button type="button" class="ov-btn" data-dialog-cancel :disabled="dialog.busy" @click="closeDialog()">Cancel</button>
+      <button type="button" class="ov-btn ov-btn-primary" id="server-renew-confirm-btn" :disabled="dialog.busy || offline" :aria-busy="dialog.busy ? 'true' : null" @click="renewServer()">{{ dialog.busy ? 'Renewing…' : 'Renew server certificate' }}</button>
     </template>
   </app-dialog>
 
