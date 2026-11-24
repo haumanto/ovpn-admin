@@ -28,7 +28,8 @@
 #                                the watcher ovpn-ban-control, or by the supervisor of configure.sh while the watcher is down)
 #   ovpn-ban.sh jail-bantime     print the bantime for the fail2ban jail (the first escalation step in seconds, -1 = permanent)
 #   ovpn-ban.sh flush            remove every DROP rule of both chains and clear the ban list
-#   ovpn-ban.sh teardown         remove the INPUT jumps, flush, delete both chains (actionstop, ban engine disabled)
+#   ovpn-ban.sh teardown         remove the INPUT jumps, flush, delete both chains (actionstop, ban engine disabled); the ban list is
+#                                emptied too, except while the history cannot vouch for it (a refused init): then the rows stay
 #
 # Ban list (read by ovpn-admin): OVPN_BAN_STATE, default /var/lib/ovpn-admin/bans.tsv, root:root 0600, no header, one
 # tab-separated row per active ban: ip, banned_at_unix, expires_at_unix, failures, reason. IPv4 and IPv6 share the file;
@@ -146,8 +147,10 @@
 #     - a history that is missing, empty or in the current format and lacks a permanent entry (expires_at 0) of the ban list of this engine
 #       (list_gate): a history cut at a row end, emptied or replaced is a valid file of fewer bans, and so is the zero-byte file that
 #       OVPN_BAN_HISTORY names. The list is the second record: a ban is written to the history before the list, a lifting removes the list row
-#       before the history rows, and a container stop, a crash and a refused start leave the list as it is (only an accepted init and the jail
-#       stop, teardown, empty it), so at a start every permanent row of the list has its
+#       before the history rows, and a container stop, a crash and a refused start leave the list as it is (only an accepted init, the jail
+#       stop, teardown, and the flush command empty it; a teardown that follows a refusal does not, see txn_teardown: a start with
+#       OVPN_BAN_REQUIRED=false or OVPN_BAN_ENABLED=false after a refusal keeps the list, so the next start with true is refused again),
+#       so at a start every permanent row of the list has its
 #       permanent row in the history. When the history is empty or missing, bans.tsv in OVPN_BAN_LEGACY_DIR is compared too, unless
 #       ban-history.tsv.migrated or FILE.legacy-format (the proof of a conversion) exists: that file is then an old copy that the operator may
 #       have emptied since. A state that was emptied on purpose is an empty list AND an empty history (the panel's unban removes both).
@@ -1890,7 +1893,8 @@ conv_marker() {
 # list_gate: the second record. The history is known (hist_gate said so) but it can still be shorter than it was: cut at a row end, emptied,
 # replaced, and every row that is left is a valid row. The ban lists say what was banned, so the permanent entries of
 #   - the ban list of this engine ($STATE: written after the history row of each ban, emptied of a ban only after the history lost it; it is
-#     left as it was by a container stop or a crash (not by the jail stop, teardown) and by a refused start), always, and
+#     left as it was by a container stop or a crash (not by the jail stop, teardown, unless the history is unknown or lacks rows of the
+#     list: then teardown keeps it as well) and by a refused start), always, and
 #   - bans.tsv of the earlier layout (OVPN_BAN_LEGACY_DIR), when the history is empty or missing and nothing proves that a conversion
 #     happened (conv_marker). After a conversion that file is an old copy: the operator may have lifted the bans since, and it is not
 #     compared again.
@@ -2435,13 +2439,25 @@ cmd_flush() {
   with_state_lock txn_flush
 }
 
-# txn_teardown: jumps, rules, rows and chains removed in one critical section (the caller holds the lock)
+# txn_teardown: jumps, rules and chains removed in one critical section (the caller holds the lock). The rows of the ban list go with them
+# only while the history can vouch for them: when hist_gate or list_gate says the history of the permanent bans is unknown or lacks a
+# permanent row of the list (the state a refused init leaves), the list is the only record of those bans left and it stays as it is. The
+# caller of a refusal is configure.sh: with OVPN_BAN_REQUIRED=false (or OVPN_BAN_ENABLED=false) it runs this teardown right after the
+# refused init, and a list emptied there would let the next start with OVPN_BAN_REQUIRED=true pass on the damaged history (QA W1). An
+# accepted init and the explicit flush command still empty the list. The gates are only read here and speak on stderr.
 txn_teardown() {
-  local fam rc=0
+  local fam rc=0 keep=0
   for fam in 4 6; do
     drop_jumps "$fam" || rc=1
   done
-  txn_flush || rc=1
+  flush_chains || rc=1
+  hist_gate || keep=1
+  [ "$keep" -ne 0 ] || list_gate || keep=1
+  if [ "$keep" -eq 0 ]; then
+    do_clear_rows || rc=1
+  else
+    echo "ovpn-ban: WARNING: the ban list $STATE is left as it is by teardown: the history of the permanent bans is unknown or lacks bans of the list (see above), so the list is the only record of them. Chains and jumps are removed; the next start with OVPN_BAN_REQUIRED=true is refused until the history is restored or both files are moved away" >&2
+  fi
   for fam in 4 6; do
     if ipt "$fam" -n -L "$(chain_of "$fam")" >/dev/null 2>&1; then ipt "$fam" -X "$(chain_of "$fam")" || rc=1; fi
   done

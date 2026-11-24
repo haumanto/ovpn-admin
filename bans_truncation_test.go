@@ -647,3 +647,200 @@ var v0111HistoryRow2End = func() int {
 	}
 	return n
 }()
+
+// W1 (QA t_c271c8ae, repair t_05f56ebe). A refused start leaves the ban list alone, but configure.sh then runs "ovpn-ban.sh teardown" when the
+// operator starts with OVPN_BAN_REQUIRED=false (init refused, the engine is switched off for that start) or with OVPN_BAN_ENABLED=false, and
+// teardown used to empty the list. The next start with true compared the damaged history with an empty list, found nothing missing and came up
+// healthy: the lost permanent bans were gone. The tests below run the real script on the rig with the very calls configure.sh makes.
+
+// banChainsGone: no ban chain and no jump to one is left in either family's firewall.
+func banChainsGone(r *banRig) bool {
+	return !strings.Contains(r.read("fw/rules4")+r.read("fw/rules6"), "OVPN_BAN")
+}
+
+// listPermRows counts the permanent rows (expires_at 0) of the ban list.
+func listPermRows(list string) int {
+	n := 0
+	for _, l := range strings.Split(list, "\n") {
+		if f := strings.Split(l, "	"); len(f) == 5 && f[2] == "0" {
+			n++
+		}
+	}
+	return n
+}
+
+func TestBanGateRefusedStartThenEngineOffKeepsTheList(t *testing.T) {
+	t.Parallel()
+	for _, dmg := range []string{"emptied", "cut at the first row end"} {
+		for _, mid := range []string{
+			"start with OVPN_BAN_REQUIRED=false: init refused, then teardown",
+			"start with OVPN_BAN_ENABLED=false: init refused, then teardown",
+			"teardown alone after the refusal",
+			"teardown twice (a restart loop)",
+		} {
+			dmg, mid := dmg, mid
+			t.Run(dmg+"/"+mid, func(t *testing.T) {
+				t.Parallel()
+				r, hist, list := listRig(t)
+				damaged := ""
+				if dmg != "emptied" {
+					damaged = hist[:strings.Index(hist, "\n")+1]
+				}
+				r.write("audit/bans-history.tsv", damaged)
+				// start 1, OVPN_BAN_REQUIRED=true: refused, the list is as it was
+				if out, code := r.run(nil, "init"); code == 0 {
+					t.Fatalf("start 1: the damaged history was accepted: %s", out)
+				}
+				if got := r.read("audit/bans.tsv"); got != list {
+					t.Fatalf("start 1: the refused start changed the list: %q", got)
+				}
+				// start 2, the engine off (configure.sh: init fails, BAN_ENABLED=false, teardown; or ENABLED=false: init, teardown)
+				switch {
+				case strings.HasPrefix(mid, "start with"):
+					if _, code := r.run(nil, "init"); code == 0 {
+						t.Fatalf("start 2: the damaged history was accepted by init")
+					}
+					if out, code := r.run(nil, "teardown"); code != 0 {
+						t.Fatalf("start 2: teardown exit %d: %s", code, out)
+					}
+				case mid == "teardown alone after the refusal":
+					if out, code := r.run(nil, "teardown"); code != 0 {
+						t.Fatalf("teardown exit %d: %s", code, out)
+					}
+				default:
+					for i := 0; i < 2; i++ {
+						if out, code := r.run(nil, "teardown"); code != 0 {
+							t.Fatalf("teardown %d: exit %d: %s", i+1, code, out)
+						}
+					}
+				}
+				if got := r.read("audit/bans.tsv"); got != list || listPermRows(got) != 3 {
+					t.Errorf("teardown after a refusal emptied the ban list: %q (before: %q)", got, list)
+				}
+				if r.read("audit/bans-history.tsv") != damaged {
+					t.Errorf("teardown changed the history")
+				}
+				// teardown still does its own work: no chain, no jump, no rule
+				if !banChainsGone(r) {
+					t.Errorf("a ban chain or a jump is left after teardown: %v %v", r.read("fw/rules4"), r.read("fw/rules6"))
+				}
+				// start 3, OVPN_BAN_REQUIRED=true again: refused, naming both files
+				out, code := r.run(nil, "init")
+				if code == 0 {
+					t.Fatalf("start 3: the damaged history was accepted after the engine was off for one start: %s", out)
+				}
+				for _, want := range []string{filepath.Join(r.dir, "audit", "bans.tsv"), filepath.Join(r.dir, "audit", "bans-history.tsv")} {
+					if !strings.Contains(out, want) {
+						t.Errorf("start 3: the refusal does not name %s: %s", want, out)
+					}
+				}
+				if len(r.rules("4"))+len(r.rules("6")) != 0 {
+					t.Errorf("start 3: a DROP rule exists on a refused start: %v %v", r.rules("4"), r.rules("6"))
+				}
+				// the repair the refusal asks for: the history restored. The next start is healthy and every permanent ban is back.
+				r.write("audit/bans-history.tsv", hist)
+				if out, code := r.restart(); code != 0 {
+					t.Fatalf("start after the history was restored: exit %d: %s", code, out)
+				}
+				for _, a := range []string{"8.8.8.8", "1.1.1.1", "2001:db8:1:2::"} {
+					if !strings.Contains(strings.Join(append(r.rules("4"), r.rules("6")...), "|"), a) {
+						t.Errorf("after the repair the permanent ban of %s is not enforced: %v %v", a, r.rules("4"), r.rules("6"))
+					}
+				}
+			})
+		}
+	}
+}
+
+// What teardown did before still happens when the history can vouch for the list: the rows go with the rules (a jail stop, ENABLED=false on a
+// healthy site), and the next start restores every permanent ban from the history. Every explicit operator way to start without the bans still works.
+func TestBanGateTeardownOtherPathsUnchanged(t *testing.T) {
+	t.Parallel()
+	t.Run("a healthy site: teardown empties rows and chains, the history stays, a start restores every ban", func(t *testing.T) {
+		t.Parallel()
+		r, hist, _ := listRig(t)
+		out, code := r.run(nil, "teardown")
+		if code != 0 || strings.Contains(out, "WARNING") {
+			t.Fatalf("teardown: exit %d: %s", code, out)
+		}
+		if got := r.read("audit/bans.tsv"); got != "" {
+			t.Errorf("the ban list of a healthy site is not emptied by teardown: %q", got)
+		}
+		if !banChainsGone(r) {
+			t.Errorf("a ban chain or a jump is left: %v %v", r.read("fw/rules4"), r.read("fw/rules6"))
+		}
+		if r.read("audit/bans-history.tsv") != hist {
+			t.Errorf("teardown changed the history")
+		}
+		if out, code := r.restart(); code != 0 {
+			t.Fatalf("restart after teardown: exit %d: %s", code, out)
+		}
+		if got := r.read("audit/bans.tsv"); listPermRows(got) != 3 {
+			t.Errorf("a start did not restore the three permanent bans: %q", got)
+		}
+	})
+	t.Run("a fresh installation: teardown, then a start", func(t *testing.T) {
+		t.Parallel()
+		r := newBanRig(t)
+		r.must("teardown")
+		if out, code := r.restart(); code != 0 {
+			t.Fatalf("fresh: exit %d: %s", code, out)
+		}
+	})
+	t.Run("an upgraded site: teardown after the migration keeps starting", func(t *testing.T) {
+		t.Parallel()
+		legacyDir := t.TempDir()
+		r := newBanRig(t, "OVPN_BAN_LEGACY_DIR="+legacyDir)
+		r.write("audit/bans.tsv", v0111BanList)
+		r.write("audit/ban-history.tsv", v0111History)
+		if out, code := r.restart(); code != 0 {
+			t.Fatalf("upgrade: exit %d: %s", code, out)
+		}
+		r.must("teardown")
+		if out, code := r.restart(); code != 0 {
+			t.Fatalf("restart after teardown: exit %d: %s", code, out)
+		}
+		if got := listPermRows(r.read("audit/bans.tsv")); got != 3 {
+			t.Errorf("%d permanent rows after the restart, want 3: %q", got, r.read("audit/bans.tsv"))
+		}
+	})
+	t.Run("the operator's deliberate ways out still work after a refusal", func(t *testing.T) {
+		t.Parallel()
+		// 1. the flush command empties the list on purpose (the history is damaged on purpose too: the operator accepts the loss)
+		r, hist, _ := listRig(t)
+		r.write("audit/bans-history.tsv", "")
+		if _, code := r.run(nil, "init"); code == 0 {
+			t.Fatalf("the emptied history was accepted")
+		}
+		r.must("teardown")
+		if listPermRows(r.read("audit/bans.tsv")) != 3 {
+			t.Fatalf("the list did not survive the refusal and teardown: %q", r.read("audit/bans.tsv"))
+		}
+		r.must("flush")
+		if got := r.read("audit/bans.tsv"); got != "" {
+			t.Errorf("flush did not empty the ban list: %q", got)
+		}
+		if out, code := r.restart(); code != 0 {
+			t.Errorf("the start after an explicit flush: exit %d: %s", code, out)
+		}
+		// 2. both files moved away: a fresh start
+		r2, _, _ := listRig(t)
+		r2.write("audit/bans-history.tsv", hist[:strings.Index(hist, "\n")+1])
+		r2.must("teardown")
+		for _, f := range []string{"audit/bans.tsv", "audit/bans-history.tsv"} {
+			if err := os.Remove(filepath.Join(r2.dir, f)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if out, code := r2.restart(); code != 0 {
+			t.Errorf("the start with both files moved away: exit %d: %s", code, out)
+		}
+		// 3. a damaged ban list is not wiped by teardown either (its permanent bans are unknown)
+		r3, _, list := listRig(t)
+		r3.write("audit/bans.tsv", "no ban row\n")
+		r3.must("teardown")
+		if r3.read("audit/bans.tsv") != "no ban row\n" {
+			t.Errorf("teardown rewrote a ban list it cannot read: %q (was %q)", r3.read("audit/bans.tsv"), list)
+		}
+	})
+}
