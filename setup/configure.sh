@@ -565,6 +565,41 @@ EOF
   fail2ban-client status ovpn-admin >/dev/null 2>&1 || return 1
 }
 
+# ban_check_wait: the readiness check of the ban engine, repeated for a bounded time. start_fail2ban returns as soon as the jail answers
+# "status", which is BEFORE the jail start action (actionstart: teardown, then setup) has finished, and "ovpn-ban.sh check" reads the chains
+# and the INPUT jumps once, without the state lock. Read between the teardown and the setup of that action it finds the jumps gone and a
+# healthy site refuses its own start (QA W1 item 5: 3 of 81 healthy starts). So a failed check is repeated every half second until
+# BAN_CHECK_WAIT seconds have passed since the first read, and only the answer of the LAST attempt counts: a site whose chains never come back
+# is refused exactly as before, with the exit status of the check (3 = required IPv6 enforcement missing), after at most BAN_CHECK_WAIT
+# seconds plus the last attempt. The wait is visible in the log: the first failure, then one line every two seconds, and a line for a pass that
+# needed more than one attempt.
+BAN_CHECK_WAIT=10
+ban_check_wait() {
+  local start="${SECONDS}" out rc n=0
+  while :; do
+    n=$((n + 1))
+    rc=0
+    out="$("${BAN_TOOL}" check 2>&1)" || rc=$?
+    if [ "${rc}" -eq 0 ]; then
+      if [ "${n}" -gt 1 ]; then
+        echo "ovpn-ban: readiness passed on attempt ${n} after $((SECONDS - start))s: the jail start action was still running when the chains were first read" >&2
+      fi
+      printf '%s\n' "${out}"
+      return 0
+    fi
+    if [ $((SECONDS - start)) -ge "${BAN_CHECK_WAIT}" ]; then
+      printf '%s\n' "${out}" >&2
+      echo "ovpn-ban: readiness still failing after ${n} attempts over $((SECONDS - start))s (exit ${rc}); refusing" >&2
+      return "${rc}"
+    fi
+    # the first failure and then every fourth attempt (about every two seconds) are logged: visible, not a wall of text
+    if [ "${n}" -eq 1 ] || [ $((n % 4)) -eq 0 ]; then
+      echo "ovpn-ban: readiness attempt ${n} failed (exit ${rc}); the jail start action may still be running, trying again (limit ${BAN_CHECK_WAIT}s). Answer: $(printf '%s' "${out}" | head -n 1)" >&2
+    fi
+    sleep 0.5
+  done
+}
+
 if [ "${BAN_ENABLED}" = "true" ]; then
   # fail closed on IPv6 (before fail2ban): with IPv6 on and OVPN_BAN_IPV6_REQUIRED not false, an IPv6 ban chain that cannot be
   # created stops the container (ovpn-ban.sh exit 3), whatever OVPN_BAN_REQUIRED says. Other setup failures (IPv4) go through
@@ -579,7 +614,7 @@ if [ "${BAN_ENABLED}" = "true" ]; then
       exit 1
     fi
   fi
-  if start_fail2ban && "${BAN_TOOL}" check; then
+  if start_fail2ban && ban_check_wait; then
     echo "fail2ban: jail ovpn-admin running (maxretry=${BAN_MAXRETRY} findtime=${BAN_FINDTIME}s jail-bantime=${BAN_JAIL_BANTIME}s escalation=\"${BAN_ESCALATION:-default 10m,1h,24h,0}\" decay-days=${BAN_DECAY_DAYS} ipv6-prefix=/${BAN_IPV6_PREFIX} max-entries=${BAN_MAX_ENTRIES})"
     # after the jail start (its start action rebuilt the chains and restored the permanent bans), before OpenVPN. The watcher is what lifts
     # a 1 h or 24 h ban when it runs out (nothing in the kernel does): a start that fails is a loud error, a watcher that dies is

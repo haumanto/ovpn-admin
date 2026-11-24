@@ -2447,12 +2447,16 @@ cmd_flush() {
 # accepted init and the explicit flush command still empty the list. The gates are only read here and speak on stderr.
 txn_teardown() {
   local fam rc=0 keep=0
+  # The two gates read the files of the permanent bans (a python call each) and run FIRST, with the jumps still in place: the jail start action
+  # is teardown, then setup, and the readiness check of configure.sh looks at the jumps while that action runs. Run after drop_jumps, the gates
+  # kept the jumps away for seconds (median 1.2 s against 0.4 s, QA W1 item 5). The caller holds the lock, so nothing changes the files between
+  # the gates and the rows being cleared below.
+  hist_gate || keep=1
+  [ "$keep" -ne 0 ] || list_gate || keep=1
   for fam in 4 6; do
     drop_jumps "$fam" || rc=1
   done
   flush_chains || rc=1
-  hist_gate || keep=1
-  [ "$keep" -ne 0 ] || list_gate || keep=1
   if [ "$keep" -eq 0 ]; then
     do_clear_rows || rc=1
   else
