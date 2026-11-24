@@ -4,6 +4,8 @@ import "database/sql"
 
 type OpenvpnUser struct {
 	Database *sql.DB
+	// SpoolDir is where a login that may not write the database leaves its re-hash (see rehash_spool.go); "" = none.
+	SpoolDir string
 }
 
 type Migration struct {

@@ -47,6 +47,9 @@ func (oUser *OpenvpnUser) rehashAfterLogin(username, storedHash, password string
 	if err != nil || cost >= bcryptCost {
 		return
 	}
+	if oUser.spoolHas(username, storedHash) {
+		return // the entry of an earlier login is waiting for the applier: no second hash, no second entry
+	}
 	newHash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
 	if err != nil {
 		fmt.Fprintf(rehashLog, "openvpn-user: warning: the password hash of %q was not re-made at cost %d: %v\n", username, bcryptCost, err)
@@ -54,7 +57,11 @@ func (oUser *OpenvpnUser) rehashAfterLogin(username, storedHash, password string
 	}
 	res, err := oUser.Database.Exec("UPDATE users SET password = ? WHERE username = ? AND CAST(password AS TEXT) = ?", string(newHash), username, storedHash)
 	if err != nil {
-		fmt.Fprintf(rehashLog, "openvpn-user: warning: the password hash of %q was not re-made at cost %d: %v\n", username, bcryptCost, err)
+		// this user may not write users.db (the login hook runs as nobody): the root-side applier stores the new hash,
+		// see rehash_spool.go. The login succeeds either way.
+		if serr := oUser.spoolRehash(username, storedHash, string(newHash)); serr != nil {
+			warnSpoolOnce(username, err, serr)
+		}
 		return
 	}
 	if n, err := res.RowsAffected(); err != nil || n != 1 {

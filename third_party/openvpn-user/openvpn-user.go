@@ -64,6 +64,10 @@ var (
 
 	getSecretCommand         = kingpin.Command("get-secret", "get OTP secret")
 	getSecretCommandUserFlag = getSecretCommand.Flag("user", "Username.").Short('u').Required().String()
+
+	// LOCAL PATCH (ovpn-admin), fourth modification: the re-hash spool, see src/rehash_spool.go. Run as the user that may write the database.
+	rehashApplyCommand          = kingpin.Command("rehash-apply", "Store the password hashes that logins of a user who cannot write the database left in the spool directory.")
+	rehashApplyCommandSpoolFlag = rehashApplyCommand.Flag("spool", "Spool directory, default <db.path>.rehash.").String()
 )
 
 func main() {
@@ -81,7 +85,7 @@ func main() {
 		}
 	}(db)
 
-	openvpnUser := src.OpenvpnUser{Database: db}
+	openvpnUser := src.OpenvpnUser{Database: db, SpoolDir: src.SpoolDirFor(*dbPath)}
 
 	kingpin.Version(version).VersionFlag.Short('v')
 
@@ -140,6 +144,15 @@ func main() {
 	case getSecretCommand.FullCommand():
 		wrap(openvpnUser.GetUserOtpSecret(*getSecretCommandUserFlag))
 
+	case rehashApplyCommand.FullCommand():
+		if *rehashApplyCommandSpoolFlag != "" {
+			openvpnUser.SpoolDir = *rehashApplyCommandSpoolFlag
+		}
+		results, err := openvpnUser.ApplySpool()
+		src.PrintSpoolResults(os.Stdout, results)
+		if err != nil {
+			kingpin.Fatalf(err.Error())
+		}
 	case dbInitCommand.FullCommand():
 		openvpnUser.InitDb()
 	case dbMigrateCommand.FullCommand():

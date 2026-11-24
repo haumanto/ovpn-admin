@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -60,6 +61,7 @@ func captureRehashLog(t *testing.T) *bytes.Buffer {
 	var buf bytes.Buffer
 	old := rehashLog
 	rehashLog = &buf
+	spoolWarnOnce = sync.Once{} // the warning is once per process, a test is a new process
 	t.Cleanup(func() { rehashLog = old })
 	return &buf
 }

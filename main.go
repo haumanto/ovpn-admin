@@ -689,6 +689,7 @@ func main() {
 	if *authByPassword {
 		if *storageBackend != "kubernetes.secrets" {
 			ovpnAdmin.modules = append(ovpnAdmin.modules, "passwdAuth")
+			startRehashSpoolApplier() // stores the re-hashes the login hook (user nobody, cannot write users.db) spooled
 		} else {
 			log.Fatal("Right now the keys `--storage.backend=kubernetes.secret` and `--auth.password` are not working together. Please use only one of them ")
 		}
