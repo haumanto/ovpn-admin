@@ -142,6 +142,22 @@ services:
       OVPN_STATE_DIR: "/var/lib/ovpn-admin"
       # trace, debug, info, warn or error; debug logs every request path and is not for a normal run
       LOG_LEVEL: "${LOG_LEVEL:-info}"
+      # Telegram settings of the panel (certificate expiry notices, including the server certificate). Same variables and defaults as
+      # the openvpn service above, which uses them for ban alerts: one set of values in the environment or the env file feeds both.
+      # The panel is a separate container, so the notices stay off until these reach this service. See the openvpn service for the
+      # full description of each variable. If you use OVPN_TELEGRAM_BOT_TOKEN_FILE, mount the same read-only token file under this
+      # service too (volumes: - /path/on/host/telegram-bot-token:/run/secrets/telegram-bot-token:ro); the mount of the openvpn
+      # service is not visible here.
+      OVPN_TELEGRAM_ENABLED: "${OVPN_TELEGRAM_ENABLED:-false}"
+      OVPN_TELEGRAM_BOT_TOKEN: "${OVPN_TELEGRAM_BOT_TOKEN:-}"
+      OVPN_TELEGRAM_BOT_TOKEN_FILE: "${OVPN_TELEGRAM_BOT_TOKEN_FILE:-}"
+      OVPN_TELEGRAM_CHAT_ID: "${OVPN_TELEGRAM_CHAT_ID:-}"
+      OVPN_TELEGRAM_THREAD_ID: "${OVPN_TELEGRAM_THREAD_ID:-}"
+      OVPN_TELEGRAM_API_BASE: "${OVPN_TELEGRAM_API_BASE:-https://api.telegram.org}"
+      OVPN_TELEGRAM_ALLOW_HTTP: "${OVPN_TELEGRAM_ALLOW_HTTP:-false}"
+      # true adds the address (and the user name where the audit log knows it) to the messages; v0.1.11 sent neither address nor name.
+      # false leaves them out.
+      OVPN_TELEGRAM_INCLUDE_ADDRESS: "${OVPN_TELEGRAM_INCLUDE_ADDRESS:-true}"
     network_mode: service:openvpn
     volumes:
       - ./easyrsa_master:/mnt/easyrsa
