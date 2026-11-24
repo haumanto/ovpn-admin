@@ -593,8 +593,25 @@ func main() {
 	log.SetLevel(logLevels[*logLevel])
 	log.SetFormatter(logFormats[*logFormat])
 
+	// the refusals come first: nothing (no listener, no scheduler, no state file) starts before they have passed
 	if err := validateBasicAuthConfig(*basicUsername, *basicPassword); err != nil {
 		log.Fatal(err)
+	}
+	if err := validateNoAuthConfig(*basicUsername, *basicPassword, *insecureNoAuth); err != nil {
+		log.Fatal(err)
+	}
+	authCfg, err := parseAuthConfig(*authMaxFailures, *authFailWindow, *adminAllowCIDR, *adminTrustProxy)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if *basicUsername == "" && *basicPassword == "" {
+		log.Warn("--insecure-no-auth is set: the panel has no authentication and is open to everyone who can reach it")
+	}
+	if len(authCfg.allow) == 0 {
+		log.Warn("--admin.allow-cidr is empty: the panel answers every source address that can reach it")
+		if authCfg.trustProxy {
+			log.Warn("--admin.trust-proxy has no effect for the allowlist while --admin.allow-cidr is empty")
+		}
 	}
 
 	if err := validateSyncTokenConfig(*serverRole, *masterSyncToken); err != nil {
@@ -724,9 +741,19 @@ func main() {
 	})
 
 	log.Printf("Bind: %s", bindURL(*listenHost, *listenPort, *listenBaseUrl))
-	// /ping stays open for health checks; everything else, /metrics included, needs credentials
+	// /ping stays open for health checks; everything else, /metrics included, needs credentials.
+	// Order, outermost first: security headers, source allowlist (403 before anything else), login lock
+	// (429 before the credentials are compared; /ping and the metrics path exempt), Basic Auth.
+	var guard *authGuard
+	if *basicUsername != "" {
+		guard = newAuthGuard(authCfg, authStateDirFromFlags())
+		if err := guard.load(); err != nil {
+			log.Errorf("auth throttle: %v", err)
+		}
+		guard.flush() // proves now that the state can be written; a failure is logged, the counters then live in memory only
+	}
 	handler := securityHeadersMiddleware(
-		basicAuthMiddleware(auditRequiredMiddleware(http.DefaultServeMux), *basicUsername, *basicPassword, *listenBaseUrl+"ping"),
+		buildAuthChain(auditRequiredMiddleware(http.DefaultServeMux), *basicUsername, *basicPassword, guard, authCfg, *listenBaseUrl+"ping", *metricsPath),
 		*listenBaseUrl+"api/")
 	if *basicUsername != "" {
 		log.Info("HTTP Basic Auth is enabled")
@@ -836,11 +863,13 @@ func basicAuthMiddleware(next http.Handler, username, password string, openPaths
 			if r.Header.Get("Authorization") != "" {
 				log.Warnf("auth failed remote=%s path=%s", r.RemoteAddr, r.URL.Path)
 				adminAudit.loginFail(r, gotUser)
+				authAttemptFrom(r).failed(r, gotUser) // the lock counts it (nil for /ping, the metrics path and without the guard)
 			}
 			w.Header().Set("WWW-Authenticate", `Basic realm="ovpn-admin", charset="UTF-8"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+		authAttemptFrom(r).succeeded() // a correct login clears the failure count of the source
 		if err := adminAudit.loginOK(r, gotUser); err != nil && auditRequired() {
 			http.Error(w, `{"status":"error","message":"the login could not be recorded in the audit trail (OVPN_ADMIN_AUDIT_REQUIRED is on)"}`, http.StatusInternalServerError)
 			return
@@ -1303,7 +1332,18 @@ func (oAdmin *OvpnAdmin) userChangePassword(username, password string) (error, s
 // --flag=value: kingpin (used by openvpn-user) does not accept a separate value that
 // starts with "-", e.g. the password "-Secret1".
 func runOpenvpnUser(command string, args ...string) (string, error) {
-	return runCommand("", "", "openvpn-user", append([]string{command, "--db.path=" + *authDatabase}, args...)...)
+	out, err := runCommand("", "", "openvpn-user", append([]string{command, "--db.path=" + *authDatabase}, args...)...)
+	if command == "auth" && err == nil && strings.Contains(out, rehashNoticePrefix) {
+		// the check replaced an old password hash (see AuthUser in the vendored module); the user is the one asked about
+		user := ""
+		for _, a := range args {
+			if v, ok := strings.CutPrefix(a, "--user="); ok {
+				user = v
+			}
+		}
+		auditRehashNotice(user, out)
+	}
+	return out, err
 }
 
 // ovpnUserExistsInDb reports whether the openvpn-user database has a row for username, including

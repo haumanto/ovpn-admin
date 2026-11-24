@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/dgryski/dgoogauth"
 	"golang.org/x/crypto/bcrypt"
+	"io"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -28,8 +29,39 @@ var errPasswordTooLong = fmt.Errorf("password is longer than 72 bytes (bcrypt li
 
 // LOCAL PATCH (ovpn-admin), second modification: upstream hashes with bcrypt.MinCost (4, a few milliseconds, cheap to brute
 // force from a stolen users.db). New and changed passwords use cost 12 (about 250 ms). A hash stores its own cost, so hashes
-// made with the old cost still verify and stay valid until the password is changed; nothing is rehashed.
+// made with the old cost still verify. Since the third modification (rehashAfterLogin) a successful password login
+// replaces a hash below this cost by a cost 12 one.
 const bcryptCost = 12
+
+// LOCAL PATCH (ovpn-admin), third modification: re-hash at login. After a successful bcrypt comparison AuthUser reads
+// the cost of the stored hash; below bcryptCost it makes a cost 12 hash of the password just verified and stores it
+// (UPDATE users SET password = ? WHERE username = ? AND CAST(password AS TEXT) = <the old hash>: a password that was
+// changed meanwhile is never overwritten by the hash of the old one; the CAST is there because change-password stores
+// its hash as a BLOB). A failed update prints one warning on stderr and the login
+// still succeeds. After a stored re-hash one line "openvpn-user: rehash cost <old> -> 12" goes to stderr: the panel
+// turns it into an audit line. The password is never printed.
+var rehashLog io.Writer = os.Stderr
+
+func (oUser *OpenvpnUser) rehashAfterLogin(username, storedHash, password string) {
+	cost, err := bcrypt.Cost([]byte(storedHash))
+	if err != nil || cost >= bcryptCost {
+		return
+	}
+	newHash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
+	if err != nil {
+		fmt.Fprintf(rehashLog, "openvpn-user: warning: the password hash of %q was not re-made at cost %d: %v\n", username, bcryptCost, err)
+		return
+	}
+	res, err := oUser.Database.Exec("UPDATE users SET password = ? WHERE username = ? AND CAST(password AS TEXT) = ?", string(newHash), username, storedHash)
+	if err != nil {
+		fmt.Fprintf(rehashLog, "openvpn-user: warning: the password hash of %q was not re-made at cost %d: %v\n", username, bcryptCost, err)
+		return
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return // the row changed meanwhile (password change): whatever is stored now stays
+	}
+	fmt.Fprintf(rehashLog, "openvpn-user: rehash cost %d -> %d\n", cost, bcryptCost)
+}
 
 func (oUser *OpenvpnUser) CreateUser(username, password string) (string, error) {
 	if len(password) > 72 { // LOCAL PATCH (ovpn-admin): bcrypt limit
@@ -325,6 +357,7 @@ func (oUser *OpenvpnUser) AuthUser(username, password, totp string) (bool, error
 			if err != nil {
 				return false, passwordMismatchedError
 			} else {
+				oUser.rehashAfterLogin(username, u.password, password) // LOCAL PATCH (ovpn-admin), third modification
 				return true, nil
 
 			}
