@@ -61,6 +61,7 @@ for a in "$@"; do
     --db.path=*) db="${a#--db.path=}" ;;
     --user=*) user="${a#--user=}" ;;
     --password=*) pw="${a#--password=}" ;;
+    --password-stdin) IFS= read -r pw ;;
   esac
 done
 [ -f "$db.fail" ] && grep -qx "$cmd" "$db.fail" && { echo "injected failure of $cmd" >&2; exit 1; }
@@ -548,7 +549,7 @@ func TestPasswordInputErrorsAreBadRequests(t *testing.T) {
 
 	// an invalid user name is an input error too
 	rec := postForm(oAdmin.userCreateHandler, "/api/user/create", url.Values{"username": {"bad name!"}, "password": {"Valid-pass-1"}})
-	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "Username can only contains") {
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "Username rule") {
 		t.Errorf("create with a bad user name: %d %q", rec.Code, rec.Body.String())
 	}
 

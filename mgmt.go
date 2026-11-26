@@ -7,6 +7,7 @@ import (
 	"maps"
 	"net"
 	"net/netip"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -435,58 +436,86 @@ func mgmtKillNotFoundReply(username string) string {
 // connected there is the wanted end state, not an error; an interface that cannot be reached, or
 // that refuses the command for another reason, is.
 func (oAdmin *OvpnAdmin) mgmtKillUserConnection(username, serverName string) error {
+	_, err := oAdmin.mgmtKillUserConnectionN(username, serverName)
+	return err
+}
+
+// mgmtKillCountRe finds the number in OpenVPN's answer "SUCCESS: common name 'x' found, 2 client(s) killed".
+var mgmtKillCountRe = regexp.MustCompile(`(\d+) client\(s\) killed`)
+
+// mgmtKillUserConnectionN is mgmtKillUserConnection that also tells how many sessions the server ended (0 for a
+// user that has none there). A SUCCESS answer without a number counts as one session: OpenVPN only says SUCCESS
+// when it found a client.
+func (oAdmin *OvpnAdmin) mgmtKillUserConnectionN(username, serverName string) (int, error) {
 	addr, ok := oAdmin.mgmtInterfaces[serverName]
 	if !ok {
-		return fmt.Errorf("openvpn mgmt interface for %s is not configured", serverName)
+		return 0, fmt.Errorf("openvpn mgmt interface for %s is not configured", serverName)
 	}
 	// "kill" takes a common name or IP:port and splits its argument at blanks: such a name cannot be
 	// told apart from another target, so the command is not sent at all
 	if username == "" || strings.ContainsAny(username, " :\r\n\x09") {
-		return fmt.Errorf("refusing to kill the session of user %q: the name cannot be sent to the management interface", username)
+		return 0, fmt.Errorf("refusing to kill the session of user %q: the name cannot be sent to the management interface", username)
 	}
 
 	out, err := mgmtCommand(addr, "kill "+username, isMgmtResult)
 	if err != nil {
-		return fmt.Errorf("openvpn mgmt interface for %s is not reachable by addr %s: %w", serverName, addr, err)
+		return 0, fmt.Errorf("openvpn mgmt interface for %s is not reachable by addr %s: %w", serverName, addr, err)
 	}
 	result := strings.TrimSpace(out)
 	if i := strings.LastIndex(result, "\n"); i >= 0 {
 		result = result[i+1:]
 	}
+	killed := 0
 	switch {
 	case strings.HasPrefix(result, "SUCCESS:"):
+		killed = 1
+		if m := mgmtKillCountRe.FindStringSubmatch(result); m != nil {
+			if n, err := strconv.Atoi(m[1]); err == nil {
+				killed = n
+			}
+		}
 		log.Infof("Session for user \"%s\" killed on %s: %s", username, serverName, result)
 	case result == mgmtKillNotFoundReply(username):
 		// the user has no session on this server: the wanted end state. Only OpenVPN's own reply for
 		// exactly this name counts; any other ERROR (a refused command, another name) is a failure
 		log.Debugf("mgmt kill %s on %s: %s", username, serverName, result)
 	default:
-		return fmt.Errorf("openvpn mgmt interface for %s did not kill the session of %q: %s", serverName, username, result)
+		return 0, fmt.Errorf("openvpn mgmt interface for %s did not kill the session of %q: %s", serverName, username, result)
 	}
-	return nil
+	return killed, nil
 }
 
 // mgmtKillUser ends every session of username on every configured management interface, whether or
 // not the panel has seen the session (its list of active clients is up to 28 s old). All interfaces
 // are tried; the error lists the ones that failed.
 func (oAdmin *OvpnAdmin) mgmtKillUser(username string) error {
+	_, err := oAdmin.mgmtKillUserCounted(username)
+	return err
+}
+
+// mgmtKillUserCounted is mgmtKillUser that also returns how many sessions the servers ended in total (the
+// sessions of the interfaces that did answer, also when another one failed).
+func (oAdmin *OvpnAdmin) mgmtKillUserCounted(username string) (int, error) {
 	if len(oAdmin.mgmtInterfaces) == 0 {
 		// nothing was asked of any server: that is not "no session", the sessions may be alive
 		err := fmt.Errorf("no openvpn mgmt interface is configured, the sessions of user %q cannot be killed", username)
 		log.Errorf("mgmtKillUser: %v", err)
-		return err
+		return 0, err
 	}
 	var failed []string
+	total := 0
 	for _, srv := range slices.Sorted(maps.Keys(oAdmin.mgmtInterfaces)) {
-		if err := oAdmin.mgmtKillUserConnection(username, srv); err != nil {
+		n, err := oAdmin.mgmtKillUserConnectionN(username, srv)
+		total += n
+		if err != nil {
 			log.Errorf("mgmtKillUser: %v", err)
 			failed = append(failed, err.Error())
 		}
 	}
 	if len(failed) > 0 {
-		return errors.New(strings.Join(failed, "; "))
+		return total, errors.New(strings.Join(failed, "; "))
 	}
-	return nil
+	return total, nil
 }
 
 // parseMgmtVersion extracts "2.6.12" from the output of the "version" command.

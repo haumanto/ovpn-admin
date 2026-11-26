@@ -224,7 +224,7 @@ func TestArchiveRefusesWithoutAUsableCaKeyIdentity(t *testing.T) {
 			oAdmin.role = "master"
 			oAdmin.masterSyncToken = "a-sync-token-for-the-test"
 			rec := httptest.NewRecorder()
-			oAdmin.downloadCertsHandler(rec, httptest.NewRequest("GET", "/api/data/certs/download?token=a-sync-token-for-the-test", nil))
+			oAdmin.downloadCertsHandler(rec, loopbackGet("/api/data/certs/download?token=a-sync-token-for-the-test"))
 			if rec.Code != http.StatusInternalServerError {
 				t.Errorf("the sync endpoint answered %d, want 500", rec.Code)
 			}

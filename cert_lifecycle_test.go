@@ -805,6 +805,7 @@ func TestCertsExpiryWithoutAdminCredentialsConfiguredIsForbidden(t *testing.T) {
 
 const wrapperScript = `#!/bin/sh
 # runs the real easy-rsa; the switch files in the working directory make a command fail
+[ -n "$EASYRSA_ARGV_LOG" ] && printf '%s\n' "$*" >> "$EASYRSA_ARGV_LOG"
 for a in "$@"; do
   case "$a" in
     build-client-full|build-server-full)
@@ -1164,14 +1165,14 @@ func TestRenewInputErrorsAreBadRequests(t *testing.T) {
 	before := pkiState(t, dir)
 	for name, tc := range map[string]struct{ user, grace, want string }{
 		"unknown user": {"nobody", "", "not found"},
-		"empty user":   {"", "", "not found"},
-		"path user":    {"../x", "", "not found"},
+		"empty user":   {"", "", "Username rule"},
+		"path user":    {"../x", "", "Username rule"},
 		"negative":     {"alice", "-1", "grace_hours"},
 		"too long":     {"alice", "721", "grace_hours"},
 		"text":         {"alice", "abc", "grace_hours"},
 		"fraction":     {"alice", "1.5", "grace_hours"},
 		"plus sign":    {"alice", "+5", "grace_hours"},
-		"server name":  {"server", "", "not found"},
+		"server name":  {"server", "", "Username rule"},
 	} {
 		rec := renew(oAdmin, tc.user, tc.grace)
 		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), tc.want) {

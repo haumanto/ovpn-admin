@@ -108,14 +108,14 @@ func parseRehashApplyOutput(out string) (applied, dropped []rehashLine, other []
 		if m := rehashAppliedRe.FindStringSubmatch(line); m != nil {
 			u, err := strconv.Unquote(m[1])
 			c, cerr := strconv.Atoi(m[2])
-			if err == nil && cerr == nil && validateUsername(u) == nil {
+			if err == nil && cerr == nil && validateLegacyUsername(u) == nil {
 				applied = append(applied, rehashLine{user: u, oldCost: c})
 				continue
 			}
 		}
 		if m := rehashDroppedRe.FindStringSubmatch(line); m != nil {
 			u, err := strconv.Unquote(m[1])
-			if err == nil && (u == "?" || validateUsername(u) == nil) {
+			if err == nil && (u == "?" || validateLegacyUsername(u) == nil) {
 				dropped = append(dropped, rehashLine{user: u, dropped: m[2]})
 				continue
 			}

@@ -857,6 +857,9 @@ func (oAdmin *OvpnAdmin) userRenew(username string, graceHours int) (renewResult
 	if *storageBackend == "kubernetes.secrets" {
 		return renewResult{}, inputError{k8sRenewUnsupported}
 	}
+	if err := validateUsername(username); err != nil {
+		return renewResult{}, err
+	}
 	oAdmin.createUserMutex.Lock()
 	defer oAdmin.createUserMutex.Unlock()
 	res, err := oAdmin.userRenewLocked(username, graceHours)
@@ -952,7 +955,7 @@ func (oAdmin *OvpnAdmin) userRenewLocked(username string, graceHours int) (res r
 
 	// 1. the new certificate, under a temporary base, the old files untouched
 	tx.removeOnRollback(tmp.all()...)
-	_, buildErr := runCommand(*easyrsaDirPath, "", *easyrsaBinPath, "--batch", "--req-cn="+username, "build-client-full", username+certTmpSuffix, "nopass")
+	_, buildErr := runCommand(*easyrsaDirPath, "", *easyrsaBinPath, "--batch", easyrsaDaysArg(), "--req-cn="+username, "build-client-full", username+certTmpSuffix, "nopass")
 	// whatever easy-rsa left behind, even when it failed after it signed: the entry in index.txt goes with the
 	// snapshot, the copy in certs_by_serial is removed here
 	if c, rerr := readCertFile(tmp.crt); rerr == nil {
@@ -1069,9 +1072,9 @@ func (oAdmin *OvpnAdmin) userRenewLocked(username string, graceHours int) (res r
 	res.OldSerial, res.NewSerial, res.GraceEndsAt = oldSerial, newSerial, graceEnds
 	res.RevokedAtOnce = graceHours == 0
 	if res.RevokedAtOnce {
-		res.Message = fmt.Sprintf("Certificate of user %q renewed (new serial %s, valid until %s): the old certificate was revoked at once", username, newSerial, newCert.NotAfter.UTC().Format(time.RFC3339))
+		res.Message = fmt.Sprintf("Certificate of user %q renewed (new serial %s, valid until %s, lifetime %d days): the old certificate was revoked at once", username, newSerial, newCert.NotAfter.UTC().Format(time.RFC3339), effectiveCertDays())
 	} else {
-		res.Message = fmt.Sprintf("Certificate of user %q renewed (new serial %s, valid until %s): the old certificate stays valid until %s", username, newSerial, newCert.NotAfter.UTC().Format(time.RFC3339), graceEnds.Format(time.RFC3339))
+		res.Message = fmt.Sprintf("Certificate of user %q renewed (new serial %s, valid until %s, lifetime %d days): the old certificate stays valid until %s", username, newSerial, newCert.NotAfter.UTC().Format(time.RFC3339), effectiveCertDays(), graceEnds.Format(time.RFC3339))
 	}
 	if res.SupersededSerial != "" {
 		res.Message += fmt.Sprintf(". The certificate of the earlier renewal (serial %s) was revoked at once", res.SupersededSerial)
@@ -1347,7 +1350,7 @@ func (oAdmin *OvpnAdmin) serverRenewLocked() (res serverRenewResult, retErr erro
 
 	// 2. the new certificate, same common name, verified
 	tx.removeOnRollback(tmp.all()...)
-	_, buildErr := runCommand(*easyrsaDirPath, "", *easyrsaBinPath, "--batch", "--req-cn="+serverCertName, "build-server-full", serverCertName+certTmpSuffix, "nopass")
+	_, buildErr := runCommand(*easyrsaDirPath, "", *easyrsaBinPath, "--batch", easyrsaDaysArg(), "--req-cn="+serverCertName, "build-server-full", serverCertName+certTmpSuffix, "nopass")
 	if c, rerr := readCertFile(tmp.crt); rerr == nil {
 		tx.removeOnRollback(pkiFile("certs_by_serial", normSerialFile(serialHex(c))+".pem"))
 	}
@@ -1401,7 +1404,7 @@ func (oAdmin *OvpnAdmin) serverRenewLocked() (res serverRenewResult, retErr erro
 		setCertGauges(certs, now)
 	}
 	res.PreviousSerial, res.NewSerial = oldSerial, newSerial
-	res.Message = fmt.Sprintf("A new server certificate (serial %s, valid until %s) is installed on disk. OpenVPN still serves the previous certificate (serial %s, valid until %s) and keeps serving it until the openvpn container is restarted: restart it in a window, check that clients connect, then confirm. The previous certificate stays valid until you confirm", newSerial, newCert.NotAfter.UTC().Format(time.RFC3339), oldSerial, oldCert.NotAfter.UTC().Format(time.RFC3339))
+	res.Message = fmt.Sprintf("A new server certificate (serial %s, valid until %s, lifetime %d days) is installed on disk. OpenVPN still serves the previous certificate (serial %s, valid until %s) and keeps serving it until the openvpn container is restarted: restart it in a window, check that clients connect, then confirm. The previous certificate stays valid until you confirm", newSerial, newCert.NotAfter.UTC().Format(time.RFC3339), effectiveCertDays(), oldSerial, oldCert.NotAfter.UTC().Format(time.RFC3339))
 	log.Infof("Server certificate renewed on disk: previous serial %s, new serial %s; restart of openvpn pending", oldSerial, newSerial)
 	return res, nil
 }
@@ -1952,7 +1955,7 @@ func (oAdmin *OvpnAdmin) userRenewHandler(w http.ResponseWriter, r *http.Request
 			fmt.Sprintf("name=%s oldSerial=%s newSerial=%s graceEndsAt=%s earlier superseded certificate revoked at once", username, res.SupersededSerial, res.NewSerial, res.GraceEndsAt.Format(time.RFC3339)))
 	}
 	adminAudit.fromRequest(r, auditActUserRenew, username, true,
-		fmt.Sprintf("name=%s oldSerial=%s newSerial=%s graceEndsAt=%s", username, res.OldSerial, res.NewSerial, res.GraceEndsAt.Format(time.RFC3339)))
+		fmt.Sprintf("name=%s oldSerial=%s newSerial=%s graceEndsAt=%s%s", username, res.OldSerial, res.NewSerial, res.GraceEndsAt.Format(time.RFC3339), issuedLifetimeNote()))
 	certJSON(w, http.StatusOK, map[string]string{"status": "ok", "message": res.Message})
 }
 
@@ -1975,7 +1978,7 @@ func (oAdmin *OvpnAdmin) serverRenewHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	adminAudit.fromRequest(r, auditActServerRenew, serverCertName, true,
-		fmt.Sprintf("previousSerial=%s newSerial=%s restart of openvpn pending", res.PreviousSerial, res.NewSerial))
+		fmt.Sprintf("previousSerial=%s newSerial=%s%s restart of openvpn pending", res.PreviousSerial, res.NewSerial, issuedLifetimeNote()))
 	certJSON(w, http.StatusOK, map[string]any{"status": "ok", "restartRequired": true, "message": res.Message})
 }
 

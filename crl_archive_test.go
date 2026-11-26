@@ -211,7 +211,7 @@ func TestDownloadCertsHandlerLeavesNoTempFile(t *testing.T) {
 	t.Setenv("TMPDIR", tmp)
 
 	rec := httptest.NewRecorder()
-	oAdmin.downloadCertsHandler(rec, httptest.NewRequest("GET", "/api/data/certs/download?token=a-sync-token-for-the-test", nil))
+	oAdmin.downloadCertsHandler(rec, loopbackGet("/api/data/certs/download?token=a-sync-token-for-the-test"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
 	}
@@ -227,7 +227,7 @@ func TestDownloadCertsHandlerLeavesNoTempFile(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	oAdmin.downloadCertsHandler(rec, httptest.NewRequest("GET", "/api/data/certs/download?token=wrong", nil))
+	oAdmin.downloadCertsHandler(rec, loopbackGet("/api/data/certs/download?token=wrong"))
 	if rec.Code != http.StatusForbidden {
 		t.Errorf("wrong token: status %d, want 403", rec.Code)
 	}
@@ -249,7 +249,7 @@ func TestDownloadCertsHandlerConcurrent(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		go func() {
 			rec := httptest.NewRecorder()
-			oAdmin.downloadCertsHandler(rec, httptest.NewRequest("GET", "/x?token=a-sync-token-for-the-test", nil))
+			oAdmin.downloadCertsHandler(rec, loopbackGet("/x?token=a-sync-token-for-the-test"))
 			done <- rec
 		}()
 	}

@@ -22,7 +22,6 @@ import (
 	"os"
 	"os/exec"
 	"path"
-	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -50,7 +49,6 @@ var staticFiles embed.FS
 var templateFiles embed.FS
 
 const (
-	usernameRegexp         = `^([a-zA-Z0-9_.\-@])+$`
 	passwordMinLength      = 12
 	passwordMaxBytes       = 72 // bcrypt hashes at most 72 bytes; golang.org/x/crypto >= 0.5 returns an error above that
 	certsArchiveFileName   = "certs.tar.gz"
@@ -295,7 +293,7 @@ func (oAdmin *OvpnAdmin) userCreateHandler(w http.ResponseWriter, r *http.Reques
 	_ = r.ParseForm()
 	userCreated, userCreateStatus, status := oAdmin.userCreateStatus(r.FormValue("username"), r.FormValue("password"))
 	adminAudit.fromRequest(r, auditActUserCreate, r.FormValue("username"), userCreated,
-		auditDetail(userCreated, "client certificate issued", userCreateStatus), r.FormValue("password"))
+		auditDetail(userCreated, "client certificate issued"+issuedLifetimeNote(), userCreateStatus), r.FormValue("password"))
 
 	if userCreated {
 		oAdmin.clients = oAdmin.usersList()
@@ -432,20 +430,6 @@ func (oAdmin *OvpnAdmin) userShowConfigHandler(w http.ResponseWriter, r *http.Re
 	fmt.Fprint(w, conf)
 }
 
-func (oAdmin *OvpnAdmin) userDisconnectHandler(w http.ResponseWriter, r *http.Request) {
-	log.Info(r.RemoteAddr, " ", r.URL.Path)
-	if !requireSameOriginPost(w, r) {
-		return
-	}
-	_ = r.ParseForm()
-	// the handler answers 200 but disconnects nobody (the call is commented out below): the trail says so
-	adminAudit.fromRequest(r, auditActUserDisconnect, r.FormValue("username"), false,
-		"not implemented: the request was answered with HTTP 200 but no session was disconnected")
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	// 	fmt.Fprintf(w, "%s", userDisconnect(r.FormValue("username")))
-	fmt.Fprintf(w, "%s", r.FormValue("username"))
-}
-
 func (oAdmin *OvpnAdmin) userShowCcdHandler(w http.ResponseWriter, r *http.Request) {
 	log.Info(r.RemoteAddr, " ", r.URL.Path)
 	_ = r.ParseForm()
@@ -528,12 +512,7 @@ func (oAdmin *OvpnAdmin) downloadCertsHandler(w http.ResponseWriter, r *http.Req
 		http.Error(w, `{"status":"error"}`, http.StatusBadRequest)
 		return
 	}
-	_ = r.ParseForm()
-	token := r.Form.Get("token")
-
-	if !syncTokenMatches(oAdmin.masterSyncToken, token) {
-		adminAudit.fromRequest(r, auditActSyncExport, certsArchiveFileName, false, "sync token rejected")
-		http.Error(w, `{"status":"error"}`, http.StatusForbidden)
+	if !oAdmin.syncGate(w, r, certsArchiveFileName) {
 		return
 	}
 
@@ -562,12 +541,7 @@ func (oAdmin *OvpnAdmin) downloadCcdHandler(w http.ResponseWriter, r *http.Reque
 		http.Error(w, `{"status":"error"}`, http.StatusBadRequest)
 		return
 	}
-	_ = r.ParseForm()
-	token := r.Form.Get("token")
-
-	if !syncTokenMatches(oAdmin.masterSyncToken, token) {
-		adminAudit.fromRequest(r, auditActSyncExport, ccdArchiveFileName, false, "sync token rejected")
-		http.Error(w, `{"status":"error"}`, http.StatusForbidden)
+	if !oAdmin.syncGate(w, r, ccdArchiveFileName) {
 		return
 	}
 
@@ -617,6 +591,10 @@ func main() {
 	if err := validateSyncTokenConfig(*serverRole, *masterSyncToken); err != nil {
 		log.Fatal(err)
 	}
+	if err := validateCertDays(*certDays); err != nil {
+		log.Fatal(err)
+	}
+	warnSyncTransport(*serverRole, *masterSyncToken, *masterHost, *masterAllowInsecureHTTP)
 
 	if err := initNetworkConfig(); err != nil {
 		log.Fatal(err)
@@ -789,15 +767,6 @@ func validateSyncTokenConfig(role, token string) error {
 		return errors.New("--master.sync-token rejected: it is the built-in default value, set a strong secret")
 	}
 	return nil
-}
-
-// syncTokenMatches fails closed: without a configured token the sync is disabled and no request
-// token is accepted, the empty one included.
-func syncTokenMatches(configured, given string) bool {
-	if strings.TrimSpace(configured) == "" {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(configured), []byte(given)) == 1
 }
 
 // requireSameOriginPost is the first check of every handler that changes state. Other methods
@@ -1078,15 +1047,6 @@ func (oAdmin *OvpnAdmin) renderClientConfigChecked(username string) (string, err
 	return fmt.Sprintf("user \"%s\" not found", username), errors.New("user not found")
 }
 
-func validateUsername(username string) error {
-	var validUsername = regexp.MustCompile(usernameRegexp)
-	if validUsername.MatchString(username) && usernameIsPathSafe(username) {
-		return nil
-	} else {
-		return inputError{fmt.Sprintf("Username can only contains %s and must not be \".\" or \"..\"", usernameRegexp)}
-	}
-}
-
 // inputError is a value of the request that is refused (user name, password): the handlers answer
 // it with HTTP 400 and its message.
 type inputError struct{ msg string }
@@ -1116,6 +1076,9 @@ func usernameIsPathSafe(username string) bool {
 }
 
 func validatePassword(password string) error {
+	if err := checkPasswordIsOneLine(password); err != nil {
+		return err
+	}
 	if utf8.RuneCountInString(password) < passwordMinLength {
 		return inputError{fmt.Sprintf("Password too short, password length must be greater or equal %d", passwordMinLength)}
 	}
@@ -1234,15 +1197,15 @@ func (oAdmin *OvpnAdmin) userCreateStatus(username, password string) (bool, stri
 	oAdmin.createUserMutex.Lock()
 	defer oAdmin.createUserMutex.Unlock()
 
+	if err := validateUsername(username); err != nil {
+		log.Debugf("userCreate: validateUsername(): %s", err.Error())
+		return false, err.Error(), http.StatusBadRequest
+	}
+
 	if checkCommonNameExist(username) {
 		ucErr = fmt.Sprintf("User \"%s\" already exists\n", username)
 		log.Debugf("userCreate: checkCommonNameExist():  %s", ucErr)
 		return false, ucErr, http.StatusBadRequest
-	}
-
-	if err := validateUsername(username); err != nil {
-		log.Debugf("userCreate: validateUsername(): %s", err.Error())
-		return false, err.Error(), http.StatusBadRequest
 	}
 
 	if *authByPassword {
@@ -1257,7 +1220,7 @@ func (oAdmin *OvpnAdmin) userCreateStatus(username, password string) (bool, stri
 	if *authByPassword {
 		// openvpn-user exits with 0 even when the INSERT fails (e.g. a database that was not migrated),
 		// so the row is checked afterwards
-		if _, err := runOpenvpnUser("create", "--user="+username, "--password="+password); err != nil || !ovpnUserExistsInDb(username) {
+		if _, err := runOpenvpnUserPassword("create", password, "--user="+username); err != nil || !ovpnUserExistsInDb(username) {
 			log.Errorf("userCreate: saving the password of user %s failed: %v", username, err)
 			return false, fmt.Sprintf("Failed to save the password of user \"%s\"", username), http.StatusUnprocessableEntity
 		}
@@ -1278,7 +1241,7 @@ func (oAdmin *OvpnAdmin) userCreateStatus(username, password string) (bool, stri
 			return false, err.Error(), http.StatusUnprocessableEntity
 		}
 	} else {
-		if _, err := runCommand(*easyrsaDirPath, "", *easyrsaBinPath, "--batch", "build-client-full", username, "nopass"); err != nil {
+		if _, err := runCommand(*easyrsaDirPath, "", *easyrsaBinPath, "--batch", easyrsaDaysArg(), "build-client-full", username, "nopass"); err != nil {
 			log.Errorf("userCreate: %v", err)
 			rollbackPassword()
 			return false, fmt.Sprintf("Failed to issue certificate for user \"%s\"", username), http.StatusUnprocessableEntity
@@ -1286,6 +1249,10 @@ func (oAdmin *OvpnAdmin) userCreateStatus(username, password string) (bool, stri
 	}
 
 	log.Infof("Certificate for user %s issued", username)
+	if *storageBackend != "kubernetes.secrets" {
+		// what the admin can see: the lifetime that was asked of easy-rsa
+		ucErr = fmt.Sprintf("User \"%s\" created, certificate valid for %d days", username, effectiveCertDays())
+	}
 
 	//oAdmin.clients = oAdmin.usersList()
 
@@ -1309,13 +1276,13 @@ func (oAdmin *OvpnAdmin) userChangePassword(username, password string) (error, s
 
 		// "change-password" of openvpn-user reports success also for a user without a row in the database
 		if !ovpnUserExistsInDb(username) {
-			if _, err := runOpenvpnUser("create", "--user="+username, "--password="+password); err != nil || !ovpnUserExistsInDb(username) {
+			if _, err := runOpenvpnUserPassword("create", password, "--user="+username); err != nil || !ovpnUserExistsInDb(username) {
 				log.Errorf("userChangePassword: saving the password of user %s failed: %v", username, err)
 				return fmt.Errorf("saving the password of user %q failed", username), "Failed to change password"
 			}
 		}
 
-		if _, err := runOpenvpnUser("change-password", "--user="+username, "--password="+password); err != nil {
+		if _, err := runOpenvpnUserPassword("change-password", password, "--user="+username); err != nil {
 			log.Errorf("userChangePassword: %v", err)
 			return err, "Failed to change password"
 		}
@@ -1333,7 +1300,13 @@ func (oAdmin *OvpnAdmin) userChangePassword(username, password string) (error, s
 // --flag=value: kingpin (used by openvpn-user) does not accept a separate value that
 // starts with "-", e.g. the password "-Secret1".
 func runOpenvpnUser(command string, args ...string) (string, error) {
-	out, err := runCommand("", "", "openvpn-user", append([]string{command, "--db.path=" + *authDatabase}, args...)...)
+	return runOpenvpnUserStdin(command, "", args...)
+}
+
+// runOpenvpnUserStdin is runOpenvpnUser with stdin: the password goes there (runOpenvpnUserPassword), never on
+// the command line.
+func runOpenvpnUserStdin(command, stdin string, args ...string) (string, error) {
+	out, err := runCommand("", stdin, "openvpn-user", append([]string{command, "--db.path=" + *authDatabase}, args...)...)
 	if command == "auth" && err == nil && strings.Contains(out, rehashNoticePrefix) {
 		// the check replaced an old password hash (see AuthUser in the vendored module); the user is the one asked about
 		user := ""
@@ -1950,7 +1923,7 @@ func (r *rotation) replacePassword(password string) error {
 		return err
 	}
 	if current := ovpnUserListRow(out, r.username); !current.exists {
-		if _, err := runOpenvpnUser("create", "--user="+r.username, "--password="+password); err != nil {
+		if _, err := runOpenvpnUserPassword("create", password, "--user="+r.username); err != nil {
 			return err
 		}
 	} else {
@@ -1959,7 +1932,7 @@ func (r *rotation) replacePassword(password string) error {
 				return err
 			}
 		}
-		if _, err := runOpenvpnUser("change-password", "--user="+r.username, "--password="+password); err != nil {
+		if _, err := runOpenvpnUserPassword("change-password", password, "--user="+r.username); err != nil {
 			return err
 		}
 	}
@@ -2068,7 +2041,7 @@ func (r *rotation) rollback() error {
 // authenticates nobody), "other" when the row is active and refuses it, and "unknown" when users.db cannot
 // be read or the row needs a second factor, which a password check cannot see through.
 func (r *rotation) passwordNow(password string) string {
-	if _, err := runOpenvpnUser("auth", "--user="+r.username, "--password="+password); err == nil {
+	if _, err := runOpenvpnUserPassword("auth", password, "--user="+r.username); err == nil {
 		return "new"
 	}
 	out, err := runOpenvpnUser("list", "--all")
@@ -2184,7 +2157,7 @@ func (oAdmin *OvpnAdmin) rotateFilesystem(username, newPassword string) (error, 
 	if err := r.retireIndexEntry(); err != nil {
 		return failed(err)
 	}
-	if _, err := runCommand(*easyrsaDirPath, "", *easyrsaBinPath, "--batch", "build-client-full", username, "nopass"); err != nil {
+	if _, err := runCommand(*easyrsaDirPath, "", *easyrsaBinPath, "--batch", easyrsaDaysArg(), "build-client-full", username, "nopass"); err != nil {
 		return failed(err)
 	}
 	if err := r.putNewCertificateFirst(); err != nil {
@@ -2284,7 +2257,7 @@ func (oAdmin *OvpnAdmin) downloadCerts() bool {
 		}
 	}
 
-	err := fDownload(certsArchivePath, *masterHost+*listenBaseUrl+downloadCertsApiUrl+"?token="+oAdmin.masterSyncToken, oAdmin.masterHostBasicAuth)
+	err := fDownload(certsArchivePath, *masterHost+*listenBaseUrl+downloadCertsApiUrl, oAdmin.masterHostBasicAuth, syncRequestHeader(oAdmin.masterSyncToken))
 	if err != nil {
 		log.Error(err)
 		return false
@@ -2301,7 +2274,7 @@ func (oAdmin *OvpnAdmin) downloadCcd() bool {
 		}
 	}
 
-	err := fDownload(ccdArchivePath, *masterHost+*listenBaseUrl+downloadCcdApiUrl+"?token="+oAdmin.masterSyncToken, oAdmin.masterHostBasicAuth)
+	err := fDownload(ccdArchivePath, *masterHost+*listenBaseUrl+downloadCcdApiUrl, oAdmin.masterHostBasicAuth, syncRequestHeader(oAdmin.masterSyncToken))
 	if err != nil {
 		log.Error(err)
 		return false

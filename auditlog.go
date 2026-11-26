@@ -96,7 +96,7 @@ import (
 //
 // What is recorded (and nothing else): user.create, user.delete, user.revoke, user.unrevoke, user.rotate,
 // user.change-password, user.config.download (ok only when the configuration was rendered), user.ccd.apply,
-// user.disconnect (always a failure: the call is not implemented, HTTP 200 notwithstanding), ban.manual,
+// user.disconnect (ok with the number of sessions OpenVPN ended, a failure with the real error otherwise), ban.manual,
 // unban, auth.login.ok (once per user and source per 30 minutes), auth.login.fail (once per source per
 // 10 seconds), pki.crl.rebuild (the scheduled one), sync.export, audit.verify, audit.read (GET
 // /api/audit/admin), and the lines the trail writes about itself: audit.rotate and audit.gap. Not

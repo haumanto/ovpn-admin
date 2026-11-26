@@ -360,7 +360,7 @@ func TestDownloadHandlersFailClosedWithoutSyncToken(t *testing.T) {
 		oAdmin := &OvpnAdmin{role: "master", masterSyncToken: tc.configured}
 		for name, h := range map[string]http.HandlerFunc{"certs": oAdmin.downloadCertsHandler, "ccd": oAdmin.downloadCcdHandler} {
 			rec := httptest.NewRecorder()
-			h(rec, httptest.NewRequest(http.MethodGet, "/api/data/"+name+"/download?token="+tc.given, nil))
+			h(rec, loopbackGet("/api/data/"+name+"/download?token="+tc.given))
 			if rec.Code != http.StatusForbidden {
 				t.Errorf("%s with configured %q, given %q: %d, want 403", name, tc.configured, tc.given, rec.Code)
 			}

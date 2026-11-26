@@ -136,12 +136,12 @@ func TestUsernameIsPathSafe(t *testing.T) {
 }
 
 func TestValidateUsername(t *testing.T) {
-	for _, name := range []string{"alice", "bob_1", "a.b-c@d"} {
+	for _, name := range []string{"alice", "bob_1", "a.b-c_d", "9x"} {
 		if err := validateUsername(name); err != nil {
 			t.Errorf("validateUsername(%q) = %v, want nil", name, err)
 		}
 	}
-	for _, name := range []string{"", ".", "..", "../x", "a/b", "a b", "a\nb", `a\b`} {
+	for _, name := range []string{"", ".", "..", "../x", "a/b", "a b", "a\nb", `a\b`, "a.b-c@d", "_x", "-x", "ca", "server"} {
 		if err := validateUsername(name); err == nil {
 			t.Errorf("validateUsername(%q) = nil, want error", name)
 		}

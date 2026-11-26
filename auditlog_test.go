@@ -829,7 +829,9 @@ func TestAdminAuditOtherActions(t *testing.T) {
 	// sync export with the wrong token must not record the token
 	rec = httptest.NewRecorder()
 	badTok := randomSecret(t, "wrong-")
-	oAdmin.downloadCertsHandler(rec, authedRequest(http.MethodGet, "/api/data/certs/download?token="+badTok, nil, ""))
+	badReq := authedRequest(http.MethodGet, "/api/data/certs/download?token="+badTok, nil, "")
+	badReq.RemoteAddr = "127.0.0.1:40000"
+	oAdmin.downloadCertsHandler(rec, badReq)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("download with a wrong token: %d", rec.Code)
 	}

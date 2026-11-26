@@ -160,11 +160,16 @@ func fMove(src, dst string) error {
 	return nil
 }
 
-func fDownload(path, url string, basicAuth bool) error {
+func fDownload(path, url string, basicAuth bool, header http.Header) error {
 	client := &http.Client{}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return err
+	}
+	for name, values := range header {
+		for _, v := range values {
+			req.Header.Add(name, v)
+		}
 	}
 	if basicAuth {
 		req.SetBasicAuth(*masterBasicAuthUser, *masterBasicAuthPassword)
@@ -176,6 +181,9 @@ func fDownload(path, url string, basicAuth bool) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUpgradeRequired {
+		return fmt.Errorf("download file operation for url %s finished with status code %d: the master refuses plain HTTP, use an https:// --master.host or set --master.allow-insecure-http on the master", url, resp.StatusCode)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("download file operation for url %s finished with status code %d", url, resp.StatusCode)
 	}

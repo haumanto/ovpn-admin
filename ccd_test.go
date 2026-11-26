@@ -123,12 +123,12 @@ func TestValidateCcdErrors(t *testing.T) {
 		in      Ccd
 		wantErr string
 	}{
-		{"path traversal", Ccd{User: "../../etc/passwd"}, "Username can only contains"},
-		{"dot dot", Ccd{User: ".."}, "Username can only contains"},
-		{"dot", Ccd{User: "."}, "Username can only contains"},
-		{"slash", Ccd{User: "alice/../bob"}, "Username can only contains"},
-		{"backslash", Ccd{User: `alice\bob`}, "Username can only contains"},
-		{"empty user", Ccd{User: ""}, "Username can only contains"},
+		{"path traversal", Ccd{User: "../../etc/passwd"}, "Username rule"},
+		{"dot dot", Ccd{User: ".."}, "Username rule"},
+		{"dot", Ccd{User: "."}, "Username rule"},
+		{"slash", Ccd{User: "alice/../bob"}, "Username rule"},
+		{"backslash", Ccd{User: `alice\bob`}, "Username rule"},
+		{"empty user", Ccd{User: ""}, "Username rule"},
 		{"unknown user", Ccd{User: "carol"}, `User "carol" not found`},
 
 		{"v4 not an address", Ccd{User: "alice", ClientAddress: "abc"}, "not a valid IPv4 address"},

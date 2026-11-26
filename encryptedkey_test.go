@@ -196,7 +196,7 @@ func TestArchiveCaKeyEncryptionMetadata(t *testing.T) {
 			oAdmin.role = "master"
 			oAdmin.masterSyncToken = "a-sync-token-for-the-test"
 			rec := httptest.NewRecorder()
-			oAdmin.downloadCertsHandler(rec, httptest.NewRequest("GET", "/api/data/certs/download?token=a-sync-token-for-the-test", nil))
+			oAdmin.downloadCertsHandler(rec, loopbackGet("/api/data/certs/download?token=a-sync-token-for-the-test"))
 			isArchive := bytes.HasPrefix(rec.Body.Bytes(), []byte{0x1f, 0x8b})
 			if c.ok {
 				if rec.Code != http.StatusOK || !isArchive {

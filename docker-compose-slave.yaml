@@ -73,6 +73,10 @@ services:
       OVPN_TELEGRAM_THREAD_ID: "${OVPN_TELEGRAM_THREAD_ID:-}"
       OVPN_TELEGRAM_API_BASE: "${OVPN_TELEGRAM_API_BASE:-https://api.telegram.org}"
       OVPN_TELEGRAM_ALLOW_HTTP: "${OVPN_TELEGRAM_ALLOW_HTTP:-false}"
+      # The ban message carries the address (the network for an IPv6 ban), the reason, the user name when the audit log knows it, the offence
+      # number, the duration and the host; the unban message carries the address. true is the default (v0.1.11 sent neither address nor name);
+      # false leaves the address and the user name out.
+      OVPN_TELEGRAM_INCLUDE_ADDRESS: "${OVPN_TELEGRAM_INCLUDE_ADDRESS:-true}"
     cap_add:
       - NET_ADMIN
     sysctls:
@@ -124,6 +128,22 @@ services:
       OVPN_AUTH_FAIL_WINDOW: "${OVPN_AUTH_FAIL_WINDOW:-15m}"
       OVPN_ADMIN_TRUST_PROXY: "${OVPN_ADMIN_TRUST_PROXY:-true}"
       OVPN_ADMIN_ALLOW_CIDR: "${OVPN_ADMIN_ALLOW_CIDR:-}"
+      # Telegram settings of the panel (the failed-login flood alert and the certificate expiry notices). Same variables and defaults as
+      # the openvpn service above, which uses them for ban alerts: one set of values in the environment or the env file feeds both.
+      # The panel is a separate container, so these alerts stay off until the values reach this service. See the openvpn service for the
+      # full description of each variable. If you use OVPN_TELEGRAM_BOT_TOKEN_FILE, mount the same read-only token file under this
+      # service too (volumes: - /path/on/host/telegram-bot-token:/run/secrets/telegram-bot-token:ro); the mount of the openvpn
+      # service is not visible here.
+      OVPN_TELEGRAM_ENABLED: "${OVPN_TELEGRAM_ENABLED:-false}"
+      OVPN_TELEGRAM_BOT_TOKEN: "${OVPN_TELEGRAM_BOT_TOKEN:-}"
+      OVPN_TELEGRAM_BOT_TOKEN_FILE: "${OVPN_TELEGRAM_BOT_TOKEN_FILE:-}"
+      OVPN_TELEGRAM_CHAT_ID: "${OVPN_TELEGRAM_CHAT_ID:-}"
+      OVPN_TELEGRAM_THREAD_ID: "${OVPN_TELEGRAM_THREAD_ID:-}"
+      OVPN_TELEGRAM_API_BASE: "${OVPN_TELEGRAM_API_BASE:-https://api.telegram.org}"
+      OVPN_TELEGRAM_ALLOW_HTTP: "${OVPN_TELEGRAM_ALLOW_HTTP:-false}"
+      # true adds the address (and the user name where the audit log knows it) to the messages; v0.1.11 sent neither address nor name.
+      # false leaves them out.
+      OVPN_TELEGRAM_INCLUDE_ADDRESS: "${OVPN_TELEGRAM_INCLUDE_ADDRESS:-true}"
     network_mode: service:openvpn
     volumes:
       - ./easyrsa_slave:/mnt/easyrsa

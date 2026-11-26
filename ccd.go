@@ -62,7 +62,7 @@ var ccdMutex sync.Mutex
 
 // checkCcdUser makes sure username is safe to use as a file name and exists.
 func checkCcdUser(username string) error {
-	if err := validateUsername(username); err != nil {
+	if err := validateLegacyUsername(username); err != nil {
 		return err
 	}
 	if !checkUserExist(username) {
@@ -254,6 +254,9 @@ func parseCcdPushRoute(line string) (ccdRoute, bool) {
 // validateCcd checks a ccd received from the API and returns its normalized form.
 // Syntax and range checks go first, uniqueness of static addresses is checked last.
 func validateCcd(ccd Ccd) (Ccd, error) {
+	if err := validateUsername(ccd.User); err != nil {
+		return Ccd{}, err
+	}
 	if err := checkCcdUser(ccd.User); err != nil {
 		return Ccd{}, err
 	}

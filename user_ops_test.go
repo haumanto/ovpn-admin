@@ -36,7 +36,15 @@ func TestFakeEasyrsa(t *testing.T) {
 }
 
 func fakeEasyrsa(t *testing.T, args []string) error {
-	if len(args) > 0 && args[0] == "--batch" {
+	// EASYRSA_ARGV_LOG: every command line the panel gives easyrsa is appended here (the --days tests read it)
+	if lf := os.Getenv("EASYRSA_ARGV_LOG"); lf != "" {
+		if f, err := os.OpenFile(lf, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600); err == nil {
+			fmt.Fprintln(f, strings.Join(args, " "))
+			f.Close()
+		}
+	}
+	// options come before the command: --batch, --days=<n>, --req-cn=<name>
+	for len(args) > 0 && strings.HasPrefix(args[0], "--") {
 		args = args[1:]
 	}
 	if len(args) == 0 {
