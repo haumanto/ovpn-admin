@@ -184,6 +184,7 @@ func TestEasyrsaArgvCarriesDaysOnCreateAndRotate(t *testing.T) {
 		t.Fatalf("%d issuance command lines, want 2 (create, rotate): %v", len(issued), issued)
 	}
 	for _, l := range issued {
+		t.Logf("easyrsa argv: %s", l)
 		if !strings.Contains(" "+l+" ", " --days=825 ") {
 			t.Errorf("argv without --days=825: %s", l)
 		}
@@ -253,6 +254,7 @@ func TestRealEasyrsaIssuesEveryCertificateWithTheLifetime(t *testing.T) {
 		t.Fatalf("%d issuance command lines, want 4 (create, rotate, renew, server renew): %v", len(issued), issued)
 	}
 	for _, l := range issued {
+		t.Logf("easyrsa argv: %s", l)
 		if !strings.Contains(" "+l+" ", " --days=825 ") {
 			t.Errorf("argv without --days=825: %s", l)
 		}
