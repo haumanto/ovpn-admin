@@ -333,9 +333,11 @@ expires.
 
 ### Disconnect
 
-The Disconnect action on a client sends the request and shows a notice. **In
-v0.1.12 it does not end the session**: the server side is not implemented yet
-and the client stays connected. It is scheduled for v0.1.13.
+The Disconnect action on a client ends its sessions on the server and reports
+how many it closed, for example `disconnected NAME (2 sessions)`. It uses the
+management interface, so it works on a master with the management channel
+configured. In v0.1.12 the action answered but ended nothing; that limitation is
+closed in v0.1.13. See [RELEASE-v0.1.13.md](RELEASE-v0.1.13.md).
 
 ### Banned IPs
 
@@ -355,7 +357,7 @@ The choice is saved in your browser only. The server does not store it, so each 
 
 ## Upgrade notes
 
-Upgrading a docker compose deployment (upstream, v0.1.0, v0.1.1, v0.1.2, v0.1.3): follow [UPGRADING.md](UPGRADING.md); `scripts/upgrade.sh` backs up first and covers the audit volume. v0.1.4 steps: [UPGRADING.md](UPGRADING.md#v013--v014). v0.1.5 steps: [UPGRADING.md](UPGRADING.md#v014--v015). v0.1.6 steps: [UPGRADING.md](UPGRADING.md#v015--v016). v0.1.7 steps: [UPGRADING.md](UPGRADING.md#v016--v017). v0.1.8 steps: [UPGRADING.md](UPGRADING.md#v017--v018). v0.1.9 steps: [UPGRADING.md](UPGRADING.md#v018--v019). v0.1.10 steps: [UPGRADING.md](UPGRADING.md#v019--v0110). v0.1.11 steps: [UPGRADING.md](UPGRADING.md#v0110--v0111). v0.1.12 steps: [UPGRADING.md](UPGRADING.md#v0111--v0112).
+Upgrading a docker compose deployment (upstream, v0.1.0, v0.1.1, v0.1.2, v0.1.3): follow [UPGRADING.md](UPGRADING.md); `scripts/upgrade.sh` backs up first and covers the audit volume. v0.1.4 steps: [UPGRADING.md](UPGRADING.md#v013--v014). v0.1.5 steps: [UPGRADING.md](UPGRADING.md#v014--v015). v0.1.6 steps: [UPGRADING.md](UPGRADING.md#v015--v016). v0.1.7 steps: [UPGRADING.md](UPGRADING.md#v016--v017). v0.1.8 steps: [UPGRADING.md](UPGRADING.md#v017--v018). v0.1.9 steps: [UPGRADING.md](UPGRADING.md#v018--v019). v0.1.10 steps: [UPGRADING.md](UPGRADING.md#v019--v0110). v0.1.11 steps: [UPGRADING.md](UPGRADING.md#v0110--v0111). v0.1.12 steps: [UPGRADING.md](UPGRADING.md#v0111--v0112). v0.1.13 steps: [UPGRADING.md](UPGRADING.md#v0112--v0113).
 
 * **openvpn-user v1.0.4 → v1.0.9** (only relevant with password authentication, `--auth.password` / `OVPN_PASSWD_AUTH=true`). openvpn-user v1.0.9 adds the columns `secret` and `app_configured` to `users.db`. The column `secret` is added without a default value, so for every user whose password was saved by openvpn-user v1.0.4 or older it is `NULL`, and `openvpn-user auth` of v1.0.9 rejects these users (`converting NULL to string is unsupported`) — they cannot connect to the VPN any more. Users created by v1.0.9 are not affected. Additionally `openvpn-user db-migrate` does nothing on a database created by v1.0.4 until `openvpn-user db-init` has created the `migrations` table, and until the database is migrated `openvpn-user create` reports success without saving the user.
   * The Docker images handle this: `setup/configure.sh` of the openvpn image and ovpn-admin itself (when started with `--auth.password` or `--auth.db-init`) run `db-init` and `db-migrate` on start and then replace `NULL` in `secret` with an empty string (the value v1.0.9 stores for new users). All steps are idempotent.

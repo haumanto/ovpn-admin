@@ -1,8 +1,8 @@
 apiVersion: v1
-appVersion: "v0.1.12"
+appVersion: "v0.1.13"
 description: Simple web UI to manage OpenVPN users, their certificates & routes in Linux. While backend is written in Go, frontend is based on Vue.js.
 name: openvpn-admin
-version: "0.1.12"
+version: "0.1.13"
 kubeVersion: ">=1.14.0-0"
 maintainers:
 - name: nabokihms
