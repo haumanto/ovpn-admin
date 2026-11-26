@@ -333,7 +333,9 @@ func writeCrlExpiring(t *testing.T, pki string, now time.Time, days float64) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(pki, "crl.pem"), crl, 0644); err != nil {
+	// atomic (temp file next to it, rename): a refresh loop that reads crl.pem right now sees the old or
+	// the new CRL, never a truncated one
+	if err := atomicWriteFile(filepath.Join(pki, "crl.pem"), crl, 0644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -561,14 +563,29 @@ func TestCrlRefreshLoopRunsRepeatedly(t *testing.T) {
 	}
 	// the CRL now runs short: a later round rebuilds it, without a restart
 	writeCrlExpiring(t, pki, time.Now(), 5)
+	// The rebuild is written by the fake easyrsa (a child process that truncates crl.pem and then writes
+	// it), so a poll can land in the middle of that write and read an empty or partial file. That read is
+	// not the answer: poll again. Only a CRL that never becomes readable and longer-lived fails the test,
+	// and then the last read error is in the message.
+	var days float64
+	var lastErr error
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if crlDaysOnDisk(t, time.Now()) > 100 {
-			return
+		next, err := crlNextUpdate()
+		if err == nil {
+			days, lastErr = crlExpireDays(next, time.Now()), nil
+			if days > 100 {
+				return
+			}
+		} else {
+			lastErr = err
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("the loop did not rebuild the CRL that had 5 days left: %.2f days", crlDaysOnDisk(t, time.Now()))
+	if lastErr != nil {
+		t.Fatalf("the loop did not rebuild the CRL that had 5 days left: crl.pem still unreadable at the deadline: %v", lastErr)
+	}
+	t.Fatalf("the loop did not rebuild the CRL that had 5 days left: %.2f days", days)
 }
 
 // syncBuffer is a log sink that the test can read while a goroutine still writes to it.
