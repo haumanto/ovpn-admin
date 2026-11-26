@@ -909,6 +909,9 @@ func (s *selfTest) checkAuditChain() (string, string) {
 		return selfTestFail, "the audit trail gave no result"
 	}
 	detail := fmt.Sprintf("the chain of %d lines is intact (seq %d to %d, checkpoint at %d)", okRes.Lines, okRes.FirstSeq, okRes.LastSeq, okRes.CheckpointSeq)
+	if okRes.Unanchored > 0 {
+		detail = fmt.Sprintf("the chain of %d lines is intact (seq %d to %d; checkpoint at seq %d, %d newer line(s) after it)", okRes.Lines, okRes.FirstSeq, okRes.LastSeq, okRes.CheckpointSeq, okRes.Unanchored)
+	}
 	if okRes.Lines == 0 {
 		detail = "the trail holds no record yet: nothing to verify, the checkpoint agrees"
 	}
