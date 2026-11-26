@@ -567,6 +567,19 @@ func main() {
 	log.SetLevel(logLevels[*logLevel])
 	log.SetFormatter(logFormats[*logFormat])
 
+	// --selftest reads the settings and the files and exits; it starts no listener and no scheduler, and it comes before the
+	// refusals below so that a panel that would refuse to start is reported as a FAIL line instead
+	if *selfTestCLI {
+		if *logLevel == "info" {
+			log.SetLevel(log.WarnLevel) // the report is the output; the start-up chatter of the helpers is not
+		}
+		if err := selfTestPrepare(); err != nil {
+			fmt.Fprintf(os.Stderr, "self-test: %v\n", err)
+			os.Exit(2)
+		}
+		os.Exit(runSelfTestCLI(os.Stdout, newSelfTest(nil)))
+	}
+
 	// the refusals come first: nothing (no listener, no scheduler, no state file) starts before they have passed
 	if err := validateBasicAuthConfig(*basicUsername, *basicPassword); err != nil {
 		log.Fatal(err)
@@ -661,6 +674,8 @@ func main() {
 	go ovpnAdmin.updateState()
 	go ovpnAdmin.crlRefreshLoop(crlFirstCheckDelay, crlCheckInterval, crlRetryInterval, nil)
 	go ovpnAdmin.certLifecycleLoop(nil) // expiry notices (first scan after 5 minutes) and the end of renewal grace periods
+	// self-test: first run 10 minutes after the start, then every 24 hours, unless OVPN_SELFTEST_ENABLED=false
+	go ovpnAdmin.selfTestLoop(selfTestFirstDelay, selfTestInterval, nil)
 
 	ovpnAdmin.modules = append(ovpnAdmin.modules, "core")
 
@@ -708,6 +723,7 @@ func main() {
 	http.HandleFunc(*listenBaseUrl+"api/user/renew", ovpnAdmin.userRenewHandler)
 	http.HandleFunc(*listenBaseUrl+"api/server/renew", ovpnAdmin.serverRenewHandler)
 	http.HandleFunc(*listenBaseUrl+"api/server/confirm-renew", ovpnAdmin.serverConfirmRenewHandler)
+	http.HandleFunc(*listenBaseUrl+"api/selftest", ovpnAdmin.selfTestHandler)
 
 	http.HandleFunc(*listenBaseUrl+"api/sync/last/try", ovpnAdmin.lastSyncTimeHandler)
 	http.HandleFunc(*listenBaseUrl+"api/sync/last/successful", ovpnAdmin.lastSuccessfulSyncTimeHandler)
