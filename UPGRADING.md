@@ -4,6 +4,7 @@ One script covers every version: `scripts/upgrade.sh`. It backs up the bind-moun
 
 Pick your section:
 
+* [v0.1.12 → v0.1.13](#v0112--v0113) (in development, not tagged)
 * [v0.1.0 → v0.1.1](#v010--v011)
 * [v0.1.1 → v0.1.2](#v011--v012)
 * [v0.1.2 → v0.1.3](#v012--v013)
@@ -19,6 +20,31 @@ Pick your section:
 * [upstream → v0.1.x](#upstream--v01x)
 
 Kubernetes/Helm deployments: see `charts/openvpn-admin/README.md`. The historical notes of the first release stay in `UPGRADING-v0.1.0.md`.
+
+## v0.1.12 → v0.1.13
+
+Status: in development, not tagged yet. This section is the first one in the file on purpose: the first change in this release breaks old clients, and step 1 is the one to read before you upgrade.
+
+1. **Re-issue the client configs before you upgrade the server.** The server now accepts the AEAD data channel ciphers `AES-256-GCM`, `AES-128-GCM` and `CHACHA20-POLY1305` and nothing else. `AES-128-CBC` is gone from `setup/openvpn.conf` (it was in `data-ciphers`, and the `cipher` and `data-ciphers-fallback` lines are deleted), and from the Helm chart. A client that pinned CBC stops connecting: a config whose `data-ciphers` list has no AEAD cipher, or one that relies on `data-ciphers-fallback AES-128-CBC` or on a client too old to negotiate a cipher. The server answers it with `AUTH_FAILED,Data channel cipher negotiation failed (no shared cipher)` and logs `PUSH: No common cipher between server and client. Server data-ciphers: 'DEFAULT' (AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305), client supported ciphers 'AES-128-CBC'`. Download a new `.ovpn` for each user from the panel (the new template writes the AEAD list and no `cipher` line), or delete the `cipher AES-128-CBC` line and any `data-ciphers-fallback` line from the file you already gave out. What was tested: a client on OpenVPN 2.7.9 that offers only `AES-128-CBC` is refused, while a 2.7.9 client with a v0.1.12 config (`data-ciphers` with the AEAD list plus `cipher AES-128-CBC`) still connects and negotiates `AES-256-GCM`, because OpenVPN 2.5 and newer ignore `cipher` for negotiation. Clients older than 2.5 were not tested.
+2. **Note your current version** (`git describe --tags --always`, or the image tags). You need it for a rollback.
+3. **Update the checkout** once the `v0.1.13` tag exists: `git fetch --tags && git checkout v0.1.13`. If you build the `openvpn` image from your own edited `setup/openvpn.conf`, apply the same change to it by hand: `data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305` and no `cipher` or `data-ciphers-fallback` line.
+4. **Back up before you upgrade:**
+   ```bash
+   mkdir -p -m 700 backups
+   tar -czf backups/pre-v0.1.13-$(date -u +%Y%m%dT%H%M%SZ).tar.gz easyrsa_master ccd_master audit_master
+   sha256sum backups/pre-v0.1.13-*.tar.gz
+   ```
+5. **Rebuild both images.** `openvpn` changes (`setup/openvpn.conf`) and `ovpn-admin` changes (the embedded client template):
+   ```bash
+   docker compose -p openvpn-master build --pull ovpn-admin openvpn
+   docker compose -p openvpn-master up -d --no-deps ovpn-admin openvpn
+   curl -fsS http://127.0.0.1:8080/ping
+   ```
+   Restarting the `openvpn` container drops connected VPN clients. Do this in a quiet window.
+6. **Custom client template.** If you run your own `client.conf.tpl` (`--templates.clientconf.path`), remove `cipher AES-128-CBC` from it and make sure it has `data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305`. Your template is not changed by the upgrade.
+7. **Verify the data channel cipher.** The server logs at `verb 3`, which does not print the cipher. Connect one client and read it from the management interface: `docker compose -p openvpn-master exec openvpn sh -c 'printf "status 3\n" | nc -w 2 127.0.0.1 8989'`. The last column of the `CLIENT_LIST` line is the negotiated cipher (`AES-256-GCM`).
+8. **Helm.** The chart's ConfigMap now sets `cipher AES-256-GCM` instead of `AES-128-CBC`, so a chart deployment also stops accepting CBC-only clients; with no `data-ciphers` line OpenVPN uses its default list, which is the same three AEAD ciphers. The chart's other gaps are unchanged, see `charts/openvpn-admin/README.md`.
+9. **Rollback.** Check out your previous tag, rebuild both images with the command in step 5 and start them again. v0.1.12 accepts `AES-128-CBC` again, so the old configs work again. No data format changes in this item.
 
 ## What the script does and never does
 

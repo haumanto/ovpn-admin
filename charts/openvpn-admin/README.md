@@ -4,7 +4,7 @@
 
 Simple web UI to manage OpenVPN users, their certificates & routes in Linux. While backend is written in Go, frontend is based on Vue.js.
 
-> **Not hardened to the Docker Compose level.** Missing: `duplicate-cn` and `client-to-client` are on (`templates/configmap.yaml`), no password authentication, no ban engine (the container runs `/entrypoint.sh`, not `configure.sh`), the cipher is `AES-128-CBC`, the Ingress is always created even with `ingress.enabled: false`, the admin password is stored as `{PLAIN}` in the Secret, and the Role can get, list, create and update every Secret in the namespace. Do not use it for an internet-facing VPN until these are fixed. Templates are unchanged in this release.
+> **Not hardened to the Docker Compose level.** Missing: `duplicate-cn` and `client-to-client` are on (`templates/configmap.yaml`), no password authentication, no ban engine (the container runs `/entrypoint.sh`, not `configure.sh`), the Ingress is always created even with `ingress.enabled: false`, the admin password is stored as `{PLAIN}` in the Secret, and the Role can get, list, create and update every Secret in the namespace. Do not use it for an internet-facing VPN until these are fixed. The only template change in this release is the data channel cipher in `templates/configmap.yaml`, now `AES-256-GCM`.
 
 ## Maintainers
 

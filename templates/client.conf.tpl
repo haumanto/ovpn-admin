@@ -6,10 +6,8 @@ verb 3
 client
 nobind
 dev tun
-# modern cipher list, negotiated with the server (OpenVPN 2.5+)
+# AEAD cipher list, negotiated with the server (OpenVPN 2.5+); the server accepts these three and nothing else
 data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
-# for clients older than 2.5 that do not negotiate; removed next release together with the server's AES-128-CBC
-cipher AES-128-CBC
 auth-nocache
 key-direction 1
 #redirect-gateway def1
