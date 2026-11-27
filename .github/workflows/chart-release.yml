@@ -38,3 +38,38 @@ jobs:
         skip_existing: true
       env:
         CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
+    # chart-releaser names the release exactly after the tag
+    # (openvpn-admin-0.1.13), which reads like a duplicate of the app release
+    # in the releases list. Give the title a human label so the two are
+    # distinguishable. Only the TITLE changes: the tag stays
+    # openvpn-admin-<version>, because index.yaml on gh-pages resolves chart
+    # downloads through the tag URL. Renaming the tag would break
+    # `helm repo add` / `helm install` for every published version.
+    - name: Label chart release titles
+      env:
+        GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        GH_REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        # chart-releaser creates the release and its tag through the GitHub API,
+        # so the tag does not exist in this checkout. Read the version from
+        # Chart.yaml and build the tag name from it instead.
+        for chart_yaml in charts/*/Chart.yaml; do
+          [ -f "$chart_yaml" ] || continue
+          version=$(awk '/^version:/{print $2; exit}' "$chart_yaml" | sed "s/[\"']//g")
+          [ -n "$version" ] || continue
+          tag="openvpn-admin-${version}"
+          title="Helm chart ${version}"
+          current=$(gh release view "$tag" --json name --jq .name 2>/dev/null || echo "")
+          if [ -z "$current" ]; then
+            echo "no release for $tag, skipping"
+            continue
+          fi
+          if [ "$current" = "$title" ]; then
+            echo "$tag already titled '$title'"
+            continue
+          fi
+          echo "retitling $tag: '$current' -> '$title'"
+          gh release edit "$tag" --title "$title"
+        done
